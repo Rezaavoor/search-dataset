@@ -21,14 +21,14 @@ Environment Variables (Azure OpenAI):
 
 import os
 import argparse
+import gzip
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 from dotenv import load_dotenv
 import json
-
-# Load environment variables from .env file
-load_dotenv()
 
 # Document loaders
 from langchain_community.document_loaders import (
@@ -38,14 +38,25 @@ from langchain_community.document_loaders import (
 from langchain_core.documents import Document
 
 # RAGAS imports
+import ragas
 from ragas.testset import TestsetGenerator
 from ragas.testset.synthesizers.testset_schema import Testset
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.testset.transforms.splitters import HeadlineSplitter
-from ragas.testset.transforms import default_transforms, HeadlinesExtractor, NodeFilter
-from ragas.testset.graph import Node, NodeType, Relationship
+from ragas.testset.transforms import (
+    default_transforms,
+    HeadlinesExtractor,
+    NodeFilter,
+    apply_transforms,
+)
+from ragas.testset.graph import Node, NodeType, Relationship, KnowledgeGraph, UUIDEncoder
+from ragas.run_config import RunConfig
+from ragas.testset.persona import Persona, generate_personas_from_kg
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings, AzureChatOpenAI, AzureOpenAIEmbeddings
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 class SafeHeadlineSplitter(HeadlineSplitter):
@@ -144,6 +155,149 @@ def patch_transforms_with_safe_splitter(transforms, llm):
     return patched
 
 
+CACHE_SCHEMA_VERSION = 1
+PIPELINE_ID = "pdf_only__headlines_required"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _canonical_json(obj: Any) -> str:
+    # Stable serialization for cache keys
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _file_fingerprint(path: Path) -> Dict[str, Any]:
+    st = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+    }
+
+
+def compute_docs_cache_id(
+    pdf_paths: List[Path],
+    *,
+    recursive: bool,
+    max_files: Optional[int],
+) -> str:
+    payload = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "kind": "documents",
+        "recursive": recursive,
+        "max_files": max_files,
+        "pdfs": [_file_fingerprint(p) for p in pdf_paths],
+    }
+    return _sha256_hex(_canonical_json(payload))[:16]
+
+
+def compute_kg_cache_id(
+    docs_cache_id: str,
+    *,
+    provider: str,
+    llm_id: str,
+    embedding_id: str,
+) -> str:
+    payload = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "kind": "knowledge_graph",
+        "pipeline_id": PIPELINE_ID,
+        "ragas_version": getattr(ragas, "__version__", "unknown"),
+        "docs_cache_id": docs_cache_id,
+        "provider": provider,
+        "llm_id": llm_id,
+        "embedding_id": embedding_id,
+    }
+    return _sha256_hex(_canonical_json(payload))[:16]
+
+
+def save_documents_cache(docs: List[Document], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        for doc in docs:
+            rec = {"page_content": doc.page_content, "metadata": doc.metadata}
+            f.write(json.dumps(rec, ensure_ascii=False))
+            f.write("\n")
+
+
+def load_documents_cache(path: Path) -> List[Document]:
+    docs: List[Document] = []
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            docs.append(
+                Document(
+                    page_content=rec.get("page_content", ""),
+                    metadata=rec.get("metadata") or {},
+                )
+            )
+    return docs
+
+
+def save_knowledge_graph_cache(kg: KnowledgeGraph, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "nodes": [node.model_dump() for node in kg.nodes],
+        "relationships": [rel.model_dump() for rel in kg.relationships],
+    }
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump(data, f, cls=UUIDEncoder, ensure_ascii=False)
+
+
+def load_knowledge_graph_cache(path: Path) -> KnowledgeGraph:
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        data = json.load(f)
+
+    nodes = [Node(**node_data) for node_data in data.get("nodes", [])]
+    nodes_map = {str(node.id): node for node in nodes}
+
+    relationships = []
+    for rel_data in data.get("relationships", []):
+        relationships.append(
+            Relationship(
+                id=rel_data["id"],
+                type=rel_data["type"],
+                source=nodes_map[rel_data["source"]],
+                target=nodes_map[rel_data["target"]],
+                bidirectional=rel_data.get("bidirectional", False),
+                properties=rel_data.get("properties", {}),
+            )
+        )
+
+    return KnowledgeGraph(nodes=nodes, relationships=relationships)
+
+
+def save_personas_cache(personas: List[Persona], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([p.model_dump() for p in personas], f, ensure_ascii=False, indent=2)
+
+
+def load_personas_cache(path: Path) -> List[Persona]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return [Persona(**p) for p in data]
+
+
+def sort_documents_deterministically(docs: List[Document]) -> List[Document]:
+    def _key(d: Document):
+        source = str(d.metadata.get("source", ""))
+        page = d.metadata.get("page")
+        page_sort = page if isinstance(page, int) else -1
+        return (source, page_sort)
+
+    return sorted(docs, key=_key)
+
+
 def load_documents(
     base_path: str,
     file_types: List[str] = ["pdf"],
@@ -178,7 +332,8 @@ def load_documents(
             "(only PDF is supported)"
         )
 
-    file_types = ["pdf"] if "pdf" in normalized_types or not normalized_types else []
+    # Always load PDFs (this script is PDF-only); ignore any other entries.
+    file_types = ["pdf"]
 
     for file_type in file_types:
         if file_type.lower() not in loaders_config:
@@ -281,7 +436,7 @@ def setup_azure_openai(model: str):
     if not endpoint:
         raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is not set.")
 
-    print(f"Setting up Azure OpenAI LLM")
+    print("Setting up Azure OpenAI LLM")
     print(f"  Endpoint: {endpoint}")
     print(f"  Chat deployment: {chat_deployment}")
     print(f"  API version: {api_version}")
@@ -307,36 +462,24 @@ def setup_azure_openai(model: str):
     return generator_llm, generator_embeddings
 
 
-def generate_testset(
+def build_knowledge_graph(
     docs: List[Document],
     generator_llm,
     generator_embeddings,
-    testset_size: int = 50,
-) -> Testset:
+) -> KnowledgeGraph:
     """
-    Generate a synthetic testset using RAGAS.
+    Build a RAGAS KnowledgeGraph from loaded documents by applying transforms.
 
-    Args:
-        docs: List of loaded documents
-        generator_llm: Wrapped LLM for generation
-        generator_embeddings: Wrapped embeddings model
-        testset_size: Number of test samples to generate
-
-    Returns:
-        Generated Testset object
+    This is the expensive "processing" step (LLM extraction + embeddings + relationship building).
     """
-    print(f"\nInitializing TestsetGenerator...")
-    generator = TestsetGenerator(
-        llm=generator_llm,
-        embedding_model=generator_embeddings,
-    )
+    print("\nBuilding knowledge graph (applying RAGAS transforms)...")
 
-    print(f"Generating testset with {testset_size} samples...")
-    print("This may take a while depending on document count and testset size...")
-
-    # Get default transforms and patch with safe headline splitter
+    # Get default transforms and patch for headline-only generation
     from langchain_core.documents import Document as LCDocument
-    lc_docs = [LCDocument(page_content=doc.page_content, metadata=doc.metadata) for doc in docs]
+
+    lc_docs = [
+        LCDocument(page_content=doc.page_content, metadata=doc.metadata) for doc in docs
+    ]
     transforms = default_transforms(
         documents=lc_docs,
         llm=generator_llm,
@@ -345,13 +488,48 @@ def generate_testset(
     transforms = patch_transforms_with_safe_splitter(transforms, llm=generator_llm)
     print("Headline-only generation enabled (skipping documents without usable headlines)")
 
-    testset = generator.generate_with_langchain_docs(
-        docs,
-        testset_size=testset_size,
-        transforms=transforms,
+    nodes: List[Node] = []
+    for doc in docs:
+        nodes.append(
+            Node(
+                type=NodeType.DOCUMENT,
+                properties={
+                    "page_content": doc.page_content,
+                    "document_metadata": doc.metadata,
+                },
+            )
+        )
+
+    kg = KnowledgeGraph(nodes=nodes)
+    apply_transforms(kg, transforms, run_config=RunConfig())
+    print(f"Knowledge graph ready: {len(kg.nodes)} nodes, {len(kg.relationships)} relationships")
+    return kg
+
+
+def generate_testset_from_knowledge_graph(
+    kg: KnowledgeGraph,
+    generator_llm,
+    generator_embeddings,
+    *,
+    testset_size: int = 50,
+    personas: Optional[List[Persona]] = None,
+) -> Testset:
+    """
+    Generate a synthetic testset from a pre-built KnowledgeGraph.
+
+    This is the "generation" step (LLM writes the final Q/A pairs).
+    """
+    print("\nInitializing TestsetGenerator...")
+    generator = TestsetGenerator(
+        llm=generator_llm,
+        embedding_model=generator_embeddings,
+        knowledge_graph=kg,
+        persona_list=personas,
     )
 
-    return testset
+    print(f"Generating testset with {testset_size} samples...")
+    print("This may take a while depending on testset size...")
+    return generator.generate(testset_size=testset_size)
 
 
 def build_content_to_source_map(docs: List[Document]) -> Dict[str, str]:
@@ -481,7 +659,7 @@ def save_testset(
             if isinstance(contexts, str):
                 try:
                     contexts = json.loads(contexts.replace("'", '"'))
-                except:
+                except Exception:
                     contexts = [contexts]
 
             # Find sources for all contexts in this row
@@ -646,6 +824,25 @@ def main():
         default="auto",
         help="LLM provider to use (default: auto-detect from env vars)",
     )
+    parser.add_argument(
+        "--processed-dir",
+        type=str,
+        default=str(script_dir / "processed"),
+        help=(
+            "Directory to store cached intermediate artifacts (documents/KG/personas). "
+            "If caches exist, they will be reused on subsequent runs."
+        ),
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable loading/saving cached intermediate artifacts",
+    )
+    parser.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="Recompute intermediate artifacts even if cache exists",
+    )
 
     args = parser.parse_args()
 
@@ -662,47 +859,127 @@ def main():
     else:
         input_dirs = [base_input_dir]
 
-    # Load documents from all specified directories
-    all_docs = []
-    for input_dir in input_dirs:
-        input_dir = Path(input_dir)
-        if not input_dir.exists():
-            print(f"Warning: Directory not found: {input_dir}")
-            continue
-        print(f"\nLoading documents from: {input_dir}")
-        docs = load_documents(
-            str(input_dir),
-            file_types=args.file_types,
-            max_files=None,  # We'll limit after combining
-            recursive=not args.no_recursive,
-        )
-        all_docs.extend(docs)
+    # Cache config
+    cache_enabled = not args.no_cache
+    processed_dir = Path(args.processed_dir).expanduser()
+    if not processed_dir.is_absolute():
+        processed_dir = (script_dir / processed_dir).resolve()
 
-    # Load individual files if specified
+    docs_cache_dir = processed_dir / "docs"
+    kg_cache_dir = processed_dir / "kg"
+    personas_cache_dir = processed_dir / "personas"
+    meta_dir = processed_dir / "meta"
+
+    if cache_enabled:
+        docs_cache_dir.mkdir(parents=True, exist_ok=True)
+        kg_cache_dir.mkdir(parents=True, exist_ok=True)
+        personas_cache_dir.mkdir(parents=True, exist_ok=True)
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect PDF paths for a stable cache key
+    def collect_pdf_paths_from_dir(d: Path, *, recursive: bool) -> List[Path]:
+        if not d.exists() or not d.is_dir():
+            return []
+        iterator = d.rglob("*.pdf") if recursive else d.glob("*.pdf")
+        out: List[Path] = []
+        for p in iterator:
+            if p.is_file():
+                out.append(p.resolve())
+        return out
+
+    pdf_paths: List[Path] = []
+    for d in input_dirs:
+        pdf_paths.extend(
+            collect_pdf_paths_from_dir(Path(d), recursive=not args.no_recursive)
+        )
     if args.files:
-        print(f"\nLoading individual files...")
         for file_path in args.files:
             resolved_file_path = resolve_input_file(file_path, base_input_dir)
-            if not resolved_file_path.exists():
-                print(f"  Warning: File not found: {resolved_file_path}")
-                continue
-            try:
-                ext = resolved_file_path.suffix.lower()
-                if ext == ".pdf":
-                    loader = PyPDFLoader(str(resolved_file_path))
-                else:
-                    print(f"  Skipping non-PDF file: {resolved_file_path}")
-                    continue
-                file_docs = loader.load()
-                print(f"  Loaded {len(file_docs)} document(s) from: {resolved_file_path.name}")
-                all_docs.extend(file_docs)
-            except Exception as e:
-                print(f"  Error loading {resolved_file_path}: {e}")
+            if resolved_file_path.exists() and resolved_file_path.suffix.lower() == ".pdf":
+                pdf_paths.append(resolved_file_path.resolve())
 
-    # Apply max_files limit if specified
-    if args.max_files and len(all_docs) > args.max_files:
-        print(f"\nLimiting to {args.max_files} documents (from {len(all_docs)} total)")
-        all_docs = all_docs[:args.max_files]
+    pdf_paths = sorted(set(pdf_paths))
+    docs_cache_id = compute_docs_cache_id(
+        pdf_paths,
+        recursive=not args.no_recursive,
+        max_files=args.max_files,
+    )
+    docs_cache_path = docs_cache_dir / f"docs_{docs_cache_id}.jsonl.gz"
+    docs_meta_path = meta_dir / f"docs_{docs_cache_id}.json"
+
+    # Load documents (prefer cache)
+    if cache_enabled and docs_cache_path.exists() and not args.reprocess:
+        print(f"\nLoading cached extracted documents: {docs_cache_path}")
+        all_docs = load_documents_cache(docs_cache_path)
+        print(f"  Loaded {len(all_docs)} cached document(s)")
+    else:
+        # Load documents from all specified directories
+        all_docs = []
+        for input_dir in input_dirs:
+            input_dir = Path(input_dir)
+            if not input_dir.exists():
+                print(f"Warning: Directory not found: {input_dir}")
+                continue
+            print(f"\nLoading documents from: {input_dir}")
+            docs = load_documents(
+                str(input_dir),
+                file_types=args.file_types,
+                max_files=None,  # We'll limit after combining
+                recursive=not args.no_recursive,
+            )
+            all_docs.extend(docs)
+
+        # Load individual files if specified
+        if args.files:
+            print("\nLoading individual files...")
+            for file_path in args.files:
+                resolved_file_path = resolve_input_file(file_path, base_input_dir)
+                if not resolved_file_path.exists():
+                    print(f"  Warning: File not found: {resolved_file_path}")
+                    continue
+                try:
+                    if resolved_file_path.suffix.lower() != ".pdf":
+                        print(f"  Skipping non-PDF file: {resolved_file_path}")
+                        continue
+                    loader = PyPDFLoader(str(resolved_file_path))
+                    file_docs = loader.load()
+                    print(
+                        f"  Loaded {len(file_docs)} document(s) from: {resolved_file_path.name}"
+                    )
+                    all_docs.extend(file_docs)
+                except Exception as e:
+                    print(f"  Error loading {resolved_file_path}: {e}")
+
+        # Deterministic ordering before limiting
+        all_docs = sort_documents_deterministically(all_docs)
+
+        # Apply max_files limit if specified
+        if args.max_files and len(all_docs) > args.max_files:
+            print(
+                f"\nLimiting to {args.max_files} documents (from {len(all_docs)} total)"
+            )
+            all_docs = all_docs[: args.max_files]
+
+        if cache_enabled:
+            print(f"\nSaving extracted documents cache: {docs_cache_path}")
+            save_documents_cache(all_docs, docs_cache_path)
+            with open(docs_meta_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "created_at": _utc_now_iso(),
+                        "schema_version": CACHE_SCHEMA_VERSION,
+                        "docs_cache_id": docs_cache_id,
+                        "input_dirs": [str(Path(d)) for d in input_dirs],
+                        "explicit_files": args.files or [],
+                        "recursive": not args.no_recursive,
+                        "max_files": args.max_files,
+                        "pdf_files": [str(p) for p in pdf_paths],
+                        "num_documents": len(all_docs),
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
 
     if not all_docs:
         print("\nError: No documents found. Please check your input directory.")
@@ -717,12 +994,79 @@ def main():
         print(f"\nError: {e}")
         return 1
 
-    # Generate testset
-    testset = generate_testset(
-        all_docs,
+    # Determine provider used (for cache key stability)
+    provider_used = args.provider
+    if provider_used == "auto":
+        if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
+            provider_used = "azure"
+        else:
+            provider_used = "openai"
+
+    embedding_id = (
+        os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-ada-002")
+        if provider_used == "azure"
+        else "openai-default"
+    )
+    kg_cache_id = compute_kg_cache_id(
+        docs_cache_id,
+        provider=provider_used,
+        llm_id=args.model,
+        embedding_id=embedding_id,
+    )
+    kg_cache_path = kg_cache_dir / f"kg_{kg_cache_id}.json.gz"
+    kg_meta_path = meta_dir / f"kg_{kg_cache_id}.json"
+    personas_cache_path = personas_cache_dir / f"personas_{kg_cache_id}.json"
+
+    # Load or build knowledge graph
+    if cache_enabled and kg_cache_path.exists() and not args.reprocess:
+        print(f"\nLoading cached knowledge graph: {kg_cache_path}")
+        kg = load_knowledge_graph_cache(kg_cache_path)
+        print(f"  Loaded KG: {len(kg.nodes)} nodes, {len(kg.relationships)} relationships")
+    else:
+        kg = build_knowledge_graph(all_docs, generator_llm, generator_embeddings)
+        if cache_enabled:
+            print(f"\nSaving knowledge graph cache: {kg_cache_path}")
+            save_knowledge_graph_cache(kg, kg_cache_path)
+            with open(kg_meta_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "created_at": _utc_now_iso(),
+                        "schema_version": CACHE_SCHEMA_VERSION,
+                        "pipeline_id": PIPELINE_ID,
+                        "ragas_version": getattr(ragas, "__version__", "unknown"),
+                        "docs_cache_id": docs_cache_id,
+                        "kg_cache_id": kg_cache_id,
+                        "provider": provider_used,
+                        "llm_id": args.model,
+                        "embedding_id": embedding_id,
+                        "num_nodes": len(kg.nodes),
+                        "num_relationships": len(kg.relationships),
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+    # Load or build personas
+    personas: Optional[List[Persona]] = None
+    if cache_enabled and personas_cache_path.exists() and not args.reprocess:
+        print(f"\nLoading cached personas: {personas_cache_path}")
+        personas = load_personas_cache(personas_cache_path)
+        print(f"  Loaded {len(personas)} persona(s)")
+    else:
+        print("\nGenerating personas (will be cached)...")
+        personas = generate_personas_from_kg(kg=kg, llm=generator_llm, num_personas=3)
+        if cache_enabled:
+            save_personas_cache(personas, personas_cache_path)
+            print(f"  Saved personas cache: {personas_cache_path}")
+
+    # Generate testset from the (cached) knowledge graph
+    testset = generate_testset_from_knowledge_graph(
+        kg,
         generator_llm,
         generator_embeddings,
         testset_size=args.testset_size,
+        personas=personas,
     )
 
     # Save results (pass docs for source file mapping)

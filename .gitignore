@@ -3,3 +3,5 @@
 /_duplicates_backup/
 /_duplicate_backup/
 /search-dataset-backup/
+/processed/
+.env

@@ -38,6 +38,18 @@ Common flags:
 - `--max-files 200` (note: this caps loaded *LangChain Documents*, often meaning PDF pages)
 - `--provider auto|openai|azure`
 - `--model gpt-4o-mini` (or your Azure deployment name)
+- `--processed-dir processed` (where intermediate caches are stored)
+- `--no-cache` (disable cache reuse)
+- `--reprocess` (ignore caches and rebuild them)
+
+### Reusing processed artifacts
+
+By default the script saves intermediate artifacts to `processed/` and reuses them on subsequent runs:
+- `processed/docs/`: extracted PDF pages (LangChain `Document`s)
+- `processed/kg/`: the processed RAGAS Knowledge Graph (after transforms)
+- `processed/personas/`: generated personas
+
+This is useful when you want to regenerate testsets (e.g., different `--testset-size`) without re-running the expensive transform step.
 
 ---
 

@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(find:*)",
-      "Bash(xargs:*)"
+      "Bash(xargs:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.ragas.io)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(python:*)"
     ]
   }
 }
