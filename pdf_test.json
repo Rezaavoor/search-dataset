@@ -1,0 +1,114 @@
+[
+  {
+    "user_input":"What the Exchange Act do for emerging growth company and shell company?",
+    "reference_contexts":[
+      "If an emerging growth company, indicate by check mark if the Registrant has elected not to use the extended transition period for complying with any new or revised financial\naccounting standards provided pursuant to Section 13(a) of the Exchange Act. \u2610\nIndicate by check mark whether the Registrant is a shell company (as defined in Rule 12b-2 of the Exchange Act).\nYes  \u2610     No  \u2612\n15,728,702,000 shares of common stock were issued and outstanding as of April 21, 2023."
+    ],
+    "reference":"The Exchange Act provides guidelines for emerging growth companies regarding the election to not use the extended transition period for complying with new or revised financial accounting standards pursuant to Section 13(a). It also defines shell companies under Rule 12b-2, requiring registrants to indicate whether they are considered a shell company.",
+    "persona_name":"Corporate Financial Analyst",
+    "query_style":"POOR_GRAMMAR",
+    "query_length":"LONG",
+    "synthesizer_name":"single_hop_specific_query_synthesizer",
+    "source_files":"[\"2023 Q2 AAPL.pdf\"]",
+    "source_files_with_pages":"[\"2023 Q2 AAPL.pdf (page 2)\"]",
+    "page_numbers":"[2]",
+    "source_files_readable":"2023 Q2 AAPL.pdf",
+    "source_files_with_pages_readable":"2023 Q2 AAPL.pdf (page 2)"
+  },
+  {
+    "user_input":"What Section 13(a) do for emerging growth company?",
+    "reference_contexts":[
+      "If an emerging growth company, indicate by check mark if the Registrant has elected not to use the extended transition period for complying with any new or revised financial\naccounting standards provided pursuant to Section 13(a) of the Exchange Act. \u2610\nIndicate by check mark whether the Registrant is a shell company (as defined in Rule 12b-2 of the Exchange Act).\nYes  \u2610     No  \u2612\n15,728,702,000 shares of common stock were issued and outstanding as of April 21, 2023."
+    ],
+    "reference":"Section 13(a) of the Exchange Act provides an extended transition period for emerging growth companies to comply with new or revised financial accounting standards.",
+    "persona_name":"Corporate Financial Analyst",
+    "query_style":"POOR_GRAMMAR",
+    "query_length":"MEDIUM",
+    "synthesizer_name":"single_hop_specific_query_synthesizer",
+    "source_files":"[\"2023 Q2 AAPL.pdf\"]",
+    "source_files_with_pages":"[\"2023 Q2 AAPL.pdf (page 2)\"]",
+    "page_numbers":"[2]",
+    "source_files_readable":"2023 Q2 AAPL.pdf",
+    "source_files_with_pages_readable":"2023 Q2 AAPL.pdf (page 2)"
+  },
+  {
+    "user_input":"What financial information does Apple Inc. provide in its Form 10-Q for the fiscal quarter ended April 1, 2023?",
+    "reference_contexts":[
+      "Apple Inc.\nForm 10-Q\nFor the Fiscal Quarter Ended April 1, 2023\nTABLE OF CONTENTS\nPage\nPart I\nItem 1. Financial Statements 1\nItem 2. Management\u2019s Discussion and Analysis of Financial Condition and Results of Operations 14\nItem 3. Quantitative and Qualitative Disclosures About Market Risk 19\nItem 4. Controls and Procedures 19\nPart II\nItem 1. Legal Proceedings 20\nItem 1A. Risk Factors 20\nItem 2. Unregistered Sales of Equity Securities and Use of Proceeds 20\nItem 3. Defaults Upon Senior Securities 21\nItem 4. Mine Safety Disclosures 21\nItem 5. Other Information 21\nItem 6. Exhibits 21"
+    ],
+    "reference":"Apple Inc.'s Form 10-Q for the fiscal quarter ended April 1, 2023 includes financial statements, management\u2019s discussion and analysis of financial condition and results of operations, quantitative and qualitative disclosures about market risk, and controls and procedures.",
+    "persona_name":"Corporate Financial Analyst",
+    "query_style":"WEB_SEARCH_LIKE",
+    "query_length":"MEDIUM",
+    "synthesizer_name":"single_hop_specific_query_synthesizer",
+    "source_files":"[\"2023 Q2 AAPL.pdf\"]",
+    "source_files_with_pages":"[\"2023 Q2 AAPL.pdf (page 3)\"]",
+    "page_numbers":"[3]",
+    "source_files_readable":"2023 Q2 AAPL.pdf",
+    "source_files_with_pages_readable":"2023 Q2 AAPL.pdf (page 3)"
+  },
+  {
+    "user_input":"Wht are the key items covered in Apple Inc.'s Form 10-Q for the fiscal quarter ended April 1, 2023?",
+    "reference_contexts":[
+      "Apple Inc.\nForm 10-Q\nFor the Fiscal Quarter Ended April 1, 2023\nTABLE OF CONTENTS\nPage\nPart I\nItem 1. Financial Statements 1\nItem 2. Management\u2019s Discussion and Analysis of Financial Condition and Results of Operations 14\nItem 3. Quantitative and Qualitative Disclosures About Market Risk 19\nItem 4. Controls and Procedures 19\nPart II\nItem 1. Legal Proceedings 20\nItem 1A. Risk Factors 20\nItem 2. Unregistered Sales of Equity Securities and Use of Proceeds 20\nItem 3. Defaults Upon Senior Securities 21\nItem 4. Mine Safety Disclosures 21\nItem 5. Other Information 21\nItem 6. Exhibits 21"
+    ],
+    "reference":"Apple Inc.'s Form 10-Q for the fiscal quarter ended April 1, 2023 covers several key items: Part I includes Financial Statements, Management\u2019s Discussion and Analysis of Financial Condition and Results of Operations, Quantitative and Qualitative Disclosures About Market Risk, and Controls and Procedures. Part II includes Legal Proceedings, Risk Factors, Unregistered Sales of Equity Securities and Use of Proceeds, Defaults Upon Senior Securities, Mine Safety Disclosures, Other Information, and Exhibits.",
+    "persona_name":"Corporate Financial Analyst",
+    "query_style":"MISSPELLED",
+    "query_length":"LONG",
+    "synthesizer_name":"single_hop_specific_query_synthesizer",
+    "source_files":"[\"2023 Q2 AAPL.pdf\"]",
+    "source_files_with_pages":"[\"2023 Q2 AAPL.pdf (page 3)\"]",
+    "page_numbers":"[3]",
+    "source_files_readable":"2023 Q2 AAPL.pdf",
+    "source_files_with_pages_readable":"2023 Q2 AAPL.pdf (page 3)"
+  },
+  {
+    "user_input":"What Apple say about financial condition and market risk in April 1, 2023 report?",
+    "reference_contexts":[
+      "<1-hop>\n\nApple Inc.\nForm 10-Q\nFor the Fiscal Quarter Ended April 1, 2023\nTABLE OF CONTENTS\nPage\nPart I\nItem 1. Financial Statements 1\nItem 2. Management\u2019s Discussion and Analysis of Financial Condition and Results of Operations 14\nItem 3. Quantitative and Qualitative Disclosures About Market Risk 19\nItem 4. Controls and Procedures 19\nPart II\nItem 1. Legal Proceedings 20\nItem 1A. Risk Factors 20\nItem 2. Unregistered Sales of Equity Securities and Use of Proceeds 20\nItem 3. Defaults Upon Senior Securities 21\nItem 4. Mine Safety Disclosures 21\nItem 5. Other Information 21\nItem 6. Exhibits 21"
+    ],
+    "reference":"In the Form 10-Q for the fiscal quarter ended April 1, 2023, Apple Inc. provides a Management\u2019s Discussion and Analysis of Financial Condition and Results of Operations in Item 2, which is found on page 14. Additionally, Apple discusses Quantitative and Qualitative Disclosures About Market Risk in Item 3, located on page 19.",
+    "persona_name":null,
+    "query_style":null,
+    "query_length":null,
+    "synthesizer_name":"multi_hop_specific_query_synthesizer",
+    "source_files":"[\"2023 Q2 AAPL.pdf\"]",
+    "source_files_with_pages":"[\"2023 Q2 AAPL.pdf (page 3)\"]",
+    "page_numbers":"[3]",
+    "source_files_readable":"2023 Q2 AAPL.pdf",
+    "source_files_with_pages_readable":"2023 Q2 AAPL.pdf (page 3)"
+  },
+  {
+    "user_input":"What Apple do on April 1, 2023 with their financial statements and other stuff like legal proceedings and market risk?",
+    "reference_contexts":[
+      "<1-hop>\n\nApple Inc.\nForm 10-Q\nFor the Fiscal Quarter Ended April 1, 2023\nTABLE OF CONTENTS\nPage\nPart I\nItem 1. Financial Statements 1\nItem 2. Management\u2019s Discussion and Analysis of Financial Condition and Results of Operations 14\nItem 3. Quantitative and Qualitative Disclosures About Market Risk 19\nItem 4. Controls and Procedures 19\nPart II\nItem 1. Legal Proceedings 20\nItem 1A. Risk Factors 20\nItem 2. Unregistered Sales of Equity Securities and Use of Proceeds 20\nItem 3. Defaults Upon Senior Securities 21\nItem 4. Mine Safety Disclosures 21\nItem 5. Other Information 21\nItem 6. Exhibits 21"
+    ],
+    "reference":"On April 1, 2023, Apple Inc. filed their Form 10-Q for the fiscal quarter, which included various sections such as financial statements, management\u2019s discussion and analysis of financial condition and results of operations, quantitative and qualitative disclosures about market risk, and controls and procedures. Additionally, the filing covered legal proceedings, risk factors, unregistered sales of equity securities and use of proceeds, defaults upon senior securities, mine safety disclosures, other information, and exhibits.",
+    "persona_name":null,
+    "query_style":null,
+    "query_length":null,
+    "synthesizer_name":"multi_hop_specific_query_synthesizer",
+    "source_files":"[\"2023 Q2 AAPL.pdf\"]",
+    "source_files_with_pages":"[\"2023 Q2 AAPL.pdf (page 3)\"]",
+    "page_numbers":"[3]",
+    "source_files_readable":"2023 Q2 AAPL.pdf",
+    "source_files_with_pages_readable":"2023 Q2 AAPL.pdf (page 3)"
+  },
+  {
+    "user_input":"Wht is the signifcance of the number of shares issued and outstnding as of April 21, 2023?",
+    "reference_contexts":[
+      "<1-hop>\n\nIf an emerging growth company, indicate by check mark if the Registrant has elected not to use the extended transition period for complying with any new or revised financial\naccounting standards provided pursuant to Section 13(a) of the Exchange Act. \u2610\nIndicate by check mark whether the Registrant is a shell company (as defined in Rule 12b-2 of the Exchange Act).\nYes  \u2610     No  \u2612\n15,728,702,000 shares of common stock were issued and outstanding as of April 21, 2023."
+    ],
+    "reference":"As of April 21, 2023, there were 15,728,702,000 shares of common stock issued and outstanding. This figure is significant as it reflects the total number of shares that are currently held by shareholders, which can impact the company's market capitalization and influence investor perception and stock valuation.",
+    "persona_name":null,
+    "query_style":null,
+    "query_length":null,
+    "synthesizer_name":"multi_hop_specific_query_synthesizer",
+    "source_files":"[\"2023 Q2 AAPL.pdf\"]",
+    "source_files_with_pages":"[\"2023 Q2 AAPL.pdf (page 2)\"]",
+    "page_numbers":"[2]",
+    "source_files_readable":"2023 Q2 AAPL.pdf",
+    "source_files_with_pages_readable":"2023 Q2 AAPL.pdf (page 2)"
+  }
+]

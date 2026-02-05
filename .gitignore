@@ -1,0 +1,5 @@
+# Large generated datasets / backups
+/search-dataset/
+/_duplicates_backup/
+/_duplicate_backup/
+/search-dataset-backup/
