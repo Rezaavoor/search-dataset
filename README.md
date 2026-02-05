@@ -35,7 +35,8 @@ Common flags:
 - `--file-types pdf` (non-PDF entries are ignored)
 - `--specific-folders folderA folderB`
 - `--files path/to/one.pdf path/to/another.pdf`
-- `--max-files 200` (note: this caps loaded *LangChain Documents*, often meaning PDF pages)
+- `--max-pdfs 20` (caps the number of PDF files before loading pages)
+- `--max-files 200` (caps extracted *LangChain Documents*; for PDFs this usually means **pages**)
 - `--provider auto|openai|azure`
 - `--model gpt-4o-mini` (or your Azure deployment name)
 - `--processed-dir processed` (where intermediate caches are stored)
@@ -49,15 +50,19 @@ python generate_synthetic_dataset.py \
   --input-dir . \
   --testset-size 50 \
   --hard-negatives \
-  --num-bm25-negatives 2 \
-  --num-embedding-negatives 2 \
+  --num-bm25-negatives 5 \
+  --num-embedding-negatives 5 \
   --output synthetic_dataset_with_negatives
 ```
 
+Hard negatives are saved to a single `hard_negatives` column as a JSON list of
+`"<filename>.pdf (page N)"` strings. Some queries may have **no** hard negatives (`[]`)
+if the miner cannot find negatives reliably.
+
 Hard negative flags:
 - `--hard-negatives` (enable hard negative mining)
-- `--num-bm25-negatives N` (number of BM25 hard negatives per query, default: 2)
-- `--num-embedding-negatives N` (number of embedding hard negatives per query, default: 2)
+- `--num-bm25-negatives N` (BM25 candidate mining budget per query, default: 5)
+- `--num-embedding-negatives N` (embedding candidate mining budget per query, default: 5)
 - `--no-content-embeddings` (disable page_content embeddings, use summary_embedding only)
 
 ### Reusing processed artifacts
@@ -93,6 +98,7 @@ This repo wires those phases together in `generate_synthetic_dataset.py` using:
 
 Important detail:
 - PDFs loaded via `PyPDFLoader` are typically **one `Document` per page** and include `metadata["page"]` (0-indexed). This affects `--max-files` and source mapping.
+- Use `--max-pdfs` if you want to cap the number of PDF files instead of pages.
 
 ### 2) Initialize LLM + embeddings
 
@@ -142,7 +148,7 @@ Typical transform sequence:
 - **Parallel step**:
   - **Embeddings/math**: `CosineSimilarityBuilder(property_name="summary_embedding")` → adds `summary_similarity` edges
   - **String overlap**: `OverlapScoreBuilder(property_name="entities")` → adds `entities_overlap` edges + `overlapped_items`
-- **Embeddings**: `EmbeddingExtractor(property_name="page_content")` → adds `page_content_embedding` (NEW)
+- **Embeddings**: `EmbeddingExtractor(property_name="page_content_embedding", embed_property_name="page_content")` → adds `page_content_embedding` (NEW)
 - **Embeddings/math**: `CosineSimilarityBuilder(property_name="page_content_embedding")` → adds `content_similarity` edges (NEW)
 
 #### Medium-doc pipeline (roughly "many docs are 101–500 tokens")
@@ -234,7 +240,7 @@ RAGAS stores the exact context strings used in:
 
 When `--hard-negatives` is enabled, the script mines challenging negative examples for each query. Hard negatives are passages that:
 - Are **similar** to the query (lexically or semantically)
-- But **do not** contain the answer (are not in `reference_contexts`)
+- But **do not** contain enough information to answer the query
 
 This is essential for training and evaluating retrieval systems, as random negatives are too easy to distinguish.
 
@@ -245,12 +251,19 @@ This is essential for training and evaluating retrieval systems, as random negat
 | **BM25** | Lexical similarity (term overlap) | Passages with similar vocabulary |
 | **Embedding** | Semantic similarity (cosine distance) | Passages about similar topics |
 
+In this repo, BM25/embedding retrieval is used to generate *candidates* at the **page** level.
+Candidates are then filtered for reliability:
+- Exclude any page that matches a positive `(filename,page)`
+- Exclude any page from the same **PDF file** as the positive(s)
+- Exclude near-duplicates via embedding cosine similarity against positive page(s)
+- Validate with an LLM judge: keep only pages that are **relevant** but **not answerable**
+
+Because the miner prioritizes correctness, some queries may produce **no** hard negatives (`[]`).
+
 ### Output columns
 
 When hard negatives are enabled, the output includes:
-- `hard_negatives_bm25`: JSON list of BM25-mined hard negatives
-- `hard_negatives_embedding`: JSON list of embedding-mined hard negatives
-- `hard_negatives`: Combined list (deduplicated)
+- `hard_negatives`: JSON list of strings like `"<filename>.pdf (page N)"`
 
 ### Example output row
 
@@ -259,9 +272,7 @@ When hard negatives are enabled, the output includes:
   "user_input": "What are the penalties for late filing?",
   "reference": "Late filing penalties include...",
   "reference_contexts": ["<positive context from doc>"],
-  "hard_negatives_bm25": ["<lexically similar but wrong passage>"],
-  "hard_negatives_embedding": ["<semantically similar but wrong passage>"],
-  "hard_negatives": ["<combined list>"],
+  "hard_negatives": ["filing_rules.pdf (page 12)", "another_doc.pdf (page 5)"],
   "source_files_with_pages": ["filing_rules.pdf (page 5)"]
 }
 ```
@@ -279,9 +290,7 @@ Typical core columns:
 - `reference_contexts`: list of context strings used to ground the answer
 
 Hard negative columns (when `--hard-negatives` is used):
-- `hard_negatives_bm25`: BM25-mined hard negatives
-- `hard_negatives_embedding`: embedding-mined hard negatives
-- `hard_negatives`: combined list
+- `hard_negatives`: JSON list of `"<filename>.pdf (page N)"` strings
 
 Additional columns may appear depending on synthesizer/version (e.g., persona/style metadata).
 
@@ -337,7 +346,10 @@ Options:
 
 ### "rank_bm25 is required for BM25 hard negative mining"
 
-Install the BM25 library:
+BM25 mining is optional. If you see this error and you don't need BM25 candidates, set:
+`--num-bm25-negatives 0`.
+
+To enable BM25 mining, install the BM25 library:
 ```bash
 pip install rank_bm25
 ```
@@ -357,7 +369,7 @@ Cost drivers:
 
 Ways to reduce:
 - lower `--testset-size`
-- reduce the number of loaded docs/pages via `--max-files` or narrower folders
+- reduce the number of loaded PDFs/pages via `--max-pdfs`, `--max-files`, or narrower folders
 - use a smaller/cheaper model
 - use `--no-content-embeddings` to skip page_content embedding (not recommended)
 

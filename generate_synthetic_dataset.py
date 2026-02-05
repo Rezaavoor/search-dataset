@@ -707,8 +707,8 @@ def mine_hard_negatives_for_testset(
     docs: List[Document],
     embedding_model,
     judge_llm: Any = None,
-    num_bm25_negatives: int = 2,
-    num_embedding_negatives: int = 2,
+    num_bm25_negatives: int = 5,
+    num_embedding_negatives: int = 5,
     max_judge_calls_per_query: int = 12,
 ) -> List[List[str]]:
     """
@@ -1502,14 +1502,14 @@ def main():
     parser.add_argument(
         "--num-bm25-negatives",
         type=int,
-        default=2,
-        help="Number of BM25 hard negatives per query (default: 2)",
+        default=5,
+        help="BM25 candidate mining budget per query (default: 5)",
     )
     parser.add_argument(
         "--num-embedding-negatives",
         type=int,
-        default=2,
-        help="Number of embedding-based hard negatives per query (default: 2)",
+        default=5,
+        help="Embedding candidate mining budget per query (default: 5)",
     )
     parser.add_argument(
         "--no-content-embeddings",
