@@ -1134,6 +1134,146 @@ def build_knowledge_graph(
     return kg
 
 
+DEFAULT_CORPUS_SIZE_HINT = 7000
+
+# Heuristic check for "doc-internal" / deictic queries that don't stand alone in a large corpus.
+_REFERENTIAL_QUERY_RE = re.compile(
+    r"("
+    r"\bthis case\b|"
+    r"\bthis matter\b|"
+    r"\bthis document\b|"
+    r"\bthis agreement\b|"
+    r"\bthe above\b|"
+    r"\bherein\b|"
+    r"\bhereinafter\b|"
+    r"\baforementioned\b|"
+    r"\bin this (case|matter|document|agreement)\b|"
+    r"\bthe parties\b"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def build_corpus_llm_context(*, corpus_size_hint: Optional[int] = None) -> str:
+    """
+    LLM guidance to generate *standalone* queries suitable for a large multi-document corpus.
+
+    This string is passed to RAGAS as `llm_context` and is surfaced inside query-generation prompts.
+    """
+    size_phrase = (
+        f"~{int(corpus_size_hint)}+ PDF documents"
+        if isinstance(corpus_size_hint, int) and corpus_size_hint > 0
+        else "thousands of PDF documents"
+    )
+    return (
+        "You are generating queries for a retrieval/search/RAG system.\n"
+        f"The user is searching across a large corpus of {size_phrase}.\n\n"
+        "CRITICAL: Each query must be a standalone, first-turn query.\n"
+        "- Do NOT assume a document/case has already been selected.\n"
+        "- Avoid deictic references like \"this case\", \"this document\", \"the above\", \"herein\", etc.\n"
+        "- Include concrete identifiers from the provided context to disambiguate (e.g., case caption with \"v.\",\n"
+        "  party/organization names, court/jurisdiction, docket/case number, statute/section, property address,\n"
+        "  agreement name, distinctive dates).\n"
+        "- Do NOT mention filenames or page numbers.\n"
+    )
+
+
+CORPUS_SINGLE_HOP_PROMPT_INSTRUCTION = (
+    "Generate a single-hop query and answer based on the specified conditions (persona, term, style, length) "
+    "and the provided context. Ensure the answer is entirely faithful to the context, using only the information "
+    "directly from the provided context.\n\n"
+    "### Search Query Constraints (CRITICAL)\n"
+    "The query will be asked in a large corpus setting (thousands of PDFs). Therefore:\n"
+    "- The query MUST be standalone as a first-turn query.\n"
+    "- Do NOT write queries that assume a document/case is already selected (avoid: \"this case\", \"this document\", "
+    "\"the above\", \"herein\", \"the parties\" without naming them).\n"
+    "- The query MUST include at least one concrete identifier copied verbatim from the context (case caption with \"v.\", "
+    "party/organization name, court/jurisdiction, docket/case number, statute/section, property address, agreement name, "
+    "or a distinctive date).\n"
+    "- Do NOT mention filenames, page numbers, or \"the provided context\".\n"
+    "- Follow query_style/query_length. If query_style asks for misspellings/poor grammar, keep identifiers intact "
+    "(do not misspell party names or case numbers).\n\n"
+    "### Instructions:\n"
+    "1. **Generate a Query**: Based on the context, persona, term, style, and length, create a question that aligns with "
+    "the persona's perspective, incorporates the term, and satisfies the standalone constraints above.\n"
+    "2. **Generate an Answer**: Using only the content from the provided context, construct a detailed answer to the query. "
+    "Do not add any information not included in or inferable from the context.\n"
+    "3. **Additional Context** (if provided): If llm_context is provided, use it as additional guidance for query framing. "
+    "Still ensure the content comes only from the provided context.\n"
+)
+
+
+CORPUS_MULTI_HOP_PROMPT_INSTRUCTION = (
+    "Generate a multi-hop query and answer based on the specified conditions (persona, themes, style, length) "
+    "and the provided context. The themes represent a set of phrases either extracted or generated from the "
+    "context, which highlight the suitability of the selected context for multi-hop query creation. Ensure the query "
+    "explicitly incorporates these themes.\n\n"
+    "### Search Query Constraints (CRITICAL)\n"
+    "The query will be asked in a large corpus setting (thousands of PDFs). Therefore:\n"
+    "- The query MUST be standalone as a first-turn query.\n"
+    "- Do NOT write queries that assume a document/case is already selected (avoid: \"this case\", \"this document\", "
+    "\"the above\", \"herein\", \"the parties\" without naming them).\n"
+    "- The query MUST include at least one concrete identifier copied verbatim from the contexts (case caption with \"v.\", "
+    "party/organization name, court/jurisdiction, docket/case number, statute/section, property address, agreement name, "
+    "or a distinctive date).\n"
+    "- Do NOT mention filenames, page numbers, or \"the provided context\".\n"
+    "- Follow query_style/query_length. If query_style asks for misspellings/poor grammar, keep identifiers intact "
+    "(do not misspell party names or case numbers).\n\n"
+    "### Instructions:\n"
+    "1. **Generate a Multi-Hop Query**: Use the provided context segments and themes to form a query that requires combining "
+    "information from multiple segments (e.g., `<1-hop>` and `<2-hop>`). Ensure the query explicitly incorporates one or more "
+    "themes, includes concrete identifiers, and makes sense with *no prior conversation*.\n"
+    "2. **Generate an Answer**: Use only the content from the provided context to create a detailed and faithful answer to "
+    "the query. Avoid adding information that is not directly present or inferable from the given context.\n"
+    "3. **Multi-Hop Context Tags**:\n"
+    "   - Each context segment is tagged as `<1-hop>`, `<2-hop>`, etc.\n"
+    "   - Ensure the query uses information from at least two segments and connects them meaningfully.\n"
+    "4. **Additional Context** (if provided): If llm_context is provided, use it as additional guidance for query framing. "
+    "Still ensure the content comes only from the provided context.\n"
+)
+
+
+def build_query_distribution_for_pipeline(
+    llm,
+    kg: KnowledgeGraph,
+    *,
+    standalone_queries: bool,
+    llm_context: Optional[str],
+):
+    """
+    Build a query_distribution that nudges RAGAS to produce *standalone, corpus-appropriate* queries.
+
+    If standalone_queries is False, returns None (RAGAS defaults are used).
+    """
+    if not standalone_queries:
+        return None
+
+    # Use RAGAS's compatibility filtering, then override the prompts.
+    from ragas.testset.synthesizers import default_query_distribution
+    from ragas.testset.synthesizers.single_hop.prompts import (
+        QueryAnswerGenerationPrompt as SingleHopQueryAnswerGenerationPrompt,
+    )
+    from ragas.testset.synthesizers.multi_hop.prompts import (
+        QueryAnswerGenerationPrompt as MultiHopQueryAnswerGenerationPrompt,
+    )
+
+    qd = default_query_distribution(llm, kg, llm_context)
+    patched = []
+    for synthesizer, prob in qd:
+        name = str(getattr(synthesizer, "name", "") or "").lower()
+        if name.startswith("single_hop"):
+            p = SingleHopQueryAnswerGenerationPrompt()
+            p.instruction = CORPUS_SINGLE_HOP_PROMPT_INSTRUCTION
+            synthesizer.generate_query_reference_prompt = p
+        else:
+            p = MultiHopQueryAnswerGenerationPrompt()
+            p.instruction = CORPUS_MULTI_HOP_PROMPT_INSTRUCTION
+            synthesizer.generate_query_reference_prompt = p
+        patched.append((synthesizer, prob))
+
+    return patched
+
+
 def generate_testset_from_knowledge_graph(
     kg: KnowledgeGraph,
     generator_llm,
@@ -1141,6 +1281,8 @@ def generate_testset_from_knowledge_graph(
     *,
     testset_size: int = 50,
     personas: Optional[List[Persona]] = None,
+    llm_context: Optional[str] = None,
+    query_distribution=None,
 ) -> Testset:
     """
     Generate a synthetic testset from a pre-built KnowledgeGraph.
@@ -1153,11 +1295,43 @@ def generate_testset_from_knowledge_graph(
         embedding_model=generator_embeddings,
         knowledge_graph=kg,
         persona_list=personas,
+        llm_context=llm_context,
     )
 
     print(f"Generating testset with {testset_size} samples...")
     print("This may take a while depending on testset size...")
-    return generator.generate(testset_size=testset_size)
+    return generator.generate(
+        testset_size=testset_size,
+        query_distribution=query_distribution,
+    )
+
+
+def _warn_on_referential_queries(testset: Testset, *, limit: int = 5) -> None:
+    """
+    Best-effort sanity check: warn if generated queries look "doc-internal".
+    """
+    try:
+        df = testset.to_pandas()
+    except Exception:
+        return
+    if "user_input" not in df.columns:
+        return
+
+    bad = []
+    for q in df["user_input"].tolist():
+        qs = str(q or "")
+        if _REFERENTIAL_QUERY_RE.search(qs):
+            bad.append(qs)
+
+    if not bad:
+        return
+
+    print(
+        f"\nWarning: {len(bad)}/{len(df)} generated query(ies) look referential "
+        "(e.g., 'this case', 'the above'). Consider tightening corpus-query guidance."
+    )
+    for i, q in enumerate(bad[: max(1, int(limit))], start=1):
+        print(f"  Referenced query {i}: {q}")
 
 
 def build_content_to_source_map(docs: List[Document]) -> Dict[str, str]:
@@ -1410,6 +1584,33 @@ def main():
         type=int,
         default=50,
         help="Number of test samples to generate (default: 50)",
+    )
+    parser.add_argument(
+        "--standalone-queries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Generate standalone, corpus-level search queries that make sense with many documents in context "
+            "(default: enabled). Disable with --no-standalone-queries to use RAGAS defaults."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-size-hint",
+        type=int,
+        default=DEFAULT_CORPUS_SIZE_HINT,
+        help=(
+            "Approximate number of PDFs in the corpus (used only to guide query generation when "
+            "--standalone-queries is enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--query-llm-context",
+        type=str,
+        default=None,
+        help=(
+            "Optional additional guidance passed to RAGAS as llm_context for query generation. "
+            "When --standalone-queries is enabled, this will be appended to the default corpus guidance."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -1769,6 +1970,26 @@ def main():
             save_personas_cache(personas, personas_cache_path)
             print(f"  Saved personas cache: {personas_cache_path}")
 
+    # Query generation guidance (standalone corpus queries vs document-internal queries)
+    llm_context: Optional[str] = None
+    if args.standalone_queries:
+        llm_context = build_corpus_llm_context(corpus_size_hint=args.corpus_size_hint)
+        extra = str(args.query_llm_context or "").strip()
+        if extra:
+            llm_context = llm_context.rstrip() + "\n" + extra + "\n"
+        print("\nStandalone query generation: enabled (corpus-level queries)")
+    else:
+        extra = str(args.query_llm_context or "").strip()
+        llm_context = extra if extra else None
+        print("\nStandalone query generation: disabled (RAGAS defaults)")
+
+    query_distribution = build_query_distribution_for_pipeline(
+        generator_llm,
+        kg,
+        standalone_queries=args.standalone_queries,
+        llm_context=llm_context,
+    )
+
     # Generate testset from the (cached) knowledge graph
     testset = generate_testset_from_knowledge_graph(
         kg,
@@ -1776,7 +1997,13 @@ def main():
         generator_embeddings,
         testset_size=args.testset_size,
         personas=personas,
+        llm_context=llm_context,
+        query_distribution=query_distribution,
     )
+
+    # Quick sanity check: highlight any still-referential queries.
+    if args.standalone_queries:
+        _warn_on_referential_queries(testset)
 
     # Mine hard negatives if requested
     hard_negatives = None
