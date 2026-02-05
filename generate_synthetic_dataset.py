@@ -3,7 +3,7 @@
 RAGAS Synthetic Dataset Generator for Legal Documents
 
 This script generates a synthetic Q&A dataset from legal documents using RAGAS.
-It supports PDF, DOCX, and TXT files.
+It supports PDF files (non-PDF inputs are skipped).
 
 Usage:
     python generate_synthetic_dataset.py [OPTIONS]
@@ -21,6 +21,7 @@ Environment Variables (Azure OpenAI):
 
 import os
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 from dotenv import load_dotenv
@@ -33,17 +34,16 @@ load_dotenv()
 from langchain_community.document_loaders import (
     DirectoryLoader,
     PyPDFLoader,
-    Docx2txtLoader,
-    TextLoader,
 )
 from langchain_core.documents import Document
 
 # RAGAS imports
 from ragas.testset import TestsetGenerator
+from ragas.testset.synthesizers.testset_schema import Testset
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.testset.transforms.splitters import HeadlineSplitter
-from ragas.testset.transforms import default_transforms
+from ragas.testset.transforms import default_transforms, HeadlinesExtractor, NodeFilter
 from ragas.testset.graph import Node, NodeType, Relationship
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings, AzureChatOpenAI, AzureOpenAIEmbeddings
 
@@ -51,43 +51,92 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings, AzureChatOpenAI, Azur
 class SafeHeadlineSplitter(HeadlineSplitter):
     """
     A wrapper around HeadlineSplitter that handles missing headlines gracefully.
-    Instead of raising an error when headlines are not found, it converts the
-    DOCUMENT node to a CHUNK node so downstream extractors still process it.
+
+    If a DOCUMENT node has no usable `headlines` property, this splitter will
+    **skip splitting** (and not raise). Downstream filtering ensures such docs
+    are excluded from question generation.
     """
 
     async def split(self, node: Node) -> Tuple[List[Node], List[Relationship]]:
         # Check if headlines property exists
         headlines = node.get_property("headlines")
-        if headlines is None:
-            # No headlines found - convert DOCUMENT to CHUNK so downstream
-            # extractors (ThemesExtractor, NERExtractor, etc.) still process it
-            chunk_node = Node(
-                type=NodeType.CHUNK,
-                properties=node.properties.copy()
-            )
-            # Create parent-child relationship
-            relationship = Relationship(
-                type="child",
-                source=node,
-                target=chunk_node,
-            )
-            return [chunk_node], [relationship]
+        if not headlines:
+            # No headlines found - safely skip splitting this node.
+            # (We do NOT create fallback chunks; these docs are filtered out upstream.)
+            return [node], []
 
         # Headlines exist - use parent class implementation
         return await super().split(node)
 
 
-def patch_transforms_with_safe_splitter(transforms):
+@dataclass
+class HeadlinesRequiredFilter(NodeFilter):
     """
-    Replace HeadlineSplitter with SafeHeadlineSplitter in the transforms list.
+    Remove DOCUMENT nodes that don't have usable headlines.
+
+    This prevents generating queries from documents/chunks where headline
+    extraction failed or returned non-matching headings.
     """
-    patched = []
-    for transform in transforms:
+
+    require_match_in_text: bool = True
+    case_insensitive_match: bool = True
+
+    async def custom_filter(self, node: Node, kg) -> bool:  # type: ignore[override]
+        headlines = node.get_property("headlines")
+        if not isinstance(headlines, list):
+            return True
+
+        cleaned = [
+            h.strip() for h in headlines if isinstance(h, str) and h.strip()
+        ]
+        if not cleaned:
+            return True
+
+        if not self.require_match_in_text:
+            return False
+
+        text = node.get_property("page_content")
+        if not isinstance(text, str) or not text.strip():
+            return True
+
+        text_cmp = text.lower() if self.case_insensitive_match else text
+        for h in cleaned:
+            h_cmp = h.lower() if self.case_insensitive_match else h
+            if h_cmp in text_cmp:
+                return False
+
+        # None of the extracted headlines appear in the actual text → treat as unusable
+        return True
+
+
+def patch_transforms_with_safe_splitter(transforms, llm):
+    """
+    Patch RAGAS transforms to enforce headline-only generation:
+
+    - Extract headlines for all DOCUMENT nodes
+    - Filter out DOCUMENT nodes without usable headlines
+    - Replace HeadlineSplitter with SafeHeadlineSplitter (no fallback chunking)
+    """
+    def doc_nodes_only(node: Node) -> bool:
+        return node.type == NodeType.DOCUMENT
+
+    # Avoid duplicate headline extraction from default_transforms
+    base_transforms = [
+        t for t in transforms if not isinstance(t, HeadlinesExtractor)
+    ]
+
+    patched = [
+        HeadlinesExtractor(llm=llm, filter_nodes=doc_nodes_only),
+        HeadlinesRequiredFilter(filter_nodes=doc_nodes_only),
+    ]
+
+    for transform in base_transforms:
         if isinstance(transform, HeadlineSplitter):
             # Replace with safe version, preserving settings
             safe_splitter = SafeHeadlineSplitter(
                 min_tokens=transform.min_tokens,
-                max_tokens=transform.max_tokens
+                max_tokens=transform.max_tokens,
+                filter_nodes=transform.filter_nodes,
             )
             patched.append(safe_splitter)
         else:
@@ -97,7 +146,7 @@ def patch_transforms_with_safe_splitter(transforms):
 
 def load_documents(
     base_path: str,
-    file_types: List[str] = ["pdf", "docx", "txt"],
+    file_types: List[str] = ["pdf"],
     max_files: Optional[int] = None,
     recursive: bool = True,
 ) -> List[Document]:
@@ -118,9 +167,18 @@ def load_documents(
 
     loaders_config = {
         "pdf": (PyPDFLoader, "*.pdf"),
-        "docx": (Docx2txtLoader, "*.docx"),
-        "txt": (TextLoader, "*.txt"),
     }
+
+    # Enforce PDF-only loading (skip non-PDF types even if requested)
+    normalized_types = [ft.lower().lstrip(".") for ft in (file_types or [])]
+    non_pdf_types = sorted({ft for ft in normalized_types if ft and ft != "pdf"})
+    if non_pdf_types:
+        print(
+            f"Skipping non-PDF file types: {', '.join(non_pdf_types)} "
+            "(only PDF is supported)"
+        )
+
+    file_types = ["pdf"] if "pdf" in normalized_types or not normalized_types else []
 
     for file_type in file_types:
         if file_type.lower() not in loaders_config:
@@ -254,7 +312,7 @@ def generate_testset(
     generator_llm,
     generator_embeddings,
     testset_size: int = 50,
-) -> "Testset":
+) -> Testset:
     """
     Generate a synthetic testset using RAGAS.
 
@@ -284,8 +342,8 @@ def generate_testset(
         llm=generator_llm,
         embedding_model=generator_embeddings,
     )
-    transforms = patch_transforms_with_safe_splitter(transforms)
-    print("Using SafeHeadlineSplitter (handles documents without headlines)")
+    transforms = patch_transforms_with_safe_splitter(transforms, llm=generator_llm)
+    print("Headline-only generation enabled (skipping documents without usable headlines)")
 
     testset = generator.generate_with_langchain_docs(
         docs,
@@ -546,8 +604,8 @@ def main():
         "--file-types",
         type=str,
         nargs="+",
-        default=["pdf", "docx", "txt"],
-        help="File types to load (default: pdf docx txt)",
+        default=["pdf"],
+        help="File types to load (PDF only; non-PDF entries are ignored)",
     )
     parser.add_argument(
         "--max-files",
@@ -632,12 +690,8 @@ def main():
                 ext = resolved_file_path.suffix.lower()
                 if ext == ".pdf":
                     loader = PyPDFLoader(str(resolved_file_path))
-                elif ext == ".docx":
-                    loader = Docx2txtLoader(str(resolved_file_path))
-                elif ext == ".txt":
-                    loader = TextLoader(str(resolved_file_path))
                 else:
-                    print(f"  Warning: Unsupported file type: {resolved_file_path}")
+                    print(f"  Skipping non-PDF file: {resolved_file_path}")
                     continue
                 file_docs = loader.load()
                 print(f"  Loaded {len(file_docs)} document(s) from: {resolved_file_path.name}")
