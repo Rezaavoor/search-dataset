@@ -20,9 +20,11 @@ Environment Variables (Azure OpenAI):
 """
 
 import os
+import ast
 import argparse
 import gzip
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -321,6 +323,51 @@ def load_personas_cache(path: Path) -> List[Persona]:
     return [Persona(**p) for p in data]
 
 
+_HOP_PREFIX_RE = re.compile(r"^\s*<\d+-hop>\s*", flags=re.IGNORECASE)
+
+
+def strip_hop_prefix(text: str) -> str:
+    """
+    Remove RAGAS hop markers like "<1-hop>" that are sometimes prepended to reference contexts.
+    """
+    return _HOP_PREFIX_RE.sub("", text)
+
+
+def parse_reference_contexts(value: Any) -> List[str]:
+    """
+    Robustly parse `reference_contexts` into a list of strings.
+
+    RAGAS often stores this as a Python-list string (single quotes), which is not valid JSON.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        if s.startswith("[") and s.endswith("]"):
+            # Prefer Python literal parsing for "['a', 'b']" style strings.
+            try:
+                v = ast.literal_eval(s)
+                if isinstance(v, list):
+                    return [str(x) for x in v if x is not None]
+                return [str(v)]
+            except Exception:
+                pass
+        # Fallback to JSON if it happens to be valid JSON.
+        try:
+            v = json.loads(s)
+            if isinstance(v, list):
+                return [str(x) for x in v if x is not None]
+            return [str(v)]
+        except Exception:
+            return [s]
+
+    return [str(value)]
+
+
 def get_all_chunks_from_kg(kg: "KnowledgeGraph") -> List[Dict[str, Any]]:
     """
     Extract all chunks (page_content + embedding) from the KnowledgeGraph.
@@ -368,185 +415,273 @@ def build_bm25_index(chunks: List[Dict[str, Any]]) -> Tuple[Any, List[List[str]]
     return bm25, tokenized_corpus
 
 
-def find_bm25_hard_negatives(
+def _extract_pages_from_kg(kg: "KnowledgeGraph") -> List[Dict[str, Any]]:
+    """
+    Build a page-level candidate set from KG DOCUMENT nodes.
+
+    Returns dicts containing:
+      - file (basename)
+      - page (1-indexed int)
+      - source (full path, if present)
+      - page_content (text)
+      - embedding (page_content_embedding preferred, else summary_embedding)
+    """
+    pages_by_key: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for node in kg.nodes:
+        if node.type != NodeType.DOCUMENT:
+            continue
+
+        md = node.get_property("document_metadata") or {}
+        source = md.get("source")
+        page0 = md.get("page")
+        if not source or not isinstance(page0, int):
+            continue
+
+        filename = os.path.basename(str(source))
+        page = page0 + 1  # human-readable, 1-indexed
+        key = (filename, page)
+
+        page_content = node.get_property("page_content") or ""
+        embedding = node.get_property("page_content_embedding")
+        if embedding is None:
+            embedding = node.get_property("summary_embedding")
+
+        pages_by_key[key] = {
+            "file": filename,
+            "page": page,
+            "source": str(source),
+            "page_content": page_content,
+            "embedding": embedding,
+        }
+
+    return list(pages_by_key.values())
+
+
+def _top_indices_desc(scores: Any, top_n: int) -> List[int]:
+    """
+    Return indices of the top_n scores in descending order, without sorting the entire array.
+    """
+    scores_np = np.asarray(scores, dtype=float)
+    n = scores_np.shape[0]
+    if n == 0:
+        return []
+    top_n = max(0, min(int(top_n), n))
+    if top_n == 0:
+        return []
+    if top_n == n:
+        return [int(i) for i in np.argsort(scores_np)[::-1]]
+    idx = np.argpartition(scores_np, -top_n)[-top_n:]
+    idx = idx[np.argsort(scores_np[idx])[::-1]]
+    return [int(i) for i in idx]
+
+
+def find_bm25_hard_negative_pages(
     query: str,
-    positive_contents: List[str],
-    chunks: List[Dict[str, Any]],
+    pages: List[Dict[str, Any]],
     bm25: Any,
+    *,
+    exclude_files: set,
+    exclude_pages: set,
     top_k: int = 5,
-) -> List[str]:
+    pool_size: int = 200,
+) -> List[Dict[str, Any]]:
     """
     Find hard negatives using BM25 scoring.
-    Returns chunks that are lexically similar but not in positive_contents.
+    Returns page refs (filename+page) that are lexically similar and satisfy exclusions.
     """
     tokenized_query = query.lower().split()
     scores = bm25.get_scores(tokenized_query)
+    top_idxs = _top_indices_desc(scores, top_n=min(pool_size, len(pages)))
 
-    # Normalize positive contents for comparison
-    positive_normalized = {p.strip().lower() for p in positive_contents}
+    hard_negs: List[Dict[str, Any]] = []
+    seen: set = set()
+    for i in top_idxs:
+        score = float(scores[i])
+        if score <= 0:
+            break
+        p = pages[i]
+        key = (p.get("file"), p.get("page"))
+        if key in exclude_pages:
+            continue
+        if p.get("file") in exclude_files:
+            continue
+        if key in seen:
+            continue
+        if not p.get("file") or not p.get("page"):
+            continue
+        hard_negs.append({"file": p["file"], "page": int(p["page"])})
+        seen.add(key)
+        if len(hard_negs) >= top_k:
+            break
 
-    # Sort by score descending
-    scored_chunks = list(zip(scores, chunks))
-    scored_chunks.sort(key=lambda x: x[0], reverse=True)
-
-    hard_negatives = []
-    for score, chunk in scored_chunks:
-        content = chunk["page_content"]
-        # Skip if this is a positive (exact or fuzzy match)
-        content_normalized = content.strip().lower()
-
-        is_positive = False
-        for pos in positive_normalized:
-            # Check for containment in either direction
-            if pos in content_normalized or content_normalized in pos:
-                is_positive = True
-                break
-            # Check for significant overlap
-            if len(pos) > 100:
-                if pos[:100] in content_normalized or content_normalized[:100] in pos:
-                    is_positive = True
-                    break
-
-        if not is_positive and score > 0:
-            hard_negatives.append(content)
-            if len(hard_negatives) >= top_k:
-                break
-
-    return hard_negatives
+    return hard_negs
 
 
-def find_embedding_hard_negatives(
+def find_embedding_hard_negative_pages(
     query_embedding: List[float],
-    positive_contents: List[str],
-    chunks: List[Dict[str, Any]],
+    pages: List[Dict[str, Any]],
+    *,
+    candidate_indices: Optional[List[int]] = None,
+    exclude_files: set,
+    exclude_pages: set,
     top_k: int = 5,
-) -> List[str]:
+    min_similarity: float = 0.25,
+) -> List[Dict[str, Any]]:
     """
     Find hard negatives using embedding cosine similarity.
-    Returns chunks that are semantically similar but not in positive_contents.
+    Returns page refs (filename+page) that are semantically similar and satisfy exclusions.
     """
-    # Filter chunks that have embeddings
-    chunks_with_embeddings = [c for c in chunks if c["embedding"] is not None]
-    if not chunks_with_embeddings:
+    if candidate_indices is None:
+        candidate_indices = list(range(len(pages)))
+
+    cand = []
+    for i in candidate_indices:
+        if i < 0 or i >= len(pages):
+            continue
+        p = pages[i]
+        key = (p.get("file"), p.get("page"))
+        if key in exclude_pages:
+            continue
+        if p.get("file") in exclude_files:
+            continue
+        emb = p.get("embedding")
+        if emb is None:
+            continue
+        cand.append((p, emb))
+
+    if not cand:
         return []
 
-    query_emb = np.array(query_embedding)
-    query_norm = np.linalg.norm(query_emb)
-    if query_norm == 0:
+    q = np.array(query_embedding, dtype=float)
+    qn = np.linalg.norm(q)
+    if qn == 0:
         return []
-    query_emb = query_emb / query_norm
+    q = q / qn
 
-    # Compute cosine similarities
-    similarities = []
-    for chunk in chunks_with_embeddings:
-        chunk_emb = np.array(chunk["embedding"])
-        chunk_norm = np.linalg.norm(chunk_emb)
-        if chunk_norm == 0:
-            similarities.append(0.0)
-        else:
-            similarities.append(float(np.dot(query_emb, chunk_emb / chunk_norm)))
+    sims = []
+    for _p, emb in cand:
+        v = np.array(emb, dtype=float)
+        vn = np.linalg.norm(v)
+        sims.append(0.0 if vn == 0 else float(np.dot(q, v / vn)))
 
-    # Normalize positive contents for comparison
-    positive_normalized = {p.strip().lower() for p in positive_contents}
-
-    # Sort by similarity descending
-    scored_chunks = list(zip(similarities, chunks_with_embeddings))
-    scored_chunks.sort(key=lambda x: x[0], reverse=True)
-
-    hard_negatives = []
-    for sim, chunk in scored_chunks:
-        content = chunk["page_content"]
-        content_normalized = content.strip().lower()
-
-        is_positive = False
-        for pos in positive_normalized:
-            if pos in content_normalized or content_normalized in pos:
-                is_positive = True
-                break
-            if len(pos) > 100:
-                if pos[:100] in content_normalized or content_normalized[:100] in pos:
-                    is_positive = True
-                    break
-
-        if not is_positive:
-            hard_negatives.append(content)
-            if len(hard_negatives) >= top_k:
-                break
-
-    return hard_negatives
+    order = np.argsort(np.asarray(sims))[::-1]
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for j in order:
+        sim = float(sims[int(j)])
+        if sim < min_similarity:
+            break
+        p, _emb = cand[int(j)]
+        key = (p.get("file"), p.get("page"))
+        if key in seen:
+            continue
+        if not p.get("file") or not p.get("page"):
+            continue
+        out.append({"file": p["file"], "page": int(p["page"])})
+        seen.add(key)
+        if len(out) >= top_k:
+            break
+    return out
 
 
 def mine_hard_negatives_for_testset(
     testset_df,
     kg: "KnowledgeGraph",
+    docs: List[Document],
     embedding_model,
     num_bm25_negatives: int = 2,
     num_embedding_negatives: int = 2,
-) -> Tuple[List[List[str]], List[List[str]]]:
+) -> List[List[Dict[str, Any]]]:
     """
     Mine hard negatives for all queries in the testset.
 
+    Hard negatives are stored as {"file": "<filename>.pdf", "page": <1-indexed page>}.
+    Exclusions:
+      - No hard negatives from the same source PDF as any positive context
+      - Exclude positives by (file,page) rather than content matching
+
     Returns:
-        (bm25_negatives_list, embedding_negatives_list) - one list per row
+        hard_negatives_list - one list per row
     """
     print("\nMining hard negatives...")
 
-    # Extract chunks from KG
-    chunks = get_all_chunks_from_kg(kg)
-    print(f"  Extracted {len(chunks)} chunks from KG")
+    pages = _extract_pages_from_kg(kg)
+    print(f"  Candidate pages from KG: {len(pages)}")
+    pages_with_embeddings = sum(1 for p in pages if p.get("embedding") is not None)
+    print(f"  Pages with embeddings: {pages_with_embeddings}/{len(pages)}")
 
-    chunks_with_embeddings = sum(1 for c in chunks if c["embedding"] is not None)
-    print(f"  Chunks with embeddings: {chunks_with_embeddings}/{len(chunks)}")
-
-    # Build BM25 index
     bm25 = None
     if num_bm25_negatives > 0:
         try:
-            bm25, _ = build_bm25_index(chunks)
+            bm25, _ = build_bm25_index(pages)
             print("  Built BM25 index")
         except ImportError as e:
             print(f"  Warning: {e}")
             print("  Skipping BM25 hard negatives")
 
-    bm25_negatives_list = []
-    embedding_negatives_list = []
+    hard_negatives_list: List[List[Dict[str, Any]]] = []
 
     for idx, row in testset_df.iterrows():
         query = row["user_input"]
 
-        # Parse reference_contexts
-        contexts = row["reference_contexts"]
-        if isinstance(contexts, str):
-            try:
-                contexts = json.loads(contexts.replace("'", '"'))
-            except Exception:
-                contexts = [contexts]
-        if not isinstance(contexts, list):
-            contexts = [contexts] if contexts else []
+        contexts = [strip_hop_prefix(c) for c in parse_reference_contexts(row.get("reference_contexts"))]
+        pos_info = find_source_files(contexts, docs)
+        pos_files = {f for f in (pos_info.get("sources") or []) if f and f != "unknown"}
+        pos_pages = {
+            (d.get("file"), d.get("page"))
+            for d in (pos_info.get("source_page_pairs") or [])
+            if isinstance(d, dict) and d.get("file") and d.get("page")
+        }
 
-        # BM25 hard negatives
-        bm25_negs = []
+        # Reliability > coverage: if we can't identify positives confidently, skip.
+        if not pos_files or not pos_pages:
+            hard_negatives_list.append([])
+            continue
+
+        bm25_negs: List[Dict[str, Any]] = []
         if bm25 is not None and num_bm25_negatives > 0:
-            bm25_negs = find_bm25_hard_negatives(
-                query, contexts, chunks, bm25, top_k=num_bm25_negatives
+            bm25_negs = find_bm25_hard_negative_pages(
+                query,
+                pages,
+                bm25,
+                exclude_files=pos_files,
+                exclude_pages=pos_pages,
+                top_k=num_bm25_negatives,
             )
-        bm25_negatives_list.append(bm25_negs)
 
-        # Embedding hard negatives
-        emb_negs = []
-        if num_embedding_negatives > 0 and chunks_with_embeddings > 0:
-            # Embed the query
+        emb_negs: List[Dict[str, Any]] = []
+        if num_embedding_negatives > 0 and pages_with_embeddings > 0:
             try:
-                query_embedding = embedding_model.embed_query(query)
-                emb_negs = find_embedding_hard_negatives(
-                    query_embedding, contexts, chunks, top_k=num_embedding_negatives
+                q_emb = embedding_model.embed_query(query)
+                cand_idxs: Optional[List[int]] = None
+                if bm25 is not None:
+                    scores = bm25.get_scores(query.lower().split())
+                    cand_idxs = _top_indices_desc(scores, top_n=300)
+                emb_negs = find_embedding_hard_negative_pages(
+                    q_emb,
+                    pages,
+                    candidate_indices=cand_idxs,
+                    exclude_files=pos_files,
+                    exclude_pages=pos_pages,
+                    top_k=num_embedding_negatives,
                 )
             except Exception as e:
                 print(f"  Warning: Failed to embed query {idx}: {e}")
-        embedding_negatives_list.append(emb_negs)
 
-    print(f"  Mined hard negatives for {len(testset_df)} queries")
-    return bm25_negatives_list, embedding_negatives_list
+        # Merge strategy:
+        # - If both approaches enabled and both produced results -> keep intersection only
+        # - Otherwise, use whichever approach produced results
+        if num_bm25_negatives > 0 and num_embedding_negatives > 0 and bm25_negs and emb_negs:
+            bm25_keys = {(d["file"], d["page"]) for d in bm25_negs}
+            emb_keys = {(d["file"], d["page"]) for d in emb_negs}
+            inter = bm25_keys.intersection(emb_keys)
+            hard_negatives_list.append([{"file": f, "page": int(p)} for (f, p) in sorted(inter)])
+        else:
+            hard_negatives_list.append(emb_negs if (num_embedding_negatives > 0 and emb_negs) else bm25_negs)
+
+    total_negs = sum(len(x) for x in hard_negatives_list)
+    print(f"  Mined {total_negs} hard negative(s) for {len(testset_df)} queries")
+    return hard_negatives_list
 
 
 def sort_documents_deterministically(docs: List[Document]) -> List[Document]:
@@ -845,10 +980,12 @@ def find_source_files(reference_contexts: List[str], docs: List[Document]) -> Di
     all_sources = []
     all_sources_with_pages = []
     all_page_numbers = []
+    all_source_page_pairs: List[Dict[str, Any]] = []
+    seen_pairs: set = set()
 
     for context in reference_contexts:
         # Normalize context for comparison
-        context_normalized = context.lower().strip()
+        context_normalized = strip_hop_prefix(str(context)).lower().strip()
 
         for doc in docs:
             doc_content = doc.page_content.lower().strip()
@@ -895,6 +1032,11 @@ def find_source_files(reference_contexts: List[str], docs: List[Document]) -> Di
                 if source_with_page not in all_sources_with_pages:
                     all_sources_with_pages.append(source_with_page)
                     all_page_numbers.append(page_num + 1 if page_num is not None else None)
+                    if page_num is not None:
+                        pair = (filename, page_num + 1)
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            all_source_page_pairs.append({"file": filename, "page": page_num + 1})
 
                 if filename not in all_sources:
                     all_sources.append(filename)
@@ -902,7 +1044,9 @@ def find_source_files(reference_contexts: List[str], docs: List[Document]) -> Di
     return {
         'sources': all_sources if all_sources else ["unknown"],
         'sources_with_pages': all_sources_with_pages if all_sources_with_pages else ["unknown"],
-        'page_numbers': all_page_numbers if all_page_numbers else [None]
+        'page_numbers': all_page_numbers if all_page_numbers else [None],
+        # Structured page ids (filename+page) for reliable comparisons downstream
+        'source_page_pairs': all_source_page_pairs,
     }
 
 
@@ -911,8 +1055,7 @@ def save_testset(
     output_path: str,
     formats: List[str] = ["csv", "json"],
     docs: Optional[List[Document]] = None,
-    bm25_negatives: Optional[List[List[str]]] = None,
-    embedding_negatives: Optional[List[List[str]]] = None,
+    hard_negatives: Optional[List[List[Dict[str, Any]]]] = None,
 ):
     """
     Save the generated testset to files.
@@ -922,8 +1065,7 @@ def save_testset(
         output_path: Base path for output files (without extension)
         formats: List of output formats ('csv', 'json', 'parquet')
         docs: Original documents for source file mapping
-        bm25_negatives: List of BM25 hard negatives per row
-        embedding_negatives: List of embedding hard negatives per row
+        hard_negatives: Hard negatives per row as {"file": ..., "page": ...}
     """
     df = testset.to_pandas()
 
@@ -935,13 +1077,7 @@ def save_testset(
         page_numbers_list = []
 
         for idx, row in df.iterrows():
-            # Parse reference_contexts - it might be a string representation of a list
-            contexts = row["reference_contexts"]
-            if isinstance(contexts, str):
-                try:
-                    contexts = json.loads(contexts.replace("'", '"'))
-                except Exception:
-                    contexts = [contexts]
+            contexts = parse_reference_contexts(row.get("reference_contexts"))
 
             # Find sources for all contexts in this row
             result = find_source_files(contexts if isinstance(contexts, list) else [contexts], docs)
@@ -963,30 +1099,10 @@ def save_testset(
         df["source_files_with_pages_readable"] = [", ".join(files) if files != ["unknown"] else "unknown" for files in source_files_with_pages_list]
 
     # Add hard negatives if provided
-    if bm25_negatives is not None:
-        df["hard_negatives_bm25"] = [json.dumps(negs) for negs in bm25_negatives]
-        bm25_count = sum(len(negs) for negs in bm25_negatives)
-        print(f"  Added {bm25_count} BM25 hard negatives ({bm25_count / len(df):.1f} avg per query)")
-
-    if embedding_negatives is not None:
-        df["hard_negatives_embedding"] = [json.dumps(negs) for negs in embedding_negatives]
-        emb_count = sum(len(negs) for negs in embedding_negatives)
-        print(f"  Added {emb_count} embedding hard negatives ({emb_count / len(df):.1f} avg per query)")
-
-    # Add combined hard negatives column for convenience
-    if bm25_negatives is not None or embedding_negatives is not None:
-        combined_negatives = []
-        for i in range(len(df)):
-            combined = []
-            if bm25_negatives is not None and i < len(bm25_negatives):
-                combined.extend(bm25_negatives[i])
-            if embedding_negatives is not None and i < len(embedding_negatives):
-                # Avoid duplicates
-                for neg in embedding_negatives[i]:
-                    if neg not in combined:
-                        combined.append(neg)
-            combined_negatives.append(combined)
-        df["hard_negatives"] = [json.dumps(negs) for negs in combined_negatives]
+    if hard_negatives is not None:
+        df["hard_negatives"] = [json.dumps(negs, ensure_ascii=False) for negs in hard_negatives]
+        neg_count = sum(len(negs) for negs in hard_negatives)
+        print(f"  Added {neg_count} hard negatives ({neg_count / len(df):.1f} avg per query)")
 
     print(f"\nGenerated {len(df)} test samples")
     print("\nSample preview:")
@@ -1413,8 +1529,7 @@ def main():
     )
 
     # Mine hard negatives if requested
-    bm25_negatives = None
-    embedding_negatives = None
+    hard_negatives = None
     if args.hard_negatives:
         # Use the embeddings wrapper directly for query embedding.
         # (RAGAS LangchainEmbeddingsWrapper stores the underlying LC embedder at `.embeddings`,
@@ -1422,9 +1537,10 @@ def main():
         raw_embedding_model = generator_embeddings
 
         testset_df = testset.to_pandas()
-        bm25_negatives, embedding_negatives = mine_hard_negatives_for_testset(
+        hard_negatives = mine_hard_negatives_for_testset(
             testset_df,
             kg,
+            all_docs,
             raw_embedding_model,
             num_bm25_negatives=args.num_bm25_negatives,
             num_embedding_negatives=args.num_embedding_negatives,
@@ -1436,15 +1552,14 @@ def main():
         args.output,
         formats=args.output_formats,
         docs=all_docs,
-        bm25_negatives=bm25_negatives,
-        embedding_negatives=embedding_negatives,
+        hard_negatives=hard_negatives,
     )
 
     print("\n" + "=" * 60)
     print("Generation complete!")
     print(f"Total samples generated: {len(df)}")
     if args.hard_negatives:
-        print("Hard negatives included: BM25 + embedding-based")
+        print("Hard negatives included (file + page)")
     print("=" * 60)
 
     return 0
