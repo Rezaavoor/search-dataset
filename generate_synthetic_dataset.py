@@ -39,6 +39,7 @@ from langchain_community.document_loaders import (
     PyPDFLoader,
 )
 from langchain_core.documents import Document
+from langchain_core.messages import SystemMessage, HumanMessage
 
 # RAGAS imports
 import ragas
@@ -368,6 +369,122 @@ def parse_reference_contexts(value: Any) -> List[str]:
     return [str(value)]
 
 
+def _truncate_for_judge(text: str, *, max_chars: int = 8000) -> str:
+    """
+    Keep judge prompts bounded in size (cost + latency).
+
+    We keep both the start and end of the passage because legal docs often place
+    the key clause near headings or near the end of a page.
+    """
+    if not text:
+        return ""
+    t = text.replace("\x00", " ").strip()
+    if len(t) <= max_chars:
+        return t
+    head = int(max_chars * 0.65)
+    tail = max_chars - head
+    return f"{t[:head]}\n...\n{t[-tail:]}"
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract and parse the first JSON object found in a model response.
+    """
+    if not isinstance(text, str):
+        return None
+    t = text.strip()
+    # Strip code fences if present
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", t)
+        t = t.replace("```", "").strip()
+    start = t.find("{")
+    end = t.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    blob = t[start : end + 1]
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
+
+
+def _normalize_ynu(value: Any) -> str:
+    """
+    Normalize various yes/no/uncertain representations to 'yes'|'no'|'uncertain'.
+    """
+    s = str(value or "").strip().lower()
+    if s in {"yes", "y", "true", "1"}:
+        return "yes"
+    if s in {"no", "n", "false", "0"}:
+        return "no"
+    return "uncertain"
+
+
+def llm_is_hard_negative(
+    judge_llm: Any,
+    *,
+    question: str,
+    passage: str,
+) -> Optional[bool]:
+    """
+    Ask an LLM to determine whether a passage is a *hard negative* for a question:
+    relevant to the question, but does NOT contain enough information to answer it.
+
+    Returns:
+      - True  => relevant=yes AND answerable=no
+      - False => otherwise (answerable=yes OR irrelevant)
+      - None  => parsing/format uncertainty (treat as unreliable)
+    """
+    if judge_llm is None:
+        return None
+
+    system = (
+        "You are a strict evaluator.\n"
+        "Decide whether the PASSAGE is relevant to the QUESTION, and whether it contains\n"
+        "enough information to answer the QUESTION.\n"
+        "Use ONLY the passage. Do not use outside knowledge.\n"
+        "If answerable=\"yes\", you MUST include an exact verbatim quote from the passage\n"
+        "that contains the key information.\n"
+        "Return ONLY valid JSON."
+    )
+
+    passage_snippet = _truncate_for_judge(passage, max_chars=8000)
+    user = (
+        f"QUESTION:\n{question}\n\n"
+        f"PASSAGE:\n{passage_snippet}\n\n"
+        'Return JSON in this exact schema:\n'
+        '{"relevant":"yes|no|uncertain","answerable":"yes|no|uncertain","evidence":"<verbatim quote if answerable=yes else empty>"}'
+    )
+
+    try:
+        resp = judge_llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    except Exception:
+        return None
+
+    content = getattr(resp, "content", None)
+    content = content if isinstance(content, str) else str(resp)
+    data = _extract_json_object(content)
+    if not isinstance(data, dict):
+        return None
+
+    relevant = _normalize_ynu(data.get("relevant"))
+    answerable = _normalize_ynu(data.get("answerable"))
+    evidence = str(data.get("evidence") or "")
+
+    if answerable == "yes":
+        # Require a verbatim quote to reduce hallucinated \"yes\" decisions
+        if not evidence or evidence not in passage_snippet:
+            return None
+
+    if relevant == "yes" and answerable == "no":
+        return True
+    if answerable == "yes":
+        return False
+    if relevant == "no":
+        return False
+    return None
+
+
 def get_all_chunks_from_kg(kg: "KnowledgeGraph") -> List[Dict[str, Any]]:
     """
     Extract all chunks (page_content + embedding) from the KnowledgeGraph.
@@ -482,9 +599,9 @@ def find_bm25_hard_negative_pages(
     *,
     exclude_files: set,
     exclude_pages: set,
-    top_k: int = 5,
+    top_k: int = 50,
     pool_size: int = 200,
-) -> List[Dict[str, Any]]:
+) -> List[Tuple[str, int]]:
     """
     Find hard negatives using BM25 scoring.
     Returns page refs (filename+page) that are lexically similar and satisfy exclusions.
@@ -493,7 +610,7 @@ def find_bm25_hard_negative_pages(
     scores = bm25.get_scores(tokenized_query)
     top_idxs = _top_indices_desc(scores, top_n=min(pool_size, len(pages)))
 
-    hard_negs: List[Dict[str, Any]] = []
+    hard_negs: List[Tuple[str, int]] = []
     seen: set = set()
     for i in top_idxs:
         score = float(scores[i])
@@ -509,7 +626,7 @@ def find_bm25_hard_negative_pages(
             continue
         if not p.get("file") or not p.get("page"):
             continue
-        hard_negs.append({"file": p["file"], "page": int(p["page"])})
+        hard_negs.append((str(p["file"]), int(p["page"])))
         seen.add(key)
         if len(hard_negs) >= top_k:
             break
@@ -524,9 +641,9 @@ def find_embedding_hard_negative_pages(
     candidate_indices: Optional[List[int]] = None,
     exclude_files: set,
     exclude_pages: set,
-    top_k: int = 5,
+    top_k: int = 50,
     min_similarity: float = 0.25,
-) -> List[Dict[str, Any]]:
+) -> List[Tuple[str, int]]:
     """
     Find hard negatives using embedding cosine similarity.
     Returns page refs (filename+page) that are semantically similar and satisfy exclusions.
@@ -565,7 +682,7 @@ def find_embedding_hard_negative_pages(
         sims.append(0.0 if vn == 0 else float(np.dot(q, v / vn)))
 
     order = np.argsort(np.asarray(sims))[::-1]
-    out: List[Dict[str, Any]] = []
+    out: List[Tuple[str, int]] = []
     seen: set = set()
     for j in order:
         sim = float(sims[int(j)])
@@ -577,7 +694,7 @@ def find_embedding_hard_negative_pages(
             continue
         if not p.get("file") or not p.get("page"):
             continue
-        out.append({"file": p["file"], "page": int(p["page"])})
+        out.append((str(p["file"]), int(p["page"])))
         seen.add(key)
         if len(out) >= top_k:
             break
@@ -589,13 +706,15 @@ def mine_hard_negatives_for_testset(
     kg: "KnowledgeGraph",
     docs: List[Document],
     embedding_model,
+    judge_llm: Any = None,
     num_bm25_negatives: int = 2,
     num_embedding_negatives: int = 2,
-) -> List[List[Dict[str, Any]]]:
+    max_judge_calls_per_query: int = 12,
+) -> List[List[str]]:
     """
     Mine hard negatives for all queries in the testset.
 
-    Hard negatives are stored as {"file": "<filename>.pdf", "page": <1-indexed page>}.
+    Hard negatives are stored as "<filename>.pdf (page N)" (1-indexed pages).
     Exclusions:
       - No hard negatives from the same source PDF as any positive context
       - Exclude positives by (file,page) rather than content matching
@@ -619,10 +738,47 @@ def mine_hard_negatives_for_testset(
             print(f"  Warning: {e}")
             print("  Skipping BM25 hard negatives")
 
-    hard_negatives_list: List[List[Dict[str, Any]]] = []
+    # Fast lookup for filtering
+    page_by_key: Dict[Tuple[str, int], Dict[str, Any]] = {
+        (p.get("file"), int(p.get("page"))): p
+        for p in pages
+        if p.get("file") and p.get("page")
+    }
+    page_emb_norm_by_key: Dict[Tuple[str, int], Optional[np.ndarray]] = {}
+    for k, p in page_by_key.items():
+        emb = p.get("embedding")
+        if emb is None:
+            page_emb_norm_by_key[k] = None
+            continue
+        try:
+            v = np.asarray(emb, dtype=np.float32)
+        except Exception:
+            page_emb_norm_by_key[k] = None
+            continue
+        if v.ndim != 1 or v.size == 0:
+            page_emb_norm_by_key[k] = None
+            continue
+        if not np.all(np.isfinite(v)):
+            page_emb_norm_by_key[k] = None
+            continue
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            n = np.linalg.norm(v)
+        if not np.isfinite(n) or n == 0:
+            page_emb_norm_by_key[k] = None
+            continue
+        page_emb_norm_by_key[k] = v / n
+
+    # Thresholds for reliability filters (general, non rule-based)
+    near_duplicate_cosine_threshold = 0.92
+
+    hard_negatives_list: List[List[str]] = []
 
     for idx, row in testset_df.iterrows():
         query = row["user_input"]
+        desired_count = max(int(num_bm25_negatives), int(num_embedding_negatives))
+        if desired_count <= 0:
+            hard_negatives_list.append([])
+            continue
 
         contexts = [strip_hop_prefix(c) for c in parse_reference_contexts(row.get("reference_contexts"))]
         pos_info = find_source_files(contexts, docs)
@@ -638,7 +794,15 @@ def mine_hard_negatives_for_testset(
             hard_negatives_list.append([])
             continue
 
-        bm25_negs: List[Dict[str, Any]] = []
+        # Positive embeddings (for near-duplicate filtering)
+        pos_embs = [
+            page_emb_norm_by_key.get(k)
+            for k in pos_pages
+            if page_emb_norm_by_key.get(k) is not None
+        ]
+        pos_embs = [v for v in pos_embs if v is not None]
+
+        bm25_negs: List[Tuple[str, int]] = []
         if bm25 is not None and num_bm25_negatives > 0:
             bm25_negs = find_bm25_hard_negative_pages(
                 query,
@@ -646,10 +810,10 @@ def mine_hard_negatives_for_testset(
                 bm25,
                 exclude_files=pos_files,
                 exclude_pages=pos_pages,
-                top_k=num_bm25_negatives,
+                top_k=max(50, num_bm25_negatives * 10),
             )
 
-        emb_negs: List[Dict[str, Any]] = []
+        emb_negs: List[Tuple[str, int]] = []
         if num_embedding_negatives > 0 and pages_with_embeddings > 0:
             try:
                 q_emb = embedding_model.embed_query(query)
@@ -663,21 +827,73 @@ def mine_hard_negatives_for_testset(
                     candidate_indices=cand_idxs,
                     exclude_files=pos_files,
                     exclude_pages=pos_pages,
-                    top_k=num_embedding_negatives,
+                    top_k=max(50, num_embedding_negatives * 10),
                 )
             except Exception as e:
                 print(f"  Warning: Failed to embed query {idx}: {e}")
 
-        # Merge strategy:
-        # - If both approaches enabled and both produced results -> keep intersection only
-        # - Otherwise, use whichever approach produced results
-        if num_bm25_negatives > 0 and num_embedding_negatives > 0 and bm25_negs and emb_negs:
-            bm25_keys = {(d["file"], d["page"]) for d in bm25_negs}
-            emb_keys = {(d["file"], d["page"]) for d in emb_negs}
-            inter = bm25_keys.intersection(emb_keys)
-            hard_negatives_list.append([{"file": f, "page": int(p)} for (f, p) in sorted(inter)])
+        # Reliability-first merge:
+        # - If both approaches are enabled and available, only keep intersection.
+        # - If only one approach is enabled, use it.
+        if num_bm25_negatives > 0 and num_embedding_negatives > 0:
+            # Prefer intersection when both approaches are available; otherwise fall back
+            if bm25 is not None and bm25_negs and emb_negs:
+                base_keys = sorted(set(bm25_negs).intersection(set(emb_negs)))
+            else:
+                base_keys = emb_negs or bm25_negs
+        elif num_embedding_negatives > 0:
+            base_keys = emb_negs
         else:
-            hard_negatives_list.append(emb_negs if (num_embedding_negatives > 0 and emb_negs) else bm25_negs)
+            base_keys = bm25_negs
+
+        # Apply conservative filters to avoid false negatives
+        filtered_keys: List[Tuple[str, int]] = []
+        seen_files: set = set()
+        judged = 0
+        for key in base_keys:
+            f, p = key
+            if f in pos_files:
+                continue
+            if key in pos_pages:
+                continue
+            page_rec = page_by_key.get(key)
+            if not page_rec:
+                continue
+
+            cand_text = str(page_rec.get("page_content") or "")
+
+            # Embedding near-duplicate filter (when available)
+            cand_v = page_emb_norm_by_key.get(key)
+            if cand_v is not None and pos_embs:
+                max_sim = max(float(np.dot(cand_v, pv)) for pv in pos_embs)
+                if max_sim >= near_duplicate_cosine_threshold:
+                    continue
+
+            # Optional diversity: don't emit multiple negatives from same file
+            if f in seen_files:
+                continue
+
+            # LLM-based validation (general): keep only if relevant but not answerable.
+            verdict = llm_is_hard_negative(
+                judge_llm,
+                question=query,
+                passage=cand_text,
+            )
+            judged += 1
+            if verdict is not True:
+                if judged >= max_judge_calls_per_query:
+                    break
+                continue
+
+            seen_files.add(f)
+
+            filtered_keys.append(key)
+            if len(filtered_keys) >= desired_count:
+                break
+            if judged >= max_judge_calls_per_query:
+                break
+
+        hard_negatives_list.append([f"{f} (page {p})" for (f, p) in filtered_keys])
 
     total_negs = sum(len(x) for x in hard_negatives_list)
     print(f"  Mined {total_negs} hard negative(s) for {len(testset_df)} queries")
@@ -1055,7 +1271,7 @@ def save_testset(
     output_path: str,
     formats: List[str] = ["csv", "json"],
     docs: Optional[List[Document]] = None,
-    hard_negatives: Optional[List[List[Dict[str, Any]]]] = None,
+    hard_negatives: Optional[List[List[str]]] = None,
 ):
     """
     Save the generated testset to files.
@@ -1065,7 +1281,7 @@ def save_testset(
         output_path: Base path for output files (without extension)
         formats: List of output formats ('csv', 'json', 'parquet')
         docs: Original documents for source file mapping
-        hard_negatives: Hard negatives per row as {"file": ..., "page": ...}
+        hard_negatives: Hard negatives per row as "<filename>.pdf (page N)"
     """
     df = testset.to_pandas()
 
@@ -1212,7 +1428,19 @@ def main():
         "--max-files",
         type=int,
         default=None,
-        help="Maximum number of files to load (default: no limit)",
+        help=(
+            "Maximum number of extracted documents (PDF pages) to process (default: no limit). "
+            "Note: PyPDFLoader yields one Document per PDF page."
+        ),
+    )
+    parser.add_argument(
+        "--max-pdfs",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of PDF files to include (default: no limit). "
+            "Applied before loading pages; use this to limit by PDF count."
+        ),
     )
     parser.add_argument(
         "--output-formats",
@@ -1344,6 +1572,14 @@ def main():
                 pdf_paths.append(resolved_file_path.resolve())
 
     pdf_paths = sorted(set(pdf_paths))
+    if args.max_pdfs is not None:
+        if args.max_pdfs <= 0:
+            print("\nError: --max-pdfs must be a positive integer.")
+            return 1
+        if len(pdf_paths) > args.max_pdfs:
+            print(f"\nLimiting to {args.max_pdfs} PDF file(s) (from {len(pdf_paths)} total)")
+            pdf_paths = pdf_paths[: args.max_pdfs]
+
     docs_cache_id = compute_docs_cache_id(
         pdf_paths,
         recursive=not args.no_recursive,
@@ -1358,42 +1594,54 @@ def main():
         all_docs = load_documents_cache(docs_cache_path)
         print(f"  Loaded {len(all_docs)} cached document(s)")
     else:
-        # Load documents from all specified directories
         all_docs = []
-        for input_dir in input_dirs:
-            input_dir = Path(input_dir)
-            if not input_dir.exists():
-                print(f"Warning: Directory not found: {input_dir}")
-                continue
-            print(f"\nLoading documents from: {input_dir}")
-            docs = load_documents(
-                str(input_dir),
-                file_types=args.file_types,
-                max_files=None,  # We'll limit after combining
-                recursive=not args.no_recursive,
-            )
-            all_docs.extend(docs)
 
-        # Load individual files if specified
-        if args.files:
-            print("\nLoading individual files...")
-            for file_path in args.files:
-                resolved_file_path = resolve_input_file(file_path, base_input_dir)
-                if not resolved_file_path.exists():
-                    print(f"  Warning: File not found: {resolved_file_path}")
-                    continue
+        # If --max-pdfs is set, load only the selected PDF paths (avoid reading the entire folder).
+        if args.max_pdfs is not None:
+            print(f"\nLoading {len(pdf_paths)} selected PDF file(s)...")
+            for pdf_path in pdf_paths:
                 try:
-                    if resolved_file_path.suffix.lower() != ".pdf":
-                        print(f"  Skipping non-PDF file: {resolved_file_path}")
-                        continue
-                    loader = PyPDFLoader(str(resolved_file_path))
+                    loader = PyPDFLoader(str(pdf_path))
                     file_docs = loader.load()
-                    print(
-                        f"  Loaded {len(file_docs)} document(s) from: {resolved_file_path.name}"
-                    )
                     all_docs.extend(file_docs)
                 except Exception as e:
-                    print(f"  Error loading {resolved_file_path}: {e}")
+                    print(f"  Error loading {pdf_path}: {e}")
+        else:
+            # Load documents from all specified directories
+            for input_dir in input_dirs:
+                input_dir = Path(input_dir)
+                if not input_dir.exists():
+                    print(f"Warning: Directory not found: {input_dir}")
+                    continue
+                print(f"\nLoading documents from: {input_dir}")
+                docs = load_documents(
+                    str(input_dir),
+                    file_types=args.file_types,
+                    max_files=None,  # We'll limit after combining
+                    recursive=not args.no_recursive,
+                )
+                all_docs.extend(docs)
+
+            # Load individual files if specified
+            if args.files:
+                print("\nLoading individual files...")
+                for file_path in args.files:
+                    resolved_file_path = resolve_input_file(file_path, base_input_dir)
+                    if not resolved_file_path.exists():
+                        print(f"  Warning: File not found: {resolved_file_path}")
+                        continue
+                    try:
+                        if resolved_file_path.suffix.lower() != ".pdf":
+                            print(f"  Skipping non-PDF file: {resolved_file_path}")
+                            continue
+                        loader = PyPDFLoader(str(resolved_file_path))
+                        file_docs = loader.load()
+                        print(
+                            f"  Loaded {len(file_docs)} document(s) from: {resolved_file_path.name}"
+                        )
+                        all_docs.extend(file_docs)
+                    except Exception as e:
+                        print(f"  Error loading {resolved_file_path}: {e}")
 
         # Deterministic ordering before limiting
         all_docs = sort_documents_deterministically(all_docs)
@@ -1418,6 +1666,8 @@ def main():
                         "explicit_files": args.files or [],
                         "recursive": not args.no_recursive,
                         "max_files": args.max_files,
+                        "max_pdfs": args.max_pdfs,
+                        "num_pdfs": len(pdf_paths),
                         "pdf_files": [str(p) for p in pdf_paths],
                         "num_documents": len(all_docs),
                     },
@@ -1535,6 +1785,7 @@ def main():
         # (RAGAS LangchainEmbeddingsWrapper stores the underlying LC embedder at `.embeddings`,
         # but we don't need to unwrap it here as the wrapper exposes `embed_query()`.)
         raw_embedding_model = generator_embeddings
+        judge_llm = getattr(generator_llm, "langchain_llm", None)
 
         testset_df = testset.to_pandas()
         hard_negatives = mine_hard_negatives_for_testset(
@@ -1542,6 +1793,7 @@ def main():
             kg,
             all_docs,
             raw_embedding_model,
+            judge_llm=judge_llm,
             num_bm25_negatives=args.num_bm25_negatives,
             num_embedding_negatives=args.num_embedding_negatives,
         )
