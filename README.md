@@ -35,8 +35,12 @@ Common flags:
 - `--file-types pdf` (non-PDF entries are ignored)
 - `--specific-folders folderA folderB`
 - `--files path/to/one.pdf path/to/another.pdf`
-- `--max-pdfs 20` (caps the number of PDF files before loading pages)
-- `--max-files 200` (caps extracted *LangChain Documents*; for PDFs this usually means **pages**)
+- `--no-recursive` (don't search subdirectories)
+- `--max-pdfs N` (cap the number of PDF files before loading pages; default: no limit)
+- `--max-files N` (cap extracted *LangChain Documents*; for PDFs this usually means **pages**; default: no limit)
+- `--standalone-queries` / `--no-standalone-queries` (default: enabled; generate standalone, corpus-level search queries)
+- `--corpus-size-hint N` (used only when `--standalone-queries` is enabled; default: 7000)
+- `--query-llm-context "..."` (extra guidance appended to the default corpus guidance)
 - `--provider auto|openai|azure`
 - `--model gpt-4o-mini` (or your Azure deployment name)
 - `--processed-dir processed` (where intermediate caches are stored)
@@ -56,7 +60,7 @@ python generate_synthetic_dataset.py \
 ```
 
 Hard negatives are saved to a single `hard_negatives` column as a JSON list of
-`"<filename>.pdf (page N)"` strings. Some queries may have **no** hard negatives (`[]`)
+`"<filename>.pdf (page N)"` strings. (In the exported CSV/JSON, this is stored as a JSON-encoded string.) Some queries may have **no** hard negatives (`[]`)
 if the miner cannot find negatives reliably.
 
 Hard negative flags:
@@ -71,6 +75,7 @@ By default the script saves intermediate artifacts to `processed/` and reuses th
 - `processed/docs/`: extracted PDF pages (LangChain `Document`s)
 - `processed/kg/`: the processed RAGAS Knowledge Graph (after transforms)
 - `processed/personas/`: generated personas
+- `processed/meta/`: metadata JSON describing cache keys + inputs for each artifact
 
 This is useful when you want to regenerate testsets (e.g., different `--testset-size`) without re-running the expensive transform step.
 
@@ -263,7 +268,7 @@ Because the miner prioritizes correctness, some queries may produce **no** hard 
 ### Output columns
 
 When hard negatives are enabled, the output includes:
-- `hard_negatives`: JSON list of strings like `"<filename>.pdf (page N)"`
+- `hard_negatives`: JSON-encoded list of strings like `"<filename>.pdf (page N)"` (stored as a string in the exported CSV/JSON)
 
 ### Example output row
 
@@ -272,8 +277,9 @@ When hard negatives are enabled, the output includes:
   "user_input": "What are the penalties for late filing?",
   "reference": "Late filing penalties include...",
   "reference_contexts": ["<positive context from doc>"],
-  "hard_negatives": ["filing_rules.pdf (page 12)", "another_doc.pdf (page 5)"],
-  "source_files_with_pages": ["filing_rules.pdf (page 5)"]
+  "hard_negatives": "[\"filing_rules.pdf (page 12)\", \"another_doc.pdf (page 5)\"]",
+  "source_files_with_pages": "[\"filing_rules.pdf (page 5)\"]",
+  "source_files_with_pages_readable": "filing_rules.pdf (page 5)"
 }
 ```
 
@@ -287,19 +293,19 @@ When hard negatives are enabled, the output includes:
 Typical core columns:
 - `user_input`: the generated question
 - `reference`: the generated grounded answer
-- `reference_contexts`: list of context strings used to ground the answer
+- `reference_contexts`: list of context strings used to ground the answer (may be serialized as a list-like string in CSV depending on your pandas/RAGAS versions)
 
 Hard negative columns (when `--hard-negatives` is used):
-- `hard_negatives`: JSON list of `"<filename>.pdf (page N)"` strings
+- `hard_negatives`: JSON-encoded list of `"<filename>.pdf (page N)"` strings (stored as a string in the exported CSV/JSON)
 
 Additional columns may appear depending on synthesizer/version (e.g., persona/style metadata).
 
 ### Source mapping columns added by this repo
 
 When saving, this repo tries to map each `reference_contexts` entry back to the original loaded docs, then adds:
-- `source_files`: JSON list of filenames
-- `source_files_with_pages`: JSON list like `"file.pdf (page 5)"`
-- `page_numbers`: JSON list of page numbers (1-indexed; `null` for non-paginated docs)
+- `source_files`: JSON-encoded list of filenames (stored as a string in the exported CSV/JSON)
+- `source_files_with_pages`: JSON-encoded list like `"file.pdf (page 5)"` (stored as a string in the exported CSV/JSON)
+- `page_numbers`: JSON-encoded list of page numbers (1-indexed; `null` for non-paginated docs; stored as a string in the exported CSV/JSON)
 - `source_files_readable`, `source_files_with_pages_readable`: comma-separated strings for quick inspection
 
 This mapping is **heuristic string matching** against loaded `Document.page_content`, so it's "best effort."
@@ -319,11 +325,13 @@ This script currently uses:
 
 If you want full control, you can:
 - build your own transform list (extractors/splitters/relationship builders)
-- pass it into `generate_with_langchain_docs(..., transforms=your_transforms)`
+- replace the `transforms = ...` block in `build_knowledge_graph(...)` and call `apply_transforms(kg, your_transforms, ...)`
 
 ### Change query mix
 
-RAGAS accepts `query_distribution=...` (a list of `(synthesizer, probability)` pairs). The script currently relies on the default distribution.
+RAGAS accepts `query_distribution=...` (a list of `(synthesizer, probability)` pairs).
+
+This script starts from the default RAGAS distribution, and when `--standalone-queries` is enabled (default) it patches the synthesizer prompts to encourage **standalone, corpus-level** search queries. Disable this behavior with `--no-standalone-queries` if you want unmodified RAGAS prompts.
 
 ---
 
@@ -375,9 +383,9 @@ Ways to reduce:
 
 ### Cache invalidation
 
-The caching system uses content-based hashing. Caches are automatically invalidated when:
-- Source PDF files change (content, size, or modification time)
-- Model or provider changes
+The caching system uses stable cache keys derived from:
+- Source PDF fingerprints (absolute path + size + modification time)
+- Provider/model/embedding id
 - Pipeline configuration changes (e.g., toggling `--no-content-embeddings`)
 
 To force a rebuild, use `--reprocess`.
