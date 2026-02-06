@@ -5,3 +5,18 @@
 /search-dataset-backup/
 /processed/
 .env
+*.json
+*.csv
+
+# Python
+__pycache__/
+__pycache__/**
+
+# IDE / editor
+.claude/
+.claude/**
+.idea/
+*.iml
+
+# macOS
+.DS_Store
