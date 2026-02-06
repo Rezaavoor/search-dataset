@@ -49,6 +49,8 @@ Common flags:
 - `--processed-dir processed` (where intermediate caches are stored)
 - `--no-cache` (disable cache reuse)
 - `--reprocess` (ignore caches and rebuild them)
+- `--pdf-store-build` / `--pdf-store-use` (optional SQLite PDF page store; see below)
+- `--pdf-store-db PATH` (override SQLite store location; default: `processed/pdf_page_store.sqlite`)
 
 ### Hard negative mining (for IR evaluation)
 
@@ -80,8 +82,59 @@ By default the script saves intermediate artifacts to `processed/` and reuses th
 - `processed/personas/`: generated personas
 - `processed/pdf_profiles/`: per-PDF LLM “profiles” used to improve query realism (folder/filename hints + high-level summary)
 - `processed/meta/`: metadata JSON describing cache keys + inputs for each artifact
+- `processed/pdf_page_store.sqlite`: optional single-table SQLite store of extracted PDF pages (plus derived fields like page summary, page embeddings, and per-PDF profiles)
 
 This is useful when you want to regenerate testsets (e.g., different `--testset-size`) without re-running the expensive transform step.
+
+### SQLite PDF page store (optional, precompute once)
+
+If you want to extract PDF pages **once** and reuse them across runs (e.g., run on a small subset first, then rerun on a larger subset and skip already-processed PDFs), you can use an optional **single-table SQLite database** called `pdf_page_store`.
+
+- **Row granularity**: 1 row per **PDF page** (matches `PyPDFLoader`)
+- **Stored fields** (from PDFs): `doc_content` + loader metadata (`source`, `page`, etc.)
+- **Derived fields**:
+  - `summary`: cheap extractive snippet (offline, deterministic)
+  - `embedding_f32`: optional float32 BLOB, computed when building with `--pdf-store-embeddings` (stored for reuse; the RAGAS transform pipeline still computes its own embeddings as needed)
+  - `pdf_profile_json`: optional per-PDF profile (stored once per PDF; typically on page 1) computed when building with `--pdf-store-profiles` or when profiles are generated during a run
+
+**Default DB path:** `processed/pdf_page_store.sqlite` (override with `--pdf-store-db`).
+
+Build/update the store (pages + summaries; no API calls):
+
+```bash
+python generate_synthetic_dataset.py \
+  --input-dir . \
+  --pdf-store-build
+```
+
+Build/update the store and also compute embeddings and/or profiles (requires API credentials):
+
+```bash
+python generate_synthetic_dataset.py \
+  --specific-folders "Claires" \
+  --max-pdfs 20 \
+  --pdf-store-build \
+  --pdf-store-embeddings \
+  --pdf-store-profiles
+```
+
+Generate using the SQLite store (no PDF re-read; still uses the same KG/persona/testset pipeline):
+
+```bash
+python generate_synthetic_dataset.py \
+  --specific-folders "Claires" \
+  --max-files 200 \
+  --testset-size 50 \
+  --pdf-store-use \
+  --output synthetic_dataset \
+  --output-formats csv json
+```
+
+Notes:
+- `--pdf-store-use` defaults to `--pdf-store-auto-build`, which will automatically insert **missing/stale PDFs** into the store as needed.
+- If you want newly inserted pages to also get `embedding_f32` and/or `pdf_profile_json`, add `--pdf-store-embeddings` and/or `--pdf-store-profiles` to the same run.
+- For strict “read only from DB”, use `--no-pdf-store-auto-build` (it will error if the DB is missing/stale for selected PDFs).
+- Use `--pdf-store-reprocess` to force re-extraction into the SQLite store for selected PDFs. `--reprocess` forces rebuilding all intermediate caches as usual.
 
 ---
 
@@ -108,6 +161,7 @@ This repo wires those phases together in `generate_synthetic_dataset.py` using:
 Important detail:
 - PDFs loaded via `PyPDFLoader` are typically **one `Document` per page** and include `metadata["page"]` (0-indexed). This affects `--max-files` and source mapping.
 - Use `--max-pdfs` if you want to cap the number of PDF files instead of pages.
+- Optional: use `--pdf-store-use` to load those per-page `Document`s from the SQLite store (`processed/pdf_page_store.sqlite`) instead of reading PDFs from disk. The downstream pipeline sees the same `page_content` + `metadata["source"]`/`metadata["page"]`.
 
 ### 2) Initialize LLM + embeddings
 
@@ -341,6 +395,8 @@ This script starts from the default RAGAS distribution, and when `--standalone-q
 
 When `--pdf-profiles` is enabled (default), the script generates a **PDF-level profile** for each PDF (cached under `processed/pdf_profiles/`) and injects it into query generation as additional context. This helps the LLM write questions that sound like what a person would search for when looking across **thousands of documents**, not just “what’s on this page.”
 
+If you also use the SQLite PDF page store, profiles are additionally persisted in the SQLite DB (one profile per PDF) so reruns across different subsets can reuse them.
+
 Profile inputs include:
 - the PDF’s **folder path** (e.g., `Claires/…`)
 - the **filename stem** (e.g., `222_Notice_of_Appearance.._Filed_by_Wichita_County._(Lerew_Mollie)`)
@@ -405,4 +461,4 @@ The caching system uses stable cache keys derived from:
 - Provider/model/embedding id
 - Pipeline configuration changes (e.g., toggling `--no-content-embeddings`)
 
-To force a rebuild, use `--reprocess`.
+To force a rebuild, use `--reprocess`. If you are using the SQLite PDF page store, you can also use `--pdf-store-reprocess` to force re-extraction into SQLite for the selected PDFs.

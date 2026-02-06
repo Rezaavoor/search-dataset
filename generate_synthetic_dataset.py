@@ -25,10 +25,11 @@ import argparse
 import gzip
 import hashlib
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple, Any
+from typing import List, Optional, Dict, Tuple, Any, Iterator
 from dotenv import load_dotenv
 import json
 import numpy as np
@@ -333,6 +334,701 @@ def load_documents_cache(path: Path) -> List[Document]:
                 )
             )
     return docs
+
+
+# ---------------------------
+# SQLite PDF page store (single-table, corpus-derived)
+# ---------------------------
+PDF_STORE_SCHEMA_VERSION = 1
+DEFAULT_PDF_STORE_DB_NAME = "pdf_page_store.sqlite"
+
+_EXTRACTIVE_SUMMARY_MODEL = "extractive_v1"
+
+
+def _iter_batched(items: List[Any], batch_size: int) -> Iterator[List[Any]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    for i in range(0, len(items), batch_size):
+        yield items[i : i + batch_size]
+
+
+def _compute_rel_path_for_store(pdf_path: Path, base_input_dir: Path) -> str:
+    """
+    Return a stable corpus-relative path when possible; otherwise fallback to absolute.
+    """
+    resolved = pdf_path.expanduser().resolve()
+    try:
+        return str(resolved.relative_to(base_input_dir.expanduser().resolve()))
+    except Exception:
+        return str(resolved)
+
+
+def _compute_source_path_from_rel_path(rel_path: str, base_input_dir: Path) -> str:
+    """
+    Convert a stored `rel_path` back into an absolute source path string.
+
+    - If rel_path is already absolute, it is used as-is (resolved best-effort).
+    - Otherwise, it is interpreted relative to `base_input_dir`.
+    """
+    try:
+        p = Path(rel_path).expanduser()
+        if p.is_absolute():
+            return str(p.resolve())
+    except Exception:
+        pass
+    try:
+        return str((base_input_dir.expanduser().resolve() / rel_path).resolve())
+    except Exception:
+        return str(base_input_dir / rel_path)
+
+
+def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _extractive_summary(text: str, *, max_chars: int = 450) -> str:
+    """
+    Cheap, deterministic "summary" for a page: whitespace-normalized leading snippet.
+
+    This is intentionally non-LLM so the PDF store can be built offline.
+    """
+    if not text:
+        return ""
+    t = str(text).replace("\x00", " ").strip()
+    if not t:
+        return ""
+    # Collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) <= max_chars:
+        return t
+    cut = t[: max_chars].rstrip()
+    # Avoid chopping mid-word when possible
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0].rstrip()
+    return cut
+
+
+def open_pdf_page_store(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys = ON")
+    # WAL is faster for large bulk inserts.
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+    except Exception:
+        # Some environments disallow changing PRAGMA; safe to ignore.
+        pass
+    return conn
+
+
+def init_pdf_page_store(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pdf_page_store (
+          id INTEGER PRIMARY KEY,
+          pdf_sha256 TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          filename TEXT NOT NULL,
+          file_type TEXT NOT NULL DEFAULT 'pdf' CHECK(file_type = 'pdf'),
+          size_bytes INTEGER NOT NULL,
+          mtime_ns INTEGER,
+          page_number INTEGER NOT NULL CHECK(page_number >= 1),
+          doc_content TEXT NOT NULL,
+          content_sha256 TEXT NOT NULL,
+          content_chars INTEGER NOT NULL,
+          summary TEXT,
+          summary_model TEXT,
+          embedding_f32 BLOB,
+          embedding_model TEXT,
+          embedding_dims INTEGER,
+          pdf_profile_json TEXT,
+          pdf_profile_model TEXT,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          updated_at TEXT,
+          UNIQUE(pdf_sha256, page_number)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS pdf_page_store_path_page_idx ON pdf_page_store(rel_path, page_number)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS pdf_page_store_pdfsha_idx ON pdf_page_store(pdf_sha256)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS pdf_profile_one_per_pdf_idx "
+        "ON pdf_page_store(pdf_sha256) WHERE pdf_profile_json IS NOT NULL"
+    )
+    try:
+        conn.execute(f"PRAGMA user_version = {int(PDF_STORE_SCHEMA_VERSION)}")
+    except Exception:
+        pass
+    conn.commit()
+
+
+def pdf_store_needs_refresh(
+    conn: sqlite3.Connection,
+    *,
+    rel_path: str,
+    size_bytes: int,
+    mtime_ns: int,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT
+          MIN(size_bytes), MAX(size_bytes),
+          MIN(mtime_ns),  MAX(mtime_ns),
+          COUNT(*),
+          MIN(page_number), MAX(page_number)
+        FROM pdf_page_store
+        WHERE rel_path = ?
+        """,
+        (rel_path,),
+    ).fetchone()
+    if not row:
+        return True
+
+    min_size, max_size, min_mtime, max_mtime, count_rows, min_page, max_page = row
+    count_rows = int(count_rows or 0)
+    if count_rows <= 0:
+        return True
+
+    if min_size is None or max_size is None or int(min_size) != int(max_size):
+        return True
+    if int(min_size) != int(size_bytes):
+        return True
+
+    if min_mtime is None or max_mtime is None or int(min_mtime) != int(max_mtime):
+        return True
+    if int(min_mtime) != int(mtime_ns):
+        return True
+
+    # Heuristic integrity check: pages should be contiguous 1..N
+    if min_page is None or max_page is None:
+        return True
+    if int(min_page) != 1:
+        return True
+    if int(max_page) != count_rows:
+        return True
+
+    return False
+
+
+def pdf_store_needs_embeddings(
+    conn: sqlite3.Connection,
+    *,
+    rel_path: str,
+    embedding_model_tag: Optional[str],
+) -> bool:
+    if not embedding_model_tag:
+        # If we don't know the model, only check for missing blobs.
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM pdf_page_store
+            WHERE rel_path = ?
+              AND (embedding_f32 IS NULL OR embedding_dims IS NULL)
+            """,
+            (rel_path,),
+        ).fetchone()
+        return bool(row and int(row[0] or 0) > 0)
+
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM pdf_page_store
+        WHERE rel_path = ?
+          AND (
+            embedding_f32 IS NULL OR
+            embedding_dims IS NULL OR
+            embedding_model IS NULL OR
+            embedding_model = '' OR
+            embedding_model != ?
+          )
+        """,
+        (rel_path, str(embedding_model_tag)),
+    ).fetchone()
+    return bool(row and int(row[0] or 0) > 0)
+
+
+def pdf_store_needs_profile(
+    conn: sqlite3.Connection,
+    *,
+    rel_path: str,
+    profile_model_tag: Optional[str],
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT pdf_profile_json, pdf_profile_model
+        FROM pdf_page_store
+        WHERE rel_path = ? AND pdf_profile_json IS NOT NULL
+        LIMIT 1
+        """,
+        (rel_path,),
+    ).fetchone()
+    if not row:
+        return True
+    blob, model = row
+    if not isinstance(blob, str) or not blob.strip():
+        return True
+    if profile_model_tag:
+        if not isinstance(model, str) or model.strip() != str(profile_model_tag):
+            return True
+    return False
+
+
+def pdf_store_fill_missing_summaries_for_pdf(
+    conn: sqlite3.Connection,
+    *,
+    rel_path: str,
+    summary_model: str = _EXTRACTIVE_SUMMARY_MODEL,
+) -> int:
+    rows = conn.execute(
+        """
+        SELECT id, doc_content
+        FROM pdf_page_store
+        WHERE rel_path = ?
+          AND (summary IS NULL OR summary = '' OR summary_model IS NULL OR summary_model = '')
+        ORDER BY page_number ASC
+        """,
+        (rel_path,),
+    ).fetchall()
+    if not rows:
+        return 0
+
+    now = _utc_now_iso()
+    updated = 0
+    with conn:
+        for row_id, content in rows:
+            s = _extractive_summary(str(content or ""))
+            conn.execute(
+                "UPDATE pdf_page_store SET summary = ?, summary_model = ?, updated_at = ? WHERE id = ?",
+                (s, str(summary_model), now, int(row_id)),
+            )
+            updated += 1
+    return updated
+
+
+def pdf_store_compute_embeddings_for_pdf(
+    conn: sqlite3.Connection,
+    *,
+    rel_path: str,
+    embedding_model,
+    embedding_model_tag: str,
+) -> int:
+    rows = conn.execute(
+        """
+        SELECT id, doc_content
+        FROM pdf_page_store
+        WHERE rel_path = ?
+          AND (
+            embedding_f32 IS NULL OR
+            embedding_dims IS NULL OR
+            embedding_model IS NULL OR
+            embedding_model = '' OR
+            embedding_model != ?
+          )
+        ORDER BY page_number ASC
+        """,
+        (rel_path, str(embedding_model_tag)),
+    ).fetchall()
+    if not rows:
+        return 0
+
+    ids = [int(r[0]) for r in rows]
+    texts = [str(r[1] or "") for r in rows]
+
+    vecs: List[Optional[List[float]]] = []
+    for batch in _iter_batched(texts, batch_size=64):
+        try:
+            batch_vecs = embedding_model.embed_documents(batch)  # type: ignore[attr-defined]
+            if not isinstance(batch_vecs, list) or len(batch_vecs) != len(batch):
+                raise ValueError("Unexpected embed_documents result shape")
+            vecs.extend(batch_vecs)
+        except Exception:
+            for t in batch:
+                try:
+                    v = embedding_model.embed_query(t)  # type: ignore[attr-defined]
+                    vecs.append(v if isinstance(v, list) else None)
+                except Exception:
+                    vecs.append(None)
+
+    if len(vecs) != len(ids):
+        return 0
+
+    now = _utc_now_iso()
+    updated = 0
+    with conn:
+        for row_id, v in zip(ids, vecs):
+            if not isinstance(v, list) or not v:
+                continue
+            arr = np.asarray(v, dtype=np.float32)
+            conn.execute(
+                """
+                UPDATE pdf_page_store
+                SET embedding_f32 = ?, embedding_model = ?, embedding_dims = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (arr.tobytes(), str(embedding_model_tag), int(arr.shape[0]), now, int(row_id)),
+            )
+            updated += 1
+    return updated
+
+
+def upsert_pdf_into_store(
+    conn: sqlite3.Connection,
+    *,
+    pdf_path: Path,
+    base_input_dir: Path,
+    embedding_model=None,
+    embedding_model_id: Optional[str] = None,
+    compute_embeddings: bool = False,
+    reprocess: bool = False,
+) -> int:
+    """
+    Extract all pages from `pdf_path` via PyPDFLoader and upsert them into `pdf_page_store`.
+
+    Returns: number of pages stored.
+    """
+    resolved = pdf_path.expanduser().resolve()
+    st = resolved.stat()
+    rel_path = _compute_rel_path_for_store(resolved, base_input_dir)
+    filename = resolved.name
+    size_bytes = int(st.st_size)
+    mtime_ns = int(st.st_mtime_ns)
+
+    if reprocess:
+        conn.execute("DELETE FROM pdf_page_store WHERE rel_path = ?", (rel_path,))
+
+    pdf_sha256 = _sha256_file(resolved)
+
+    loader = PyPDFLoader(str(resolved))
+    docs = loader.load()
+    # Deterministic ordering by page when available
+    docs = sorted(
+        docs,
+        key=lambda d: d.metadata.get("page")
+        if isinstance(d.metadata.get("page"), int)
+        else 10**9,
+    )
+
+    embeddings: Optional[List[Optional[List[float]]]] = None
+    if compute_embeddings and embedding_model is not None:
+        texts = [str(d.page_content or "") for d in docs]
+        embeddings = []
+        # Conservative batching; can be tuned later.
+        for batch in _iter_batched(texts, batch_size=64):
+            try:
+                batch_vecs = embedding_model.embed_documents(batch)  # type: ignore[attr-defined]
+                if not isinstance(batch_vecs, list) or len(batch_vecs) != len(batch):
+                    raise ValueError("Unexpected embed_documents result shape")
+                embeddings.extend(batch_vecs)
+            except Exception:
+                # Fallback: per-text embed_query to avoid failing the whole build.
+                for t in batch:
+                    try:
+                        v = embedding_model.embed_query(t)  # type: ignore[attr-defined]
+                        embeddings.append(v if isinstance(v, list) else None)
+                    except Exception:
+                        embeddings.append(None)
+
+        # Ensure alignment
+        if len(embeddings) != len(docs):
+            embeddings = None
+
+    now = _utc_now_iso()
+    stored = 0
+
+    # Upsert rows; preserve optional derived columns when not recomputed.
+    with conn:
+        for idx, doc in enumerate(docs):
+            page0 = doc.metadata.get("page")
+            page_number = int(page0) + 1 if isinstance(page0, int) else (idx + 1)
+
+            content = str(doc.page_content or "")
+            content_sha256 = _sha256_hex(content)
+            content_chars = int(len(content))
+            summary = _extractive_summary(content)
+            summary_model = _EXTRACTIVE_SUMMARY_MODEL
+
+            md = doc.metadata or {}
+            if not isinstance(md, dict):
+                md = {}
+            md = dict(md)
+            # Make sure metadata matches the standard PyPDFLoader contract:
+            md["source"] = str(resolved)
+            md["page"] = int(page_number - 1)  # 0-indexed for compatibility
+            metadata_json = json.dumps(md, ensure_ascii=False)
+
+            emb_blob = None
+            emb_dims = None
+            emb_model = None
+            if embeddings is not None:
+                v = embeddings[idx]
+                if isinstance(v, list) and v:
+                    arr = np.asarray(v, dtype=np.float32)
+                    emb_blob = arr.tobytes()
+                    emb_dims = int(arr.shape[0])
+                    emb_model = str(embedding_model_id or "")
+
+            conn.execute(
+                """
+                INSERT INTO pdf_page_store (
+                  pdf_sha256,
+                  rel_path,
+                  filename,
+                  file_type,
+                  size_bytes,
+                  mtime_ns,
+                  page_number,
+                  doc_content,
+                  content_sha256,
+                  content_chars,
+                  summary,
+                  summary_model,
+                  embedding_f32,
+                  embedding_model,
+                  embedding_dims,
+                  metadata_json,
+                  updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(pdf_sha256, page_number) DO UPDATE SET
+                  rel_path = excluded.rel_path,
+                  filename = excluded.filename,
+                  size_bytes = excluded.size_bytes,
+                  mtime_ns = excluded.mtime_ns,
+                  doc_content = excluded.doc_content,
+                  content_sha256 = excluded.content_sha256,
+                  content_chars = excluded.content_chars,
+                  summary = excluded.summary,
+                  summary_model = excluded.summary_model,
+                  embedding_f32 = COALESCE(excluded.embedding_f32, pdf_page_store.embedding_f32),
+                  embedding_model = COALESCE(excluded.embedding_model, pdf_page_store.embedding_model),
+                  embedding_dims = COALESCE(excluded.embedding_dims, pdf_page_store.embedding_dims),
+                  metadata_json = excluded.metadata_json,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    pdf_sha256,
+                    rel_path,
+                    filename,
+                    "pdf",
+                    size_bytes,
+                    mtime_ns,
+                    page_number,
+                    content,
+                    content_sha256,
+                    content_chars,
+                    summary,
+                    summary_model,
+                    emb_blob,
+                    emb_model,
+                    emb_dims,
+                    metadata_json,
+                    now,
+                ),
+            )
+            stored += 1
+
+    return stored
+
+
+def load_documents_from_store(
+    conn: sqlite3.Connection,
+    *,
+    base_input_dir: Path,
+    pdf_paths: List[Path],
+    max_files: Optional[int],
+) -> List[Document]:
+    rel_paths = [_compute_rel_path_for_store(p, base_input_dir) for p in pdf_paths]
+    docs: List[Document] = []
+
+    # SQLite has a parameter limit; chunk IN queries.
+    for chunk in _iter_batched(rel_paths, batch_size=800):
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = conn.execute(
+            f"""
+            SELECT rel_path, page_number, doc_content, metadata_json
+            FROM pdf_page_store
+            WHERE rel_path IN ({placeholders})
+            ORDER BY rel_path ASC, page_number ASC
+            """,
+            tuple(chunk),
+        ).fetchall()
+
+        for rel_path, page_number, doc_content, metadata_json in rows:
+            md: Dict[str, Any] = {}
+            try:
+                if isinstance(metadata_json, str) and metadata_json.strip():
+                    parsed = json.loads(metadata_json)
+                    if isinstance(parsed, dict):
+                        md = parsed
+            except Exception:
+                md = {}
+
+            source_path = _compute_source_path_from_rel_path(str(rel_path), base_input_dir)
+            md["source"] = source_path
+            if page_number is not None:
+                try:
+                    md["page"] = int(page_number) - 1
+                except Exception:
+                    pass
+
+            docs.append(Document(page_content=str(doc_content or ""), metadata=md))
+
+    # Deterministic ordering before limiting (matches file-loader path)
+    docs = sort_documents_deterministically(docs)
+    if max_files and len(docs) > max_files:
+        docs = docs[: max_files]
+    return docs
+
+
+def _store_set_pdf_profile(
+    conn: sqlite3.Connection,
+    *,
+    rel_path: str,
+    profile: Dict[str, Any],
+    pdf_profile_model: str,
+) -> None:
+    """
+    Store a single profile payload on page 1 for this PDF (enforced by partial unique index).
+    """
+    now = _utc_now_iso()
+    # Ensure we don't violate the "one profile per PDF" index if an older row had the profile.
+    with conn:
+        conn.execute(
+            "UPDATE pdf_page_store SET pdf_profile_json = NULL, pdf_profile_model = NULL WHERE rel_path = ?",
+            (rel_path,),
+        )
+        conn.execute(
+            """
+            UPDATE pdf_page_store
+            SET pdf_profile_json = ?, pdf_profile_model = ?, updated_at = ?
+            WHERE rel_path = ? AND page_number = 1
+            """,
+            (json.dumps(profile, ensure_ascii=False), str(pdf_profile_model), now, rel_path),
+        )
+
+
+def load_pdf_profiles_from_store(
+    conn: sqlite3.Connection,
+    *,
+    pdf_paths: List[Path],
+    base_input_dir: Path,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Load profiles from SQLite and return a map: absolute source_path -> profile dict.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for pdf_path in pdf_paths:
+        rel_path = _compute_rel_path_for_store(pdf_path, base_input_dir)
+        row = conn.execute(
+            """
+            SELECT pdf_profile_json
+            FROM pdf_page_store
+            WHERE rel_path = ? AND pdf_profile_json IS NOT NULL
+            LIMIT 1
+            """,
+            (rel_path,),
+        ).fetchone()
+        if not row:
+            continue
+        blob = row[0]
+        if not isinstance(blob, str) or not blob.strip():
+            continue
+        try:
+            prof = json.loads(blob)
+        except Exception:
+            continue
+        if not isinstance(prof, dict):
+            continue
+
+        resolved = pdf_path.expanduser().resolve()
+        source_path = str(resolved)
+        # Refresh path-derived fields (corpus_path/folder_hints) in case input-dir moved
+        prof["source_path"] = source_path
+        prof["filename"] = resolved.name
+        prof["filename_stem"] = resolved.stem
+        prof["corpus_path"] = _compute_corpus_path(resolved, base_input_dir)
+        folder_hints: List[str] = []
+        if prof.get("corpus_path"):
+            try:
+                p = Path(str(prof["corpus_path"]))
+                folder_hints = list(p.parts[:-1])
+            except Exception:
+                folder_hints = []
+        if not folder_hints:
+            parent_name = resolved.parent.name
+            if parent_name:
+                folder_hints = [parent_name]
+        prof["folder_hints"] = folder_hints
+
+        out[source_path] = prof
+
+    return out
+
+
+def generate_pdf_profile_from_store(
+    conn: sqlite3.Connection,
+    *,
+    pdf_path: Path,
+    base_input_dir: Path,
+    llm: Any,
+    provider: str,
+    llm_id: str,
+    max_pages: int,
+    max_chars_per_page: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Generate a PDF profile using the already-extracted pages in SQLite (no PDF re-read),
+    then store it back into SQLite.
+    """
+    resolved = pdf_path.expanduser().resolve()
+    rel_path = _compute_rel_path_for_store(resolved, base_input_dir)
+
+    # Build excerpt from the first N stored pages
+    rows = conn.execute(
+        """
+        SELECT page_number, doc_content
+        FROM pdf_page_store
+        WHERE rel_path = ?
+        ORDER BY page_number ASC
+        LIMIT ?
+        """,
+        (rel_path, int(max_pages)),
+    ).fetchall()
+
+    parts: List[str] = []
+    for page_number, doc_content in rows:
+        page_label = f"{int(page_number)}" if page_number is not None else "?"
+        snippet = _truncate_for_profile(str(doc_content or ""), max_chars=int(max_chars_per_page))
+        if snippet.strip():
+            parts.append(f"--- PAGE {page_label} ---\n{snippet}")
+    excerpt = "\n\n".join(parts).strip()
+
+    prof = _generate_pdf_profile_with_llm(
+        llm,
+        pdf_path=resolved,
+        base_input_dir=base_input_dir,
+        excerpt=excerpt,
+        provider=provider,
+        llm_id=llm_id,
+        max_pages=max_pages,
+        max_chars_per_page=max_chars_per_page,
+    )
+
+    model_tag = f"{provider}:{llm_id}:p{int(max_pages)}:c{int(max_chars_per_page)}"
+    _store_set_pdf_profile(conn, rel_path=rel_path, profile=prof, pdf_profile_model=model_tag)
+    return prof
 
 
 def save_knowledge_graph_cache(kg: KnowledgeGraph, path: Path) -> None:
@@ -2395,6 +3091,63 @@ def main():
         ),
     )
     parser.add_argument(
+        "--pdf-store-db",
+        type=str,
+        default=None,
+        help=(
+            "Optional SQLite DB path for a single-table PDF page store (pdf_page_store). "
+            "Use this to pre-extract PDF pages once and load documents from SQLite on later runs."
+        ),
+    )
+    parser.add_argument(
+        "--pdf-store-use",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Load extracted PDF pages from the SQLite PDF store instead of reading PDFs / processed/docs "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--pdf-store-build",
+        action="store_true",
+        help=(
+            "Build/update the SQLite PDF store for the selected PDFs, then exit (unless --pdf-store-use is also set)."
+        ),
+    )
+    parser.add_argument(
+        "--pdf-store-auto-build",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When --pdf-store-use is enabled, automatically extract and insert missing/stale PDFs into the store "
+            "(default: enabled). Disable with --no-pdf-store-auto-build."
+        ),
+    )
+    parser.add_argument(
+        "--pdf-store-reprocess",
+        action="store_true",
+        help="Force re-extraction and overwrite of SQLite PDF store rows for selected PDFs.",
+    )
+    parser.add_argument(
+        "--pdf-store-embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When building the SQLite PDF store, also compute and store page embeddings "
+            "(default: disabled; requires embedding API access)."
+        ),
+    )
+    parser.add_argument(
+        "--pdf-store-profiles",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When building the SQLite PDF store, also compute and store PDF profiles "
+            "(default: disabled; requires LLM API access)."
+        ),
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="Disable loading/saving cached intermediate artifacts",
@@ -2454,6 +3207,21 @@ def main():
     pdf_profiles_cache_dir = processed_dir / "pdf_profiles"
     meta_dir = processed_dir / "meta"
 
+    # SQLite PDF store (single-table page store) — optional.
+    pdf_store_conn: Optional[sqlite3.Connection] = None
+    pdf_store_db_path: Optional[Path] = None
+    if args.pdf_store_use or args.pdf_store_build:
+        if args.pdf_store_db:
+            pdf_store_db_path = Path(args.pdf_store_db).expanduser()
+            if not pdf_store_db_path.is_absolute():
+                pdf_store_db_path = (script_dir / pdf_store_db_path).resolve()
+        else:
+            pdf_store_db_path = (processed_dir / DEFAULT_PDF_STORE_DB_NAME).resolve()
+
+        pdf_store_conn = open_pdf_page_store(pdf_store_db_path)
+        init_pdf_page_store(pdf_store_conn)
+        print(f"\nSQLite PDF store: enabled ({pdf_store_db_path})")
+
     if cache_enabled:
         docs_cache_dir.mkdir(parents=True, exist_ok=True)
         kg_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2492,6 +3260,153 @@ def main():
             print(f"\nLimiting to {args.max_pdfs} PDF file(s) (from {len(pdf_paths)} total)")
             pdf_paths = pdf_paths[: args.max_pdfs]
 
+    # Optional: build/sync the SQLite PDF store for the selected PDFs.
+    #
+    # - `--pdf-store-build` builds the store upfront (and exits unless --pdf-store-use is also set).
+    # - When `--pdf-store-use` is enabled, we can auto-populate missing/stale PDFs to keep the
+    #   pipeline fully functional even if the store is incomplete.
+    if pdf_store_conn is not None and (args.pdf_store_build or (args.pdf_store_use and args.pdf_store_auto_build)):
+        store_force = bool(args.pdf_store_reprocess or args.reprocess)
+
+        # These flags apply both when explicitly building the store and when auto-building
+        # missing/stale PDFs during a --pdf-store-use run.
+        want_embeddings = bool(args.pdf_store_embeddings)
+        want_profiles = bool(args.pdf_store_profiles)
+
+        store_embedding_model = None
+        store_embedding_model_id: Optional[str] = None
+        store_profile_llm = None
+        store_provider_used = args.provider
+        if store_provider_used == "auto":
+            if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
+                store_provider_used = "azure"
+            elif os.environ.get("OPENAI_API_KEY"):
+                store_provider_used = "openai"
+            else:
+                store_provider_used = "auto"  # will error if models are needed
+
+        if want_embeddings or want_profiles:
+            try:
+                tmp_llm, tmp_emb = setup_llm_and_embeddings(args.model, args.provider)
+            except ValueError as e:
+                print(f"\nError: {e}")
+                return 1
+
+            # Embedder/LLM handles (match later cache-id logic)
+            store_embedding_model = tmp_emb if want_embeddings else None
+            store_profile_llm = getattr(tmp_llm, "langchain_llm", None) if want_profiles else None
+            store_embedding_model_id = (
+                os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-ada-002")
+                if store_provider_used == "azure"
+                else "openai-default"
+            )
+
+        print("\nSyncing SQLite PDF store (pdf_page_store)...")
+        refreshed_pdfs = 0
+        upserted_pages = 0
+        skipped = 0
+        filled_summaries = 0
+        filled_embeddings = 0
+        filled_profiles = 0
+
+        total = len(pdf_paths)
+        for i, pdf_path in enumerate(pdf_paths, start=1):
+            try:
+                st = pdf_path.stat()
+            except Exception:
+                # If the file disappeared between scan and now, skip.
+                continue
+
+            rel_path = _compute_rel_path_for_store(pdf_path, base_input_dir)
+            needs_extract = store_force or pdf_store_needs_refresh(
+                pdf_store_conn,
+                rel_path=rel_path,
+                size_bytes=int(st.st_size),
+                mtime_ns=int(st.st_mtime_ns),
+            )
+
+            try:
+                if needs_extract:
+                    pages = upsert_pdf_into_store(
+                        pdf_store_conn,
+                        pdf_path=pdf_path,
+                        base_input_dir=base_input_dir,
+                        embedding_model=store_embedding_model,
+                        embedding_model_id=store_embedding_model_id,
+                        compute_embeddings=bool(want_embeddings),
+                        # IMPORTANT: if the PDF is missing/stale, replace rows for this rel_path
+                        # to avoid accumulating multiple versions (same rel_path, different pdf_sha256).
+                        reprocess=True,
+                    )
+                    upserted_pages += int(pages)
+                    refreshed_pdfs += 1
+                else:
+                    skipped += 1
+
+                # Always backfill missing extractive summaries (cheap + offline)
+                filled_summaries += pdf_store_fill_missing_summaries_for_pdf(
+                    pdf_store_conn, rel_path=rel_path
+                )
+
+                # Backfill embeddings (if requested) without re-extracting pages
+                if want_embeddings and store_embedding_model is not None:
+                    if pdf_store_needs_embeddings(
+                        pdf_store_conn,
+                        rel_path=rel_path,
+                        embedding_model_tag=store_embedding_model_id,
+                    ):
+                        filled_embeddings += pdf_store_compute_embeddings_for_pdf(
+                            pdf_store_conn,
+                            rel_path=rel_path,
+                            embedding_model=store_embedding_model,
+                            embedding_model_tag=str(store_embedding_model_id or ""),
+                        )
+
+                # Backfill profiles (if requested) without re-extracting pages
+                if want_profiles:
+                    profile_tag = (
+                        f"{store_provider_used}:{args.model}:p{int(args.pdf_profile_max_pages)}:"
+                        f"c{int(args.pdf_profile_max_chars_per_page)}"
+                    )
+                    if pdf_store_needs_profile(
+                        pdf_store_conn,
+                        rel_path=rel_path,
+                        profile_model_tag=profile_tag,
+                    ):
+                        prof = generate_pdf_profile_from_store(
+                            pdf_store_conn,
+                            pdf_path=pdf_path,
+                            base_input_dir=base_input_dir,
+                            llm=store_profile_llm,
+                            provider=store_provider_used,
+                            llm_id=args.model,
+                            max_pages=int(args.pdf_profile_max_pages),
+                            max_chars_per_page=int(args.pdf_profile_max_chars_per_page),
+                        )
+                        if prof is not None:
+                            filled_profiles += 1
+
+            except Exception as e:
+                print(f"  Warning: Failed to store/backfill {pdf_path}: {e}")
+                continue
+
+            if i == 1 or i == total or (i % 25 == 0):
+                print(
+                    f"  Processed {i}/{total} PDFs "
+                    f"(refreshed: {refreshed_pdfs}, skipped: {skipped}, "
+                    f"summaries+={filled_summaries}, embeddings+={filled_embeddings}, profiles+={filled_profiles})"
+                )
+
+        print(
+            f"SQLite PDF store sync complete: refreshed {refreshed_pdfs}/{total} PDFs, "
+            f"upserted {upserted_pages} page(s), skipped {skipped} up-to-date. "
+            f"Backfilled: summaries {filled_summaries}, embeddings {filled_embeddings}, profiles {filled_profiles}."
+        )
+
+        if args.pdf_store_build and not args.pdf_store_use:
+            print("\nSQLite PDF store build complete (--pdf-store-build). Exiting.")
+            return 0
+
     docs_cache_id = compute_docs_cache_id(
         pdf_paths,
         recursive=not args.no_recursive,
@@ -2500,8 +3415,46 @@ def main():
     docs_cache_path = docs_cache_dir / f"docs_{docs_cache_id}.jsonl.gz"
     docs_meta_path = meta_dir / f"docs_{docs_cache_id}.json"
 
-    # Load documents (prefer cache)
-    if cache_enabled and docs_cache_path.exists() and not args.reprocess:
+    # Load documents
+    if args.pdf_store_use:
+        if pdf_store_conn is None:
+            print("\nError: --pdf-store-use was set but SQLite PDF store is not initialized.")
+            return 1
+
+        # If auto-build is disabled, verify that the store covers the selected PDFs.
+        if not args.pdf_store_auto_build:
+            missing_or_stale = 0
+            for pdf_path in pdf_paths:
+                try:
+                    st = pdf_path.stat()
+                except Exception:
+                    continue
+                rel_path = _compute_rel_path_for_store(pdf_path, base_input_dir)
+                if pdf_store_needs_refresh(
+                    pdf_store_conn,
+                    rel_path=rel_path,
+                    size_bytes=int(st.st_size),
+                    mtime_ns=int(st.st_mtime_ns),
+                ):
+                    missing_or_stale += 1
+            if missing_or_stale:
+                print(
+                    f"\nError: SQLite PDF store is missing/stale for {missing_or_stale} PDF(s). "
+                    "Run with --pdf-store-build or enable --pdf-store-auto-build."
+                )
+                return 1
+
+        print("\nLoading documents from SQLite PDF store...")
+        all_docs = load_documents_from_store(
+            pdf_store_conn,
+            base_input_dir=base_input_dir,
+            pdf_paths=pdf_paths,
+            max_files=args.max_files,
+        )
+        print(f"  Loaded {len(all_docs)} document(s) from SQLite store")
+
+    # Fallback: file-based extracted-doc cache
+    elif cache_enabled and docs_cache_path.exists() and not args.reprocess:
         print(f"\nLoading cached extracted documents: {docs_cache_path}")
         all_docs = load_documents_cache(docs_cache_path)
         print(f"  Loaded {len(all_docs)} cached document(s)")
@@ -2621,20 +3574,53 @@ def main():
     # so query generation can use PDF-level context even when the KG is loaded from cache.
     pdf_profiles_by_source: Dict[str, Dict[str, Any]] = {}
     if args.pdf_profiles:
-        raw_profile_llm = getattr(generator_llm, "langchain_llm", None)
-        pdf_profiles_by_source = build_pdf_profiles(
-            pdf_paths=pdf_paths,
-            docs=all_docs,
-            base_input_dir=base_input_dir,
-            llm=raw_profile_llm,
-            provider=provider_used,
-            llm_id=args.model,
-            profiles_dir=pdf_profiles_cache_dir,
-            cache_enabled=cache_enabled,
-            reprocess=args.reprocess,
-            max_pages=int(args.pdf_profile_max_pages),
-            max_chars_per_page=int(args.pdf_profile_max_chars_per_page),
-        )
+        # If a SQLite store is enabled, prefer loading profiles from SQLite (when present),
+        # and only generate missing ones via the existing file-based cache path.
+        if pdf_store_conn is not None and not args.reprocess:
+            pdf_profiles_by_source = load_pdf_profiles_from_store(
+                pdf_store_conn,
+                pdf_paths=pdf_paths,
+                base_input_dir=base_input_dir,
+            )
+
+        missing_pdf_paths = [
+            p for p in pdf_paths if str(p.expanduser().resolve()) not in pdf_profiles_by_source
+        ]
+        if missing_pdf_paths:
+            raw_profile_llm = getattr(generator_llm, "langchain_llm", None)
+            new_profiles = build_pdf_profiles(
+                pdf_paths=missing_pdf_paths,
+                docs=all_docs,
+                base_input_dir=base_input_dir,
+                llm=raw_profile_llm,
+                provider=provider_used,
+                llm_id=args.model,
+                profiles_dir=pdf_profiles_cache_dir,
+                cache_enabled=cache_enabled,
+                reprocess=args.reprocess,
+                max_pages=int(args.pdf_profile_max_pages),
+                max_chars_per_page=int(args.pdf_profile_max_chars_per_page),
+            )
+            pdf_profiles_by_source.update(new_profiles)
+
+            # Persist newly created profiles into SQLite for future runs.
+            if pdf_store_conn is not None:
+                model_tag = (
+                    f"{provider_used}:{args.model}:p{int(args.pdf_profile_max_pages)}:"
+                    f"c{int(args.pdf_profile_max_chars_per_page)}"
+                )
+                for source_path, prof in new_profiles.items():
+                    try:
+                        rel_path = _compute_rel_path_for_store(Path(source_path), base_input_dir)
+                        _store_set_pdf_profile(
+                            pdf_store_conn,
+                            rel_path=rel_path,
+                            profile=prof,
+                            pdf_profile_model=model_tag,
+                        )
+                    except Exception:
+                        continue
+
         print(f"PDF profiles: enabled ({len(pdf_profiles_by_source)} cached/generated)")
     else:
         print("PDF profiles: disabled (--no-pdf-profiles)")
