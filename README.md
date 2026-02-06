@@ -41,6 +41,9 @@ Common flags:
 - `--standalone-queries` / `--no-standalone-queries` (default: enabled; generate standalone, corpus-level search queries)
 - `--corpus-size-hint N` (used only when `--standalone-queries` is enabled; default: 7000)
 - `--query-llm-context "..."` (extra guidance appended to the default corpus guidance)
+- `--pdf-profiles` / `--no-pdf-profiles` (default: enabled; generate per-PDF LLM profiles and inject them into query generation)
+- `--pdf-profile-max-pages N` (default: 3; lower to reduce cost)
+- `--pdf-profile-max-chars-per-page N` (default: 2500; lower to reduce cost)
 - `--provider auto|openai|azure`
 - `--model gpt-4o-mini` (or your Azure deployment name)
 - `--processed-dir processed` (where intermediate caches are stored)
@@ -75,6 +78,7 @@ By default the script saves intermediate artifacts to `processed/` and reuses th
 - `processed/docs/`: extracted PDF pages (LangChain `Document`s)
 - `processed/kg/`: the processed RAGAS Knowledge Graph (after transforms)
 - `processed/personas/`: generated personas
+- `processed/pdf_profiles/`: per-PDF LLM “profiles” used to improve query realism (folder/filename hints + high-level summary)
 - `processed/meta/`: metadata JSON describing cache keys + inputs for each artifact
 
 This is useful when you want to regenerate testsets (e.g., different `--testset-size`) without re-running the expensive transform step.
@@ -332,6 +336,19 @@ If you want full control, you can:
 RAGAS accepts `query_distribution=...` (a list of `(synthesizer, probability)` pairs).
 
 This script starts from the default RAGAS distribution, and when `--standalone-queries` is enabled (default) it patches the synthesizer prompts to encourage **standalone, corpus-level** search queries. Disable this behavior with `--no-standalone-queries` if you want unmodified RAGAS prompts.
+
+### PDF profiles (improving query realism across many PDFs)
+
+When `--pdf-profiles` is enabled (default), the script generates a **PDF-level profile** for each PDF (cached under `processed/pdf_profiles/`) and injects it into query generation as additional context. This helps the LLM write questions that sound like what a person would search for when looking across **thousands of documents**, not just “what’s on this page.”
+
+Profile inputs include:
+- the PDF’s **folder path** (e.g., `Claires/…`)
+- the **filename stem** (e.g., `222_Notice_of_Appearance.._Filed_by_Wichita_County._(Lerew_Mollie)`)
+- a short excerpt from the first few pages
+
+Notes:
+- The profiler metadata is used to improve **query framing only**; answers are still expected to be grounded in the provided context excerpt(s).
+- If you want to reduce cost/latency, lower `--pdf-profile-max-pages` and/or `--pdf-profile-max-chars-per-page`, or disable with `--no-pdf-profiles`.
 
 ---
 

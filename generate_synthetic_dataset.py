@@ -25,7 +25,7 @@ import argparse
 import gzip
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Any
@@ -61,6 +61,14 @@ from ragas.run_config import RunConfig
 from ragas.testset.persona import Persona, generate_personas_from_kg
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings, AzureChatOpenAI, AzureOpenAIEmbeddings
 
+# RAGAS synthesizers/prompts (used for PDF-profile-aware query generation)
+from ragas.dataset_schema import SingleTurnSample
+from ragas.testset.synthesizers.single_hop.prompts import QueryCondition as SingleHopQueryCondition
+from ragas.testset.synthesizers.multi_hop.prompts import QueryConditions as MultiHopQueryConditions
+from ragas.testset.synthesizers.single_hop.specific import SingleHopSpecificQuerySynthesizer
+from ragas.testset.synthesizers.multi_hop.abstract import MultiHopAbstractQuerySynthesizer
+from ragas.testset.synthesizers.multi_hop.specific import MultiHopSpecificQuerySynthesizer
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -83,7 +91,26 @@ class SafeHeadlineSplitter(HeadlineSplitter):
             return [node], []
 
         # Headlines exist - use parent class implementation
-        return await super().split(node)
+        nodes, relationships = await super().split(node)
+
+        # IMPORTANT: Propagate source metadata into CHUNK nodes.
+        #
+        # RAGAS's stock HeadlineSplitter creates CHUNK nodes with only `page_content`,
+        # which loses the originating PDF identity (source path, page index, etc).
+        #
+        # We copy `document_metadata` from the parent DOCUMENT node so downstream
+        # query generation can attach PDF-level context (profiles) per chunk.
+        parent_md = node.get_property("document_metadata")
+        if parent_md is not None:
+            for n in nodes:
+                if n.type == NodeType.CHUNK and n.get_property("document_metadata") is None:
+                    # Shallow copy is sufficient (metadata is JSON-like dict from LC docs)
+                    if isinstance(parent_md, dict):
+                        n.add_property("document_metadata", dict(parent_md))
+                    else:
+                        n.add_property("document_metadata", parent_md)
+
+        return nodes, relationships
 
 
 @dataclass
@@ -253,6 +280,35 @@ def compute_kg_cache_id(
     return _sha256_hex(_canonical_json(payload))[:16]
 
 
+# ---------------------------
+# PDF Profile caching/config
+# ---------------------------
+PDF_PROFILE_SCHEMA_VERSION = 1
+DEFAULT_PDF_PROFILE_MAX_PAGES = 3
+DEFAULT_PDF_PROFILE_MAX_CHARS_PER_PAGE = 2500
+DEFAULT_PDF_PROFILE_MAX_PROFILE_CHARS = 1800  # Cap injected profile text per PDF
+
+
+def compute_pdf_profile_cache_id(
+    pdf_path: Path,
+    *,
+    provider: str,
+    llm_id: str,
+    max_pages: int,
+    max_chars_per_page: int,
+) -> str:
+    payload = {
+        "schema_version": PDF_PROFILE_SCHEMA_VERSION,
+        "kind": "pdf_profile",
+        "provider": provider,
+        "llm_id": llm_id,
+        "max_pages": int(max_pages),
+        "max_chars_per_page": int(max_chars_per_page),
+        "pdf": _file_fingerprint(pdf_path),
+    }
+    return _sha256_hex(_canonical_json(payload))[:16]
+
+
 def save_documents_cache(docs: List[Document], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wt", encoding="utf-8") as f:
@@ -418,6 +474,586 @@ def _normalize_ynu(value: Any) -> str:
     if s in {"no", "n", "false", "0"}:
         return "no"
     return "uncertain"
+
+
+# ---------------------------
+# PDF Profiles (LLM-based)
+# ---------------------------
+PDF_PROFILE_LLM_CONTEXT_RULES = (
+    "You may receive one or more PDF_PROFILES below (PDF-level metadata).\n"
+    "Use PDF_PROFILES ONLY to make the SEARCH QUERY more realistic in a large corpus and to pick a plausible user intent.\n"
+    "CRITICAL:\n"
+    "- Do NOT mention file paths, directories, '.pdf', or raw filenames in the final query.\n"
+    "- Do NOT copy filename stems verbatim if they contain underscores/odd punctuation; use them only as hints.\n"
+    "- Prefer identifiers present in the provided context excerpt(s). You MAY use folder/collection hints or a cleaned-up\n"
+    "  title guess from the profile to disambiguate, but keep it natural and do not rely on it for the answer.\n"
+    "- The ANSWER must be supported ONLY by the provided context excerpt(s), not by PDF_PROFILES.\n"
+)
+
+
+def _safe_resolve_path_str(path_like: Any) -> Optional[str]:
+    """
+    Best-effort canonicalization of a path-like value to an absolute, resolved string.
+    """
+    if path_like is None:
+        return None
+    s = str(path_like).strip()
+    if not s:
+        return None
+    try:
+        return str(Path(s).expanduser().resolve())
+    except Exception:
+        return s
+
+
+def _truncate_for_profile(text: str, *, max_chars: int) -> str:
+    """
+    Keep PDF profile excerpts/snippets bounded in size.
+    """
+    if not text:
+        return ""
+    t = str(text).replace("\x00", " ").strip()
+    if len(t) <= max_chars:
+        return t
+    head = int(max_chars * 0.7)
+    tail = max_chars - head
+    return f"{t[:head]}\n...\n{t[-tail:]}"
+
+
+def _group_docs_by_source(docs: List[Document]) -> Dict[str, List[Document]]:
+    out: Dict[str, List[Document]] = {}
+    for d in docs:
+        src = _safe_resolve_path_str(d.metadata.get("source"))
+        if not src:
+            continue
+        out.setdefault(src, []).append(d)
+    # Deterministic page ordering per PDF (if page numbers exist)
+    for src, items in out.items():
+        def _k(doc: Document):
+            p = doc.metadata.get("page")
+            return p if isinstance(p, int) else 10**9
+        out[src] = sorted(items, key=_k)
+    return out
+
+
+def _build_pdf_excerpt_from_docs(
+    docs_for_pdf: List[Document],
+    *,
+    max_pages: int,
+    max_chars_per_page: int,
+) -> str:
+    if not docs_for_pdf or max_pages <= 0 or max_chars_per_page <= 0:
+        return ""
+    chosen = docs_for_pdf[: max_pages]
+    parts: List[str] = []
+    for doc in chosen:
+        page0 = doc.metadata.get("page")
+        page_label = f"{int(page0) + 1}" if isinstance(page0, int) else "?"
+        snippet = _truncate_for_profile(doc.page_content or "", max_chars=max_chars_per_page)
+        if not snippet.strip():
+            continue
+        parts.append(f"--- PAGE {page_label} ---\n{snippet}")
+    return "\n\n".join(parts).strip()
+
+
+def _compute_corpus_path(pdf_path: Path, base_input_dir: Path) -> Optional[str]:
+    """
+    Compute a stable, non-personal "corpus path" for prompting (relative to input dir when possible).
+    """
+    try:
+        rel = pdf_path.resolve().relative_to(base_input_dir.resolve())
+        return str(rel)
+    except Exception:
+        return None
+
+
+def _format_pdf_profile_for_prompt(
+    profile: Dict[str, Any],
+    *,
+    max_chars: int = DEFAULT_PDF_PROFILE_MAX_PROFILE_CHARS,
+) -> str:
+    """
+    Convert a cached profile dict into a compact text block for prompt injection.
+    """
+    corpus_path = str(profile.get("corpus_path") or "").strip()
+    filename_stem = str(profile.get("filename_stem") or "").strip()
+    folder_hints = profile.get("folder_hints") or []
+    folder_hints = [str(x) for x in folder_hints if str(x).strip()]
+
+    llm_profile = profile.get("llm_profile") or {}
+    if not isinstance(llm_profile, dict):
+        llm_profile = {}
+
+    def _get_list(key: str, limit: int = 8) -> List[str]:
+        v = llm_profile.get(key)
+        if not isinstance(v, list):
+            return []
+        out = []
+        for x in v:
+            xs = str(x).strip()
+            if xs:
+                out.append(xs)
+            if len(out) >= limit:
+                break
+        return out
+
+    title_guess = str(llm_profile.get("title_guess") or "").strip()
+    doc_type = str(llm_profile.get("doc_type") or "").strip()
+    summary = str(llm_profile.get("summary") or "").strip()
+    topics = _get_list("topics", limit=8)
+    key_entities = _get_list("key_entities", limit=8)
+    likely_intents = _get_list("likely_user_intents", limit=6)
+
+    lines: List[str] = []
+    if corpus_path:
+        lines.append(f"- corpus_path: {corpus_path}")
+    if folder_hints:
+        lines.append(f"- folder_hints: {', '.join(folder_hints[:5])}")
+    if filename_stem:
+        lines.append(f"- filename_stem: {filename_stem}")
+    if title_guess:
+        lines.append(f"- title_guess: {title_guess}")
+    if doc_type:
+        lines.append(f"- doc_type: {doc_type}")
+    if summary:
+        lines.append(f"- summary: {summary}")
+    if topics:
+        lines.append(f"- topics: {', '.join(topics)}")
+    if key_entities:
+        lines.append(f"- key_entities: {', '.join(key_entities)}")
+    if likely_intents:
+        lines.append(f"- likely_user_intents: {', '.join(likely_intents)}")
+
+    return _truncate_for_profile("\n".join(lines), max_chars=max_chars).strip()
+
+
+def _generate_pdf_profile_with_llm(
+    llm: Any,
+    *,
+    pdf_path: Path,
+    base_input_dir: Path,
+    excerpt: str,
+    provider: str,
+    llm_id: str,
+    max_pages: int,
+    max_chars_per_page: int,
+) -> Dict[str, Any]:
+    """
+    Generate a compact PDF-level profile using an LLM.
+
+    Returns a profile dict (always includes path + filename hints), with an optional
+    `llm_profile` payload if generation succeeded.
+    """
+    resolved = pdf_path.resolve()
+    source_path = str(resolved)
+    corpus_path = _compute_corpus_path(resolved, base_input_dir)
+    filename = resolved.name
+    filename_stem = resolved.stem
+    folder_hints: List[str] = []
+    if corpus_path:
+        try:
+            p = Path(corpus_path)
+            folder_hints = list(p.parts[:-1])
+        except Exception:
+            folder_hints = []
+    # If we couldn't compute a relative path (or the file sits directly under input-dir),
+    # still provide at least the immediate parent folder as a hint (e.g., "Claires").
+    if not folder_hints:
+        try:
+            parent_name = resolved.parent.name
+            if parent_name:
+                folder_hints = [parent_name]
+        except Exception:
+            pass
+
+    profile_id = compute_pdf_profile_cache_id(
+        resolved,
+        provider=provider,
+        llm_id=llm_id,
+        max_pages=max_pages,
+        max_chars_per_page=max_chars_per_page,
+    )
+
+    base_profile: Dict[str, Any] = {
+        "schema_version": PDF_PROFILE_SCHEMA_VERSION,
+        "profile_id": profile_id,
+        "created_at": _utc_now_iso(),
+        "provider": provider,
+        "llm_id": llm_id,
+        # Always store absolute resolved path for stable lookup
+        "source_path": source_path,
+        # Prompt-safe path (relative to input dir) when available
+        "corpus_path": corpus_path,
+        "filename": filename,
+        "filename_stem": filename_stem,
+        "folder_hints": folder_hints,
+    }
+
+    if llm is None:
+        base_profile["llm_profile"] = {
+            "title_guess": "",
+            "doc_type": "",
+            "summary": "",
+            "topics": [],
+            "key_entities": [],
+            "likely_user_intents": [],
+        }
+        base_profile["llm_profile_error"] = "llm_unavailable"
+        return base_profile
+
+    system = (
+        "You are a careful document profiler.\n"
+        "Given limited excerpts from a PDF plus filename/folder hints, produce a compact high-level profile.\n"
+        "The profile will be used ONLY to help generate realistic user search queries across a large corpus.\n"
+        "Do NOT include page numbers, file paths, or raw filenames in any output fields except where explicitly requested.\n"
+        "Return ONLY valid JSON.\n"
+    )
+
+    # Include the filename/folder hints explicitly (as the user requested)
+    user = (
+        "Create a PDF profile in JSON.\n\n"
+        f"PDF source_path (absolute): {source_path}\n"
+        f"PDF corpus_path (relative, if available): {corpus_path or ''}\n"
+        f"PDF filename: {filename}\n"
+        f"PDF filename_stem: {filename_stem}\n"
+        f"PDF folder_hints: {folder_hints}\n\n"
+        "EXCERPT (may be partial):\n"
+        f"{excerpt}\n\n"
+        "Return JSON in this exact schema:\n"
+        "{"
+        "\"title_guess\":\"<string>\","
+        "\"doc_type\":\"<string>\","
+        "\"summary\":\"<1-2 sentences>\","
+        "\"topics\":[\"<string>\",...],"
+        "\"key_entities\":[\"<string>\",...],"
+        "\"likely_user_intents\":[\"<string>\",...],"
+        "\"confidence\":\"high|medium|low\""
+        "}"
+    )
+
+    llm_profile: Dict[str, Any] = {}
+    try:
+        resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+        content = getattr(resp, "content", None)
+        content = content if isinstance(content, str) else str(resp)
+        data = _extract_json_object(content)
+        if isinstance(data, dict):
+            llm_profile = data
+        else:
+            base_profile["llm_profile_error"] = "json_parse_failed"
+    except Exception as e:
+        base_profile["llm_profile_error"] = f"llm_invoke_failed: {e}"
+
+    # Normalize to safe JSON-ish types
+    def _as_list(v: Any, limit: int = 12) -> List[str]:
+        if not isinstance(v, list):
+            return []
+        out: List[str] = []
+        for x in v:
+            xs = str(x).strip()
+            if xs:
+                out.append(xs)
+            if len(out) >= limit:
+                break
+        return out
+
+    base_profile["llm_profile"] = {
+        "title_guess": str(llm_profile.get("title_guess") or "").strip(),
+        "doc_type": str(llm_profile.get("doc_type") or "").strip(),
+        "summary": str(llm_profile.get("summary") or "").strip(),
+        "topics": _as_list(llm_profile.get("topics")),
+        "key_entities": _as_list(llm_profile.get("key_entities")),
+        "likely_user_intents": _as_list(llm_profile.get("likely_user_intents"), limit=8),
+        "confidence": str(llm_profile.get("confidence") or "").strip().lower(),
+    }
+    return base_profile
+
+
+def _load_pdf_profile_cache(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_pdf_profile_cache(profile: Dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+
+def build_pdf_profiles(
+    *,
+    pdf_paths: List[Path],
+    docs: List[Document],
+    base_input_dir: Path,
+    llm: Any,
+    provider: str,
+    llm_id: str,
+    profiles_dir: Path,
+    cache_enabled: bool,
+    reprocess: bool,
+    max_pages: int = DEFAULT_PDF_PROFILE_MAX_PAGES,
+    max_chars_per_page: int = DEFAULT_PDF_PROFILE_MAX_CHARS_PER_PAGE,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Build/load per-PDF profiles and return a map: source_path -> profile dict.
+    """
+    docs_by_source = _group_docs_by_source(docs)
+
+    profiles: Dict[str, Dict[str, Any]] = {}
+    total = len(pdf_paths)
+    if total == 0:
+        return profiles
+
+    print("\nBuilding PDF profiles (LLM-based; cached)...")
+    print(f"  PDFs to profile: {total}")
+    print(
+        f"  Profile excerpt: first {max_pages} page(s), up to {max_chars_per_page} chars per page"
+    )
+
+    for i, pdf_path in enumerate(pdf_paths, start=1):
+        resolved = pdf_path.resolve()
+        source_path = str(resolved)
+        profile_cache_id = compute_pdf_profile_cache_id(
+            resolved,
+            provider=provider,
+            llm_id=llm_id,
+            max_pages=max_pages,
+            max_chars_per_page=max_chars_per_page,
+        )
+        cache_path = profiles_dir / f"profile_{profile_cache_id}.json"
+
+        if cache_enabled and cache_path.exists() and not reprocess:
+            cached = _load_pdf_profile_cache(cache_path)
+            if isinstance(cached, dict):
+                # Refresh path-derived fields (corpus_path/folder_hints) in case input-dir changes
+                cached["source_path"] = source_path
+                cached["filename"] = resolved.name
+                cached["filename_stem"] = resolved.stem
+                cached["corpus_path"] = _compute_corpus_path(resolved, base_input_dir)
+                folder_hints: List[str] = []
+                if cached.get("corpus_path"):
+                    try:
+                        p = Path(str(cached["corpus_path"]))
+                        folder_hints = list(p.parts[:-1])
+                    except Exception:
+                        folder_hints = []
+                if not folder_hints:
+                    parent_name = resolved.parent.name
+                    if parent_name:
+                        folder_hints = [parent_name]
+                cached["folder_hints"] = folder_hints
+                profiles[source_path] = cached
+                continue
+
+        docs_for_pdf = docs_by_source.get(source_path, [])
+        excerpt = _build_pdf_excerpt_from_docs(
+            docs_for_pdf, max_pages=max_pages, max_chars_per_page=max_chars_per_page
+        )
+
+        prof = _generate_pdf_profile_with_llm(
+            llm,
+            pdf_path=resolved,
+            base_input_dir=base_input_dir,
+            excerpt=excerpt,
+            provider=provider,
+            llm_id=llm_id,
+            max_pages=max_pages,
+            max_chars_per_page=max_chars_per_page,
+        )
+        profiles[source_path] = prof
+
+        if cache_enabled:
+            _save_pdf_profile_cache(prof, cache_path)
+
+        # Light progress for large corpora
+        if i == 1 or i == total or (i % 25 == 0):
+            print(f"  Profiled {i}/{total} PDFs")
+
+    return profiles
+
+
+def build_llm_context_with_pdf_profiles(
+    *,
+    base_llm_context: Optional[str],
+    profiles: List[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    Combine the global llm_context (corpus guidance) with one or more PDF profile blocks.
+    """
+    blocks: List[str] = []
+    if base_llm_context and str(base_llm_context).strip():
+        blocks.append(str(base_llm_context).strip())
+
+    # Always include the rules when injecting profiles
+    blocks.append(PDF_PROFILE_LLM_CONTEXT_RULES.strip())
+
+    rendered = []
+    for p in profiles:
+        rendered_block = _format_pdf_profile_for_prompt(p, max_chars=DEFAULT_PDF_PROFILE_MAX_PROFILE_CHARS)
+        if rendered_block:
+            rendered.append(rendered_block)
+    if rendered:
+        blocks.append("PDF_PROFILES:\n" + "\n\n".join(rendered))
+
+    out = "\n\n".join([b for b in blocks if b.strip()]).strip()
+    return out or None
+
+
+# --------------------------------
+# PDF-profile-aware query synthesis
+# --------------------------------
+@dataclass
+class PdfProfileSingleHopSpecificQuerySynthesizer(SingleHopSpecificQuerySynthesizer):
+    pdf_profiles_by_source: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def _profiles_for_sources(self, sources: List[str], *, max_profiles: int = 1) -> List[Dict[str, Any]]:
+        seen: set = set()
+        out: List[Dict[str, Any]] = []
+        for s in sources:
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            p = self.pdf_profiles_by_source.get(s)
+            if isinstance(p, dict):
+                out.append(p)
+            if len(out) >= max_profiles:
+                break
+        return out
+
+    async def _generate_sample(self, scenario, callbacks):  # type: ignore[override]
+        reference_context = scenario.nodes[0].properties.get("page_content", "")
+
+        md = scenario.nodes[0].get_property("document_metadata") or {}
+        source = _safe_resolve_path_str(md.get("source")) if isinstance(md, dict) else None
+        profiles = self._profiles_for_sources([source] if source else [], max_profiles=1)
+        dynamic_llm_context = build_llm_context_with_pdf_profiles(
+            base_llm_context=self.llm_context,
+            profiles=profiles,
+        ) if profiles else self.llm_context
+
+        prompt_input = SingleHopQueryCondition(
+            persona=scenario.persona,
+            term=scenario.term,
+            context=reference_context,
+            query_length=scenario.length.value,
+            query_style=scenario.style.value,
+            llm_context=dynamic_llm_context,
+        )
+        response = await self.generate_query_reference_prompt.generate(
+            data=prompt_input, llm=self.llm, callbacks=callbacks
+        )
+        return SingleTurnSample(
+            user_input=response.query,
+            reference=response.answer,
+            reference_contexts=[reference_context],
+            persona_name=getattr(scenario.persona, "name", None),
+            query_style=getattr(scenario.style, "name", None),
+            query_length=getattr(scenario.length, "name", None),
+        )
+
+
+@dataclass
+class PdfProfileMultiHopAbstractQuerySynthesizer(MultiHopAbstractQuerySynthesizer):
+    pdf_profiles_by_source: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def _profiles_for_nodes(self, nodes: List[Node], *, max_profiles: int = 2) -> List[Dict[str, Any]]:
+        sources: List[str] = []
+        for n in nodes:
+            md = n.get_property("document_metadata") or {}
+            src = _safe_resolve_path_str(md.get("source")) if isinstance(md, dict) else None
+            if src:
+                sources.append(src)
+        seen: set = set()
+        out: List[Dict[str, Any]] = []
+        for s in sources:
+            if s in seen:
+                continue
+            seen.add(s)
+            p = self.pdf_profiles_by_source.get(s)
+            if isinstance(p, dict):
+                out.append(p)
+            if len(out) >= max_profiles:
+                break
+        return out
+
+    async def _generate_sample(self, scenario, callbacks):  # type: ignore[override]
+        reference_contexts = self.make_contexts(scenario)
+        profiles = self._profiles_for_nodes(list(scenario.nodes), max_profiles=2)
+        dynamic_llm_context = build_llm_context_with_pdf_profiles(
+            base_llm_context=self.llm_context,
+            profiles=profiles,
+        ) if profiles else self.llm_context
+
+        prompt_input = MultiHopQueryConditions(
+            persona=scenario.persona,
+            themes=scenario.combinations,
+            context=reference_contexts,
+            query_length=scenario.length.value,
+            query_style=scenario.style.value,
+            llm_context=dynamic_llm_context,
+        )
+        response = await self.generate_query_reference_prompt.generate(
+            data=prompt_input, llm=self.llm, callbacks=callbacks
+        )
+        return SingleTurnSample(
+            user_input=response.query,
+            reference=response.answer,
+            reference_contexts=reference_contexts,
+        )
+
+
+@dataclass
+class PdfProfileMultiHopSpecificQuerySynthesizer(MultiHopSpecificQuerySynthesizer):
+    pdf_profiles_by_source: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def _profiles_for_nodes(self, nodes: List[Node], *, max_profiles: int = 2) -> List[Dict[str, Any]]:
+        sources: List[str] = []
+        for n in nodes:
+            md = n.get_property("document_metadata") or {}
+            src = _safe_resolve_path_str(md.get("source")) if isinstance(md, dict) else None
+            if src:
+                sources.append(src)
+        seen: set = set()
+        out: List[Dict[str, Any]] = []
+        for s in sources:
+            if s in seen:
+                continue
+            seen.add(s)
+            p = self.pdf_profiles_by_source.get(s)
+            if isinstance(p, dict):
+                out.append(p)
+            if len(out) >= max_profiles:
+                break
+        return out
+
+    async def _generate_sample(self, scenario, callbacks):  # type: ignore[override]
+        reference_contexts = self.make_contexts(scenario)
+        profiles = self._profiles_for_nodes(list(scenario.nodes), max_profiles=2)
+        dynamic_llm_context = build_llm_context_with_pdf_profiles(
+            base_llm_context=self.llm_context,
+            profiles=profiles,
+        ) if profiles else self.llm_context
+
+        prompt_input = MultiHopQueryConditions(
+            persona=scenario.persona,
+            themes=scenario.combinations,
+            context=reference_contexts,
+            query_length=scenario.length.value,
+            query_style=scenario.style.value,
+            llm_context=dynamic_llm_context,
+        )
+        response = await self.generate_query_reference_prompt.generate(
+            data=prompt_input, llm=self.llm, callbacks=callbacks
+        )
+        return SingleTurnSample(
+            user_input=response.query,
+            reference=response.answer,
+            reference_contexts=reference_contexts,
+        )
 
 
 def llm_is_hard_negative(
@@ -1239,13 +1875,18 @@ def build_query_distribution_for_pipeline(
     *,
     standalone_queries: bool,
     llm_context: Optional[str],
+    pdf_profiles_by_source: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     """
     Build a query_distribution that nudges RAGAS to produce *standalone, corpus-appropriate* queries.
 
-    If standalone_queries is False, returns None (RAGAS defaults are used).
+    Returns:
+      - None only when we are using fully stock RAGAS behavior (no standalone prompt patching,
+        and no PDF-profile injection).
+      - Otherwise, returns a query_distribution with compatible synthesizers.
     """
-    if not standalone_queries:
+    use_pdf_profiles = bool(pdf_profiles_by_source)
+    if not standalone_queries and not use_pdf_profiles:
         return None
 
     # Use RAGAS's compatibility filtering, then override the prompts.
@@ -1257,18 +1898,59 @@ def build_query_distribution_for_pipeline(
         QueryAnswerGenerationPrompt as MultiHopQueryAnswerGenerationPrompt,
     )
 
-    qd = default_query_distribution(llm, kg, llm_context)
+    if use_pdf_profiles:
+        # Build our PDF-profile-aware synthesizers and run the same compatibility filtering logic
+        # as RAGAS's default_query_distribution.
+        candidates = [
+            PdfProfileSingleHopSpecificQuerySynthesizer(
+                llm=llm,
+                llm_context=llm_context,
+                pdf_profiles_by_source=pdf_profiles_by_source or {},
+            ),
+            PdfProfileMultiHopAbstractQuerySynthesizer(
+                llm=llm,
+                llm_context=llm_context,
+                pdf_profiles_by_source=pdf_profiles_by_source or {},
+            ),
+            PdfProfileMultiHopSpecificQuerySynthesizer(
+                llm=llm,
+                llm_context=llm_context,
+                pdf_profiles_by_source=pdf_profiles_by_source or {},
+            ),
+        ]
+
+        available = []
+        for query in candidates:
+            try:
+                if query.get_node_clusters(kg):
+                    available.append(query)
+            except Exception as e:
+                print(
+                    f"Warning: Skipping {getattr(query, 'name', type(query).__name__)} due to unexpected error: {e}"
+                )
+                continue
+
+        if not available:
+            raise ValueError(
+                "No compatible query synthesizers for the provided KnowledgeGraph."
+            )
+
+        qd = [(q, 1 / len(available)) for q in available]
+    else:
+        qd = default_query_distribution(llm, kg, llm_context)
+
     patched = []
     for synthesizer, prob in qd:
-        name = str(getattr(synthesizer, "name", "") or "").lower()
-        if name.startswith("single_hop"):
-            p = SingleHopQueryAnswerGenerationPrompt()
-            p.instruction = CORPUS_SINGLE_HOP_PROMPT_INSTRUCTION
-            synthesizer.generate_query_reference_prompt = p
-        else:
-            p = MultiHopQueryAnswerGenerationPrompt()
-            p.instruction = CORPUS_MULTI_HOP_PROMPT_INSTRUCTION
-            synthesizer.generate_query_reference_prompt = p
+        if standalone_queries:
+            name = str(getattr(synthesizer, "name", "") or "").lower()
+            if name.startswith("single_hop"):
+                p = SingleHopQueryAnswerGenerationPrompt()
+                p.instruction = CORPUS_SINGLE_HOP_PROMPT_INSTRUCTION
+                synthesizer.generate_query_reference_prompt = p
+            else:
+                p = MultiHopQueryAnswerGenerationPrompt()
+                p.instruction = CORPUS_MULTI_HOP_PROMPT_INSTRUCTION
+                synthesizer.generate_query_reference_prompt = p
         patched.append((synthesizer, prob))
 
     return patched
@@ -1613,6 +2295,33 @@ def main():
         ),
     )
     parser.add_argument(
+        "--pdf-profiles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Generate per-PDF LLM profiles and inject them into query generation to improve realism "
+            "(default: enabled). Disable with --no-pdf-profiles."
+        ),
+    )
+    parser.add_argument(
+        "--pdf-profile-max-pages",
+        type=int,
+        default=DEFAULT_PDF_PROFILE_MAX_PAGES,
+        help=(
+            "Max number of starting pages to include in each PDF profile excerpt (default: 3). "
+            "Lower this to reduce cost."
+        ),
+    )
+    parser.add_argument(
+        "--pdf-profile-max-chars-per-page",
+        type=int,
+        default=DEFAULT_PDF_PROFILE_MAX_CHARS_PER_PAGE,
+        help=(
+            "Max characters per page included in PDF profile excerpt (default: 2500). "
+            "Lower this to reduce cost."
+        ),
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default="gpt-4o-mini",
@@ -1742,12 +2451,14 @@ def main():
     docs_cache_dir = processed_dir / "docs"
     kg_cache_dir = processed_dir / "kg"
     personas_cache_dir = processed_dir / "personas"
+    pdf_profiles_cache_dir = processed_dir / "pdf_profiles"
     meta_dir = processed_dir / "meta"
 
     if cache_enabled:
         docs_cache_dir.mkdir(parents=True, exist_ok=True)
         kg_cache_dir.mkdir(parents=True, exist_ok=True)
         personas_cache_dir.mkdir(parents=True, exist_ok=True)
+        pdf_profiles_cache_dir.mkdir(parents=True, exist_ok=True)
         meta_dir.mkdir(parents=True, exist_ok=True)
 
     # Collect PDF paths for a stable cache key
@@ -1904,6 +2615,30 @@ def main():
         else "openai-default"
     )
 
+    # PDF profiles (LLM-derived, per-PDF high-level metadata) — enabled by default.
+    #
+    # This is intentionally done early (right after loading documents and setting up the LLM),
+    # so query generation can use PDF-level context even when the KG is loaded from cache.
+    pdf_profiles_by_source: Dict[str, Dict[str, Any]] = {}
+    if args.pdf_profiles:
+        raw_profile_llm = getattr(generator_llm, "langchain_llm", None)
+        pdf_profiles_by_source = build_pdf_profiles(
+            pdf_paths=pdf_paths,
+            docs=all_docs,
+            base_input_dir=base_input_dir,
+            llm=raw_profile_llm,
+            provider=provider_used,
+            llm_id=args.model,
+            profiles_dir=pdf_profiles_cache_dir,
+            cache_enabled=cache_enabled,
+            reprocess=args.reprocess,
+            max_pages=int(args.pdf_profile_max_pages),
+            max_chars_per_page=int(args.pdf_profile_max_chars_per_page),
+        )
+        print(f"PDF profiles: enabled ({len(pdf_profiles_by_source)} cached/generated)")
+    else:
+        print("PDF profiles: disabled (--no-pdf-profiles)")
+
     # Determine if we should add content embeddings (default: True)
     add_content_embeddings = not args.no_content_embeddings
 
@@ -1988,6 +2723,7 @@ def main():
         kg,
         standalone_queries=args.standalone_queries,
         llm_context=llm_context,
+        pdf_profiles_by_source=pdf_profiles_by_source if args.pdf_profiles else None,
     )
 
     # Generate testset from the (cached) knowledge graph
