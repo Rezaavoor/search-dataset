@@ -96,13 +96,13 @@ def build_knowledge_graph(
                 base_input_dir=base_input_dir,
                 headlines_model_tag=f"{ragas_doc_extraction_model_tag_base}:headlines:max5",
                 summary_model_tag=f"{ragas_doc_extraction_model_tag_base}:summary",
+                entities_model_tag=f"{ragas_doc_extraction_model_tag_base}:entities",
+                themes_model_tag=f"{ragas_doc_extraction_model_tag_base}:themes",
             )
-            if counts.get("headlines") or counts.get("summary"):
-                print(
-                    f"  SQLite store: cached RAGAS extractions "
-                    f"(headlines+={counts.get('headlines', 0)}, "
-                    f"summary+={counts.get('summary', 0)})"
-                )
+            persisted = {k: v for k, v in counts.items() if v}
+            if persisted:
+                parts = ", ".join(f"{k}+={v}" for k, v in persisted.items())
+                print(f"  SQLite store: cached RAGAS extractions ({parts})")
         except Exception:
             pass
 
@@ -283,8 +283,14 @@ def save_testset(
     formats: List[str] = ["csv", "json"],
     docs: Optional[List[Document]] = None,
     hard_negatives: Optional[List[List[str]]] = None,
+    source_mappings: Optional[List[Dict[str, Any]]] = None,
 ):
-    """Save the generated testset to files in the output directory."""
+    """Save the generated testset to files in the output directory.
+
+    Args:
+        source_mappings: Pre-computed find_source_files results per row
+            (from hard negative mining). If provided, skips recomputing.
+    """
     df = testset.to_pandas()
 
     if docs:
@@ -293,14 +299,21 @@ def save_testset(
         source_files_with_pages_list = []
         page_numbers_list = []
 
-        for _, row in df.iterrows():
-            contexts = parse_reference_contexts(row.get("reference_contexts"))
-            result = find_source_files(
-                contexts if isinstance(contexts, list) else [contexts], docs
-            )
-            source_files_list.append(result["sources"])
-            source_files_with_pages_list.append(result["sources_with_pages"])
-            page_numbers_list.append(result["page_numbers"])
+        if source_mappings and len(source_mappings) == len(df):
+            # Reuse pre-computed source mappings from hard negative mining
+            for result in source_mappings:
+                source_files_list.append(result["sources"])
+                source_files_with_pages_list.append(result["sources_with_pages"])
+                page_numbers_list.append(result["page_numbers"])
+        else:
+            for _, row in df.iterrows():
+                contexts = parse_reference_contexts(row.get("reference_contexts"))
+                result = find_source_files(
+                    contexts if isinstance(contexts, list) else [contexts], docs
+                )
+                source_files_list.append(result["sources"])
+                source_files_with_pages_list.append(result["sources_with_pages"])
+                page_numbers_list.append(result["page_numbers"])
 
         df["source_files"] = [json.dumps(f) for f in source_files_list]
         df["source_files_with_pages"] = [

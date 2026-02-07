@@ -304,10 +304,10 @@ def main() -> int:
         return 1
 
     # --- Compute total steps ---
-    total_steps = 7  # collect, sync store, load docs, setup LLM, build KG, personas, save
+    # collect, setup LLM, sync store, load docs, build KG, personas, testset, save
+    total_steps = 8
     if args.pdf_profiles:
         total_steps += 1
-    total_steps += 1  # generate testset
     if args.hard_negatives:
         total_steps += 1
     steps = StepTracker(total_steps)
@@ -362,7 +362,46 @@ def main() -> int:
     print(f"  Found {len(pdf_paths)} PDF file(s)")
 
     # -----------------------------------------------------------------------
-    # STEP 2: Initialize & sync SQLite PDF store
+    # STEP 2: Setup LLM & embeddings + sync SQLite PDF store
+    # -----------------------------------------------------------------------
+    steps.next("Setting up LLM & embeddings")
+
+    try:
+        generator_llm, generator_embeddings = setup_llm_and_embeddings(
+            args.model, args.provider
+        )
+    except ValueError as e:
+        print(f"\n  Error: {e}")
+        return 1
+
+    # Resolve provider for cache keys
+    provider_used = args.provider
+    if provider_used == "auto":
+        if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
+            provider_used = "azure"
+        elif os.environ.get("OPENAI_API_KEY"):
+            provider_used = "openai"
+        else:
+            provider_used = "openai"
+
+    embedding_id = (
+        os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME",
+                       "text-embedding-ada-002")
+        if provider_used == "azure" else "openai-default"
+    )
+
+    # Attach the embedding model tag so SQLiteCachedEmbeddingExtractor can match
+    # against stored embedding_f32 blobs in SQLite.
+    generator_embeddings._embedding_model_tag = embedding_id
+
+    ragas_doc_extraction_model_tag_base = (
+        f"{provider_used}:{args.model}:ragas{getattr(ragas, '__version__', 'unknown')}:"
+        f"doc_extract_v{int(RAGAS_DOC_EXTRACT_CACHE_VERSION)}"
+    )
+    reuse_cached_store_extractions = bool(not args.reprocess)
+
+    # -----------------------------------------------------------------------
+    # STEP 3: Initialize & sync SQLite PDF store
     # -----------------------------------------------------------------------
     steps.next("Syncing SQLite PDF store")
 
@@ -380,30 +419,9 @@ def main() -> int:
     want_embeddings = bool(args.pdf_store_embeddings)
     store_force = bool(args.reprocess)
 
-    # Detect provider early for store operations
-    provider_used = args.provider
-    if provider_used == "auto":
-        if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
-            provider_used = "azure"
-        elif os.environ.get("OPENAI_API_KEY"):
-            provider_used = "openai"
-        else:
-            provider_used = "auto"
-
-    store_embedding_model = None
-    store_embedding_model_id: Optional[str] = None
-    if want_embeddings:
-        try:
-            tmp_llm, tmp_emb = setup_llm_and_embeddings(args.model, args.provider)
-            store_embedding_model = tmp_emb
-            store_embedding_model_id = (
-                os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME",
-                               "text-embedding-ada-002")
-                if provider_used == "azure" else "openai-default"
-            )
-        except ValueError as e:
-            print(f"\n  Error setting up embeddings for store: {e}")
-            return 1
+    # Reuse the already-initialized embedding model for store operations
+    store_embedding_model = generator_embeddings if want_embeddings else None
+    store_embedding_model_id: Optional[str] = embedding_id if want_embeddings else None
 
     refreshed_pdfs = 0
     upserted_pages = 0
@@ -474,7 +492,7 @@ def main() -> int:
     )
 
     # -----------------------------------------------------------------------
-    # STEP 3: Load documents from SQLite store
+    # STEP 4: Load documents from SQLite store
     # -----------------------------------------------------------------------
     steps.next("Loading documents from SQLite store")
 
@@ -486,38 +504,6 @@ def main() -> int:
     if not all_docs:
         print("\n  Error: No documents found. Check your input directory.")
         return 1
-
-    # -----------------------------------------------------------------------
-    # STEP 4: Setup LLM & embeddings
-    # -----------------------------------------------------------------------
-    steps.next("Setting up LLM & embeddings")
-
-    try:
-        generator_llm, generator_embeddings = setup_llm_and_embeddings(
-            args.model, args.provider
-        )
-    except ValueError as e:
-        print(f"\n  Error: {e}")
-        return 1
-
-    # Resolve provider for cache keys
-    if provider_used == "auto":
-        if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
-            provider_used = "azure"
-        else:
-            provider_used = "openai"
-
-    embedding_id = (
-        os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME",
-                       "text-embedding-ada-002")
-        if provider_used == "azure" else "openai-default"
-    )
-
-    ragas_doc_extraction_model_tag_base = (
-        f"{provider_used}:{args.model}:ragas{getattr(ragas, '__version__', 'unknown')}:"
-        f"doc_extract_v{int(RAGAS_DOC_EXTRACT_CACHE_VERSION)}"
-    )
-    reuse_cached_store_extractions = bool(not args.reprocess)
 
     # -----------------------------------------------------------------------
     # STEP 5 (optional): Build PDF profiles
@@ -542,7 +528,7 @@ def main() -> int:
         print("\n  PDF profiles: disabled (--no-pdf-profiles)")
 
     # -----------------------------------------------------------------------
-    # STEP 6: Build or load knowledge graph (file-cached)
+    # STEP 6: Build or load knowledge graph (file-cached)  
     # -----------------------------------------------------------------------
     steps.next("Building knowledge graph")
 
@@ -680,6 +666,7 @@ def main() -> int:
     # STEP 9 (optional): Mine hard negatives
     # -----------------------------------------------------------------------
     hard_negatives = None
+    source_mappings = None
     if args.hard_negatives:
         steps.next("Mining hard negatives")
 
@@ -687,7 +674,7 @@ def main() -> int:
         judge_llm = getattr(generator_llm, "langchain_llm", None)
 
         testset_df = testset.to_pandas()
-        hard_negatives = mine_hard_negatives_for_testset(
+        hard_negatives, source_mappings = mine_hard_negatives_for_testset(
             testset_df,
             kg,
             all_docs,
@@ -709,6 +696,7 @@ def main() -> int:
         formats=args.output_formats,
         docs=all_docs,
         hard_negatives=hard_negatives,
+        source_mappings=source_mappings,
     )
 
     print(f"\n{'=' * 60}")

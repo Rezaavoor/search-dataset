@@ -100,19 +100,18 @@ Hard negative flags:
 The script runs a clear step-by-step pipeline with progress indicators:
 
 ```
-[Step  1/10] Collecting PDF paths
-[Step  2/10] Syncing SQLite PDF store
-[Step  3/10] Loading documents from SQLite store
-[Step  4/10] Setting up LLM & embeddings
-[Step  5/10] Building PDF profiles
-[Step  6/10] Building knowledge graph
-[Step  7/10] Generating personas
-[Step  8/10] Generating testset
-[Step  9/10] Mining hard negatives
-[Step 10/10] Saving results
+[Step 1/9] Collecting PDF paths
+[Step 2/9] Setting up LLM & embeddings
+[Step 3/9] Syncing SQLite PDF store
+[Step 4/9] Loading documents from SQLite store
+[Step 5/9] Building PDF profiles
+[Step 6/9] Building knowledge graph
+[Step 7/9] Generating personas
+[Step 8/9] Generating testset
+[Step 9/9] Saving results
 ```
 
-The step count adjusts dynamically based on which optional features (PDF profiles, hard negatives) are enabled.
+When hard negatives are enabled, a "Mining hard negatives" step is added before saving. The step count adjusts dynamically based on which optional features (PDF profiles, hard negatives) are enabled.
 
 ---
 
@@ -124,9 +123,10 @@ All PDF pages are extracted and stored in a **single-table SQLite database** (`p
 - **Stored fields** (from PDFs): `doc_content` + loader metadata (`source`, `page`, etc.)
 - **Derived fields**:
   - `summary`: cheap extractive snippet (offline, deterministic)
-  - `embedding_f32`: optional float32 BLOB, computed with `--pdf-store-embeddings` (stored for reuse; the RAGAS transform pipeline still computes its own embeddings as needed)
+  - `embedding_f32`: optional float32 BLOB, computed with `--pdf-store-embeddings`. Reused by the KG transform pipeline for DOCUMENT-level nodes, avoiding redundant embedding API calls on rebuilds.
   - `pdf_profile_json`: per-PDF profile (one per PDF; computed when `--pdf-profiles` is enabled)
-  - `ragas_headlines_json`, `ragas_summary`: RAGAS LLM extractions cached for reuse across runs
+  - `ragas_headlines_json`, `ragas_summary`: RAGAS LLM extractions cached for reuse across KG builds (skips LLM calls when cached)
+  - `ragas_entities_json`, `ragas_themes_json`: RAGAS chunk-level extractions persisted after KG build for inspection (not loaded back — see caching notes below)
 
 **Default DB path:** `processed/pdf_page_store.sqlite` (override with `--pdf-store-db`).
 
@@ -148,6 +148,18 @@ Intermediate artifacts are saved under `processed/` and reused on subsequent run
 
 This is useful when you want to regenerate testsets (e.g., different `--testset-size`) without re-running the expensive transform step.
 
+### What is cached in SQLite vs the KG file
+
+The SQLite store caches **page-level** (DOCUMENT node) extractions that map 1:1 to a page row:
+
+| Extraction | SQLite columns | Reused on KG rebuild? |
+|------------|----------------|----------------------|
+| Headlines | `ragas_headlines_json` | Yes — skips LLM call |
+| Summary | `ragas_summary` | Yes — skips LLM call |
+| Page embedding | `embedding_f32` | Yes — skips embedding API call (DOCUMENT nodes only) |
+
+**Chunk-level** data (entities, themes, chunk embeddings) is NOT loaded from SQLite because multiple chunks can exist per page and the per-page key would cause collisions. This data is written to SQLite for inspection but the **KG file cache** (`processed/kg/*.json.gz`) is what prevents recomputation on re-runs with the same PDFs.
+
 ---
 
 ## How RAGAS works here (what gets called, and why)
@@ -166,11 +178,11 @@ This repo wires those phases together using:
 
 ## Phase A: Documents → Knowledge Graph (Transforms)
 
-### 1) Load documents from SQLite store
+### 1) Initialize LLM + embeddings and load documents
 
-PDF pages are loaded from the SQLite page store (auto-synced in Step 2). Each page becomes a LangChain `Document` with `metadata["source"]` (absolute path) and `metadata["page"]` (0-indexed).
+LLM and embedding models are set up once (Step 2) and reused for all subsequent operations including store sync, profile generation, KG building, and testset generation. PDF pages are loaded from the SQLite page store (auto-synced in Step 3). Each page becomes a LangChain `Document` with `metadata["source"]` (absolute path) and `metadata["page"]` (0-indexed).
 
-### 2) Initialize LLM + embeddings
+### 2) LLM + embedding setup
 
 `setup_llm_and_embeddings(...)` creates:
 - an **LLM** (for summarization, NER/themes extraction, and finally Q/A generation)

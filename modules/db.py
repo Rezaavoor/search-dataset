@@ -93,6 +93,10 @@ def init_pdf_page_store(conn: sqlite3.Connection) -> None:
     _add_col("ragas_headlines_model", "TEXT")
     _add_col("ragas_summary", "TEXT")
     _add_col("ragas_summary_model", "TEXT")
+    _add_col("ragas_entities_json", "TEXT")
+    _add_col("ragas_entities_model", "TEXT")
+    _add_col("ragas_themes_json", "TEXT")
+    _add_col("ragas_themes_model", "TEXT")
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS pdf_page_store_path_page_idx "
@@ -163,16 +167,71 @@ def pdf_store_persist_ragas_extractions(
     base_input_dir: Path,
     headlines_model_tag: str,
     summary_model_tag: str,
+    entities_model_tag: str = "",
+    themes_model_tag: str = "",
 ) -> Dict[str, int]:
     """Persist per-page RAGAS LLM extractions from the KG back into SQLite."""
     from ragas.testset.graph import NodeType
 
-    counts = {"headlines": 0, "summary": 0}
+    counts = {"headlines": 0, "summary": 0, "entities": 0, "themes": 0}
     now = utc_now_iso()
+
+    def _persist_json_list(node, prop_name, col_name, model_col, model_tag):
+        value = node.get_property(prop_name)
+        if not isinstance(value, list) or not model_tag:
+            return 0
+        try:
+            blob = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return 0
+        try:
+            cur = conn.execute(
+                f"""
+                UPDATE pdf_page_store
+                SET {col_name} = ?, {model_col} = ?, updated_at = ?
+                WHERE rel_path = ? AND page_number = ?
+                  AND (
+                    {col_name} IS NULL OR {col_name} = ''
+                    OR {model_col} IS NULL OR {model_col} = ''
+                    OR {model_col} != ?
+                  )
+                """,
+                (blob, str(model_tag), now,
+                 str(rel_path), int(page_number), str(model_tag)),
+            )
+            return int(cur.rowcount or 0)
+        except Exception:
+            return 0
+
+    def _persist_text(node, prop_name, col_name, model_col, model_tag):
+        value = node.get_property(prop_name)
+        if not isinstance(value, str) or not model_tag:
+            return 0
+        try:
+            cur = conn.execute(
+                f"""
+                UPDATE pdf_page_store
+                SET {col_name} = ?, {model_col} = ?, updated_at = ?
+                WHERE rel_path = ? AND page_number = ?
+                  AND (
+                    {col_name} IS NULL
+                    OR {model_col} IS NULL OR {model_col} = ''
+                    OR {model_col} != ?
+                  )
+                """,
+                (value, str(model_tag), now,
+                 str(rel_path), int(page_number), str(model_tag)),
+            )
+            return int(cur.rowcount or 0)
+        except Exception:
+            return 0
 
     with conn:
         for node in kg.nodes:
-            if node.type != NodeType.DOCUMENT:
+            # Headlines/summary live on DOCUMENT nodes;
+            # entities/themes live on CHUNK nodes.
+            # Both carry document_metadata (propagated by SafeHeadlineSplitter).
+            if node.type not in (NodeType.DOCUMENT, NodeType.CHUNK):
                 continue
 
             md = node.get_property("document_metadata")
@@ -193,71 +252,22 @@ def pdf_store_persist_ragas_extractions(
             except Exception:
                 continue
 
-            # Headlines
-            headlines = node.get_property("headlines")
-            if isinstance(headlines, list):
-                try:
-                    blob = json.dumps(headlines, ensure_ascii=False)
-                except Exception:
-                    blob = None
-                if isinstance(blob, str):
-                    try:
-                        cur = conn.execute(
-                            """
-                            UPDATE pdf_page_store
-                            SET ragas_headlines_json = ?, ragas_headlines_model = ?,
-                                updated_at = ?
-                            WHERE rel_path = ? AND page_number = ?
-                              AND (
-                                ragas_headlines_json IS NULL
-                                OR ragas_headlines_json = ''
-                                OR ragas_headlines_model IS NULL
-                                OR ragas_headlines_model = ''
-                                OR ragas_headlines_model != ?
-                              )
-                            """,
-                            (
-                                blob, str(headlines_model_tag), now,
-                                str(rel_path), int(page_number),
-                                str(headlines_model_tag),
-                            ),
-                        )
-                        try:
-                            counts["headlines"] += int(cur.rowcount or 0)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-
-            # Summary
-            summary = node.get_property("summary")
-            if isinstance(summary, str):
-                try:
-                    cur = conn.execute(
-                        """
-                        UPDATE pdf_page_store
-                        SET ragas_summary = ?, ragas_summary_model = ?,
-                            updated_at = ?
-                        WHERE rel_path = ? AND page_number = ?
-                          AND (
-                            ragas_summary IS NULL
-                            OR ragas_summary_model IS NULL
-                            OR ragas_summary_model = ''
-                            OR ragas_summary_model != ?
-                          )
-                        """,
-                        (
-                            summary, str(summary_model_tag), now,
-                            str(rel_path), int(page_number),
-                            str(summary_model_tag),
-                        ),
-                    )
-                    try:
-                        counts["summary"] += int(cur.rowcount or 0)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            counts["headlines"] += _persist_json_list(
+                node, "headlines",
+                "ragas_headlines_json", "ragas_headlines_model", headlines_model_tag,
+            )
+            counts["summary"] += _persist_text(
+                node, "summary",
+                "ragas_summary", "ragas_summary_model", summary_model_tag,
+            )
+            counts["entities"] += _persist_json_list(
+                node, "entities",
+                "ragas_entities_json", "ragas_entities_model", entities_model_tag,
+            )
+            counts["themes"] += _persist_json_list(
+                node, "themes",
+                "ragas_themes_json", "ragas_themes_model", themes_model_tag,
+            )
 
     return counts
 

@@ -334,8 +334,13 @@ def mine_hard_negatives_for_testset(
     num_bm25_negatives: int = 5,
     num_embedding_negatives: int = 5,
     max_judge_calls_per_query: int = 12,
-) -> List[List[str]]:
-    """Mine hard negatives for all queries in the testset."""
+) -> Tuple[List[List[str]], List[Dict[str, Any]]]:
+    """Mine hard negatives for all queries in the testset.
+
+    Returns:
+        (hard_negatives_list, source_mappings) - source_mappings is the
+        per-row find_source_files result, reusable by save_testset.
+    """
     print("  Mining hard negatives...")
 
     pages = _extract_pages_from_kg(kg)
@@ -380,12 +385,32 @@ def mine_hard_negatives_for_testset(
 
     near_duplicate_cosine_threshold = 0.92
     hard_negatives_list: List[List[str]] = []
+    source_mappings: List[Dict[str, Any]] = []
+
+    # Pre-compute all query embeddings in a single batch (avoids N sequential API calls)
+    query_embeddings: Dict[int, Optional[List[float]]] = {}
+    if num_embedding_negatives > 0 and pages_with_embeddings > 0:
+        all_queries = [(idx, row["user_input"]) for idx, row in testset_df.iterrows()]
+        query_texts = [q for _, q in all_queries]
+        query_indices = [idx for idx, _ in all_queries]
+        try:
+            batch_embs = embedding_model.embed_documents(query_texts)
+            if isinstance(batch_embs, list) and len(batch_embs) == len(query_texts):
+                for qi, emb in zip(query_indices, batch_embs):
+                    query_embeddings[qi] = emb if isinstance(emb, list) else None
+                print(f"  Pre-embedded {len(query_texts)} queries (batched)")
+        except Exception as e:
+            print(f"  Warning: Batch query embedding failed, falling back to per-query: {e}")
 
     for idx, row in testset_df.iterrows():
         query = row["user_input"]
         desired_count = max(int(num_bm25_negatives), int(num_embedding_negatives))
         if desired_count <= 0:
             hard_negatives_list.append([])
+            source_mappings.append({
+                "sources": ["unknown"], "sources_with_pages": ["unknown"],
+                "page_numbers": [None], "source_page_pairs": [],
+            })
             continue
 
         contexts = [
@@ -399,6 +424,8 @@ def mine_hard_negatives_for_testset(
             for d in (pos_info.get("source_page_pairs") or [])
             if isinstance(d, dict) and d.get("file") and d.get("page")
         }
+
+        source_mappings.append(pos_info)
 
         if not pos_files or not pos_pages:
             hard_negatives_list.append([])
@@ -422,7 +449,10 @@ def mine_hard_negatives_for_testset(
         emb_negs: List[Tuple[str, int]] = []
         if num_embedding_negatives > 0 and pages_with_embeddings > 0:
             try:
-                q_emb = embedding_model.embed_query(query)
+                # Use pre-computed embedding if available, else fallback
+                q_emb = query_embeddings.get(idx)
+                if q_emb is None:
+                    q_emb = embedding_model.embed_query(query)
                 cand_idxs: Optional[List[int]] = None
                 if bm25 is not None:
                     scores = bm25.get_scores(query.lower().split())
@@ -488,4 +518,4 @@ def mine_hard_negatives_for_testset(
 
     total_negs = sum(len(x) for x in hard_negatives_list)
     print(f"  Mined {total_negs} hard negative(s) for {len(testset_df)} queries")
-    return hard_negatives_list
+    return hard_negatives_list, source_mappings
