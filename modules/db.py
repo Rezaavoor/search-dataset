@@ -1,6 +1,7 @@
 """SQLite PDF page store operations (single-table, corpus-derived)."""
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,6 +21,133 @@ from .utils import (
     sort_documents_deterministically,
     utc_now_iso,
 )
+
+
+# ---------------------------------------------------------------------------
+# Multi-model embedding helpers
+# ---------------------------------------------------------------------------
+def sanitize_model_name(model: str) -> str:
+    """Convert an embedding model name to a safe SQLite column suffix.
+
+    Example: 'text-embedding-3-large' -> 'text_embedding_3_large'
+    """
+    return re.sub(r"[^a-zA-Z0-9]", "_", str(model).strip()).strip("_").lower()
+
+
+def _emb_col(model: str) -> str:
+    """Return the BLOB column name for a model's embeddings."""
+    return f"emb__{sanitize_model_name(model)}"
+
+
+def _emb_dims_col(model: str) -> str:
+    """Return the INTEGER dims column name for a model's embeddings."""
+    return f"emb_dims__{sanitize_model_name(model)}"
+
+
+def ensure_embedding_columns(conn: sqlite3.Connection, model_name: str) -> None:
+    """Add model-specific embedding columns if they don't exist yet."""
+    try:
+        existing_cols = {
+            str(r[1])
+            for r in conn.execute("PRAGMA table_info(pdf_page_store)").fetchall()
+            if r and r[1]
+        }
+    except Exception:
+        existing_cols = set()
+
+    blob_col = _emb_col(model_name)
+    dims_col = _emb_dims_col(model_name)
+
+    if blob_col not in existing_cols:
+        try:
+            conn.execute(
+                f"ALTER TABLE pdf_page_store ADD COLUMN {blob_col} BLOB"
+            )
+        except Exception:
+            pass
+    if dims_col not in existing_cols:
+        try:
+            conn.execute(
+                f"ALTER TABLE pdf_page_store ADD COLUMN {dims_col} INTEGER"
+            )
+        except Exception:
+            pass
+
+
+def load_page_embeddings(
+    conn: sqlite3.Connection,
+    model_name: str,
+    *,
+    rel_paths: Optional[List[str]] = None,
+) -> Dict[Tuple[str, int], np.ndarray]:
+    """Load embeddings for a specific model from SQLite.
+
+    Returns: dict of (rel_path, page_number) -> numpy float32 array.
+    """
+    blob_col = _emb_col(model_name)
+    dims_col = _emb_dims_col(model_name)
+    out: Dict[Tuple[str, int], np.ndarray] = {}
+
+    if rel_paths is not None:
+        for chunk in iter_batched(rel_paths, batch_size=800):
+            placeholders = ",".join(["?"] * len(chunk))
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT rel_path, page_number, {blob_col}, {dims_col}
+                    FROM pdf_page_store
+                    WHERE rel_path IN ({placeholders})
+                      AND {blob_col} IS NOT NULL AND {dims_col} IS NOT NULL
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+            except Exception:
+                continue
+            for rp, pn, blob, dims in rows:
+                try:
+                    vec = np.frombuffer(blob, dtype=np.float32)
+                    if len(vec) == int(dims):
+                        out[(str(rp), int(pn))] = vec
+                except Exception:
+                    continue
+    else:
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT rel_path, page_number, {blob_col}, {dims_col}
+                FROM pdf_page_store
+                WHERE {blob_col} IS NOT NULL AND {dims_col} IS NOT NULL
+                """
+            ).fetchall()
+        except Exception:
+            rows = []
+        for rp, pn, blob, dims in rows:
+            try:
+                vec = np.frombuffer(blob, dtype=np.float32)
+                if len(vec) == int(dims):
+                    out[(str(rp), int(pn))] = vec
+            except Exception:
+                continue
+
+    return out
+
+
+def store_page_embedding(
+    conn: sqlite3.Connection,
+    model_name: str,
+    *,
+    row_id: int,
+    embedding: np.ndarray,
+) -> None:
+    """Store a single embedding into the model-specific column."""
+    blob_col = _emb_col(model_name)
+    dims_col = _emb_dims_col(model_name)
+    now = utc_now_iso()
+    conn.execute(
+        f"UPDATE pdf_page_store SET {blob_col} = ?, {dims_col} = ?, updated_at = ? "
+        f"WHERE id = ?",
+        (embedding.astype(np.float32).tobytes(), int(embedding.shape[0]), now, int(row_id)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +243,46 @@ def init_pdf_page_store(conn: sqlite3.Connection) -> None:
     except Exception:
         pass
     conn.commit()
+
+    # Migrate existing embedding_f32 data to model-specific columns.
+    # This is a one-time operation; subsequent runs are a no-op.
+    _migrate_embeddings_to_model_columns(conn)
+
+
+def _migrate_embeddings_to_model_columns(conn: sqlite3.Connection) -> None:
+    """Copy embedding_f32 data into model-specific columns for each distinct model."""
+    try:
+        models = conn.execute(
+            "SELECT DISTINCT embedding_model FROM pdf_page_store "
+            "WHERE embedding_model IS NOT NULL AND embedding_model != '' "
+            "  AND embedding_f32 IS NOT NULL"
+        ).fetchall()
+    except Exception:
+        return
+
+    for (model_name,) in models:
+        if not model_name or not str(model_name).strip():
+            continue
+        model_name = str(model_name).strip()
+        ensure_embedding_columns(conn, model_name)
+        blob_col = _emb_col(model_name)
+        dims_col = _emb_dims_col(model_name)
+
+        # Only copy rows that don't already have model-specific data
+        try:
+            conn.execute(
+                f"""
+                UPDATE pdf_page_store
+                SET {blob_col} = embedding_f32, {dims_col} = embedding_dims
+                WHERE embedding_model = ?
+                  AND embedding_f32 IS NOT NULL
+                  AND ({blob_col} IS NULL)
+                """,
+                (model_name,),
+            )
+            conn.commit()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -448,17 +616,23 @@ def pdf_store_compute_embeddings(
 
     now = utc_now_iso()
     updated = 0
+    ensure_embedding_columns(conn, embedding_model_tag)
+    blob_col = _emb_col(embedding_model_tag)
+    dims_col = _emb_dims_col(embedding_model_tag)
     with conn:
         for row_id, v in zip(ids, vecs):
             if not isinstance(v, list) or not v:
                 continue
             arr = np.asarray(v, dtype=np.float32)
+            emb_bytes = arr.tobytes()
+            emb_dims = int(arr.shape[0])
+            # Write to both legacy columns and model-specific columns
             conn.execute(
-                "UPDATE pdf_page_store "
-                "SET embedding_f32 = ?, embedding_model = ?, embedding_dims = ?, "
-                "    updated_at = ? WHERE id = ?",
-                (arr.tobytes(), str(embedding_model_tag), int(arr.shape[0]),
-                 now, int(row_id)),
+                f"UPDATE pdf_page_store "
+                f"SET embedding_f32 = ?, embedding_model = ?, embedding_dims = ?, "
+                f"    {blob_col} = ?, {dims_col} = ?, updated_at = ? WHERE id = ?",
+                (emb_bytes, str(embedding_model_tag), emb_dims,
+                 emb_bytes, emb_dims, now, int(row_id)),
             )
             updated += 1
     return updated
@@ -521,6 +695,10 @@ def upsert_pdf_into_store(
 
     now = utc_now_iso()
     stored = 0
+
+    # Ensure model-specific embedding columns exist when storing embeddings
+    if compute_embeddings and embedding_model_id:
+        ensure_embedding_columns(conn, str(embedding_model_id))
 
     with conn:
         for idx, doc in enumerate(docs):
@@ -585,6 +763,25 @@ def upsert_pdf_into_store(
                 ),
             )
             stored += 1
+
+    # Also write embeddings to model-specific columns
+    if emb_model and embeddings is not None:
+        blob_col = _emb_col(emb_model)
+        dims_col = _emb_dims_col(emb_model)
+        with conn:
+            for idx, doc in enumerate(docs):
+                v = embeddings[idx] if idx < len(embeddings) else None
+                if not isinstance(v, list) or not v:
+                    continue
+                arr = np.asarray(v, dtype=np.float32)
+                page0 = doc.metadata.get("page")
+                page_number = int(page0) + 1 if isinstance(page0, int) else (idx + 1)
+                conn.execute(
+                    f"UPDATE pdf_page_store "
+                    f"SET {blob_col} = ?, {dims_col} = ? "
+                    f"WHERE rel_path = ? AND page_number = ?",
+                    (arr.tobytes(), int(arr.shape[0]), rel_path, page_number),
+                )
 
     return stored
 

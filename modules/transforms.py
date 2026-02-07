@@ -14,7 +14,7 @@ from ragas.testset.transforms.extractors.llm_based import NERExtractor, ThemesEx
 from ragas.testset.transforms.relationship_builders.cosine import CosineSimilarityBuilder
 from ragas.testset.transforms.splitters import HeadlineSplitter
 
-from .db import pdf_store_load_cached_pairs
+from .db import _emb_col, _emb_dims_col, pdf_store_load_cached_pairs
 from .utils import compute_rel_path_for_store
 
 
@@ -495,7 +495,7 @@ class SQLiteCachedEmbeddingExtractor(EmbeddingExtractor):
             else:
                 nodes_with_key.append((node, key))
 
-        # Load cached embeddings from SQLite (embedding_f32 column)
+        # Load cached embeddings from SQLite (model-specific column)
         loaded_from_cache = 0
         nodes_to_embed: List[Node] = list(nodes_missing_key)
 
@@ -505,41 +505,38 @@ class SQLiteCachedEmbeddingExtractor(EmbeddingExtractor):
             and self.embedding_model_tag.strip()
             and nodes_with_key
         ):
+            blob_col = _emb_col(self.embedding_model_tag)
+            dims_col = _emb_dims_col(self.embedding_model_tag)
             rel_paths = sorted({k[0] for _, k in nodes_with_key})
-            # Load raw embedding blobs + model tags + dims
             emb_cache: Dict[Tuple[str, int], Tuple] = {}
             for chunk in iter_batched(rel_paths, batch_size=800):
                 placeholders = ",".join(["?"] * len(chunk))
                 try:
                     rows = self.conn.execute(
                         f"""
-                        SELECT rel_path, page_number,
-                               embedding_f32, embedding_model, embedding_dims
+                        SELECT rel_path, page_number, {blob_col}, {dims_col}
                         FROM pdf_page_store
                         WHERE rel_path IN ({placeholders})
-                          AND embedding_f32 IS NOT NULL
-                          AND embedding_dims IS NOT NULL
+                          AND {blob_col} IS NOT NULL
+                          AND {dims_col} IS NOT NULL
                         """,
                         tuple(chunk),
                     ).fetchall()
                 except Exception:
                     rows = []
-                for rel_path, page_number, blob, model, dims in rows:
+                for rel_path, page_number, blob, dims in rows:
                     try:
                         pn = int(page_number)
                     except Exception:
                         continue
-                    emb_cache[(str(rel_path), pn)] = (blob, model, dims)
+                    emb_cache[(str(rel_path), pn)] = (blob, dims)
 
             for node, key in nodes_with_key:
                 cached = emb_cache.get(key)
                 if not cached:
                     nodes_to_embed.append(node)
                     continue
-                blob, model, dims = cached
-                if not isinstance(model, str) or model.strip() != str(self.embedding_model_tag):
-                    nodes_to_embed.append(node)
-                    continue
+                blob, dims = cached
                 if not isinstance(blob, bytes) or not isinstance(dims, int) or dims <= 0:
                     nodes_to_embed.append(node)
                     continue

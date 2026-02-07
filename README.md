@@ -9,7 +9,8 @@ The main entrypoint is `generate_synthetic_dataset.py`.
 ## Project structure
 
 ```
-generate_synthetic_dataset.py   # Main entrypoint (argparse + step-by-step orchestration)
+generate_synthetic_dataset.py   # Generate synthetic Q&A dataset from PDFs
+evaluate_search.py              # Evaluate embedding model search quality
 modules/
   config.py                     # Constants and defaults
   utils.py                      # Shared helpers (hashing, JSON, paths, text)
@@ -20,7 +21,7 @@ modules/
   synthesizers.py               # Query synthesizers + distribution building
   hard_negatives.py             # Hard negative mining (BM25, embedding, LLM judge)
   testset.py                    # KG building, testset gen/save, persona management
-output/                         # Generated CSV/JSON/Parquet datasets
+output/                         # Generated datasets + evaluation results
 processed/                      # Cached intermediate artifacts (KG, personas, SQLite store)
 ```
 
@@ -123,7 +124,7 @@ All PDF pages are extracted and stored in a **single-table SQLite database** (`p
 - **Stored fields** (from PDFs): `doc_content` + loader metadata (`source`, `page`, etc.)
 - **Derived fields**:
   - `summary`: cheap extractive snippet (offline, deterministic)
-  - `embedding_f32`: optional float32 BLOB, computed with `--pdf-store-embeddings`. Reused by the KG transform pipeline for DOCUMENT-level nodes, avoiding redundant embedding API calls on rebuilds.
+  - `embedding_f32` + `emb__{model}`: page embeddings stored per model (see "Multi-model embedding storage" below). Computed with `--pdf-store-embeddings`. Reused by the KG transform pipeline for DOCUMENT-level nodes and by `evaluate_search.py` for retrieval evaluation.
   - `pdf_profile_json`: per-PDF profile (one per PDF; computed when `--pdf-profiles` is enabled)
   - `ragas_headlines_json`, `ragas_summary`: RAGAS LLM extractions cached for reuse across KG builds (skips LLM calls when cached)
   - `ragas_entities_json`, `ragas_themes_json`: RAGAS chunk-level extractions persisted after KG build for inspection (not loaded back — see caching notes below)
@@ -156,7 +157,7 @@ The SQLite store caches **page-level** (DOCUMENT node) extractions that map 1:1 
 |------------|----------------|----------------------|
 | Headlines | `ragas_headlines_json` | Yes — skips LLM call |
 | Summary | `ragas_summary` | Yes — skips LLM call |
-| Page embedding | `embedding_f32` | Yes — skips embedding API call (DOCUMENT nodes only) |
+| Page embedding | `emb__{model}` | Yes — skips embedding API call (DOCUMENT nodes only) |
 
 **Chunk-level** data (entities, themes, chunk embeddings) is NOT loaded from SQLite because multiple chunks can exist per page and the per-page key would cause collisions. This data is written to SQLite for inspection but the **KG file cache** (`processed/kg/*.json.gz`) is what prevents recomputation on re-runs with the same PDFs.
 
@@ -390,6 +391,89 @@ When saving, this repo tries to map each `reference_contexts` entry back to the 
 - `source_files_readable`, `source_files_with_pages_readable`: comma-separated strings for quick inspection
 
 This mapping is **heuristic string matching** against loaded `Document.page_content`, so it's "best effort."
+
+---
+
+## Evaluating embedding model search quality
+
+`evaluate_search.py` measures how well an embedding model retrieves the correct source pages for each query in a generated dataset. It reuses the pre-computed page embeddings stored in SQLite -- no need to re-embed the corpus.
+
+### Quick start
+
+```bash
+python evaluate_search.py \
+  --dataset output/dataset_with_negatives_v11.csv \
+  --embedding-model text-embedding-3-large \
+  --top-k 1 5 10 20
+```
+
+Results are saved to `output/eval_text_embedding_3_large.json` and a summary is printed to stdout.
+
+### What it does
+
+1. Loads the dataset CSV (queries + ground truth source pages + hard negatives)
+2. Loads page embeddings from SQLite for the specified model
+3. Embeds all queries using the same model (the only API call)
+4. Ranks all corpus pages by cosine similarity to each query
+5. Computes metrics: Recall@K, MRR, MAP, hard negative rank analysis
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **Recall@K** | Did any correct source page appear in the top K results? |
+| **MRR** | Mean Reciprocal Rank -- 1/rank of the first correct page, averaged |
+| **MAP** | Mean Average Precision -- precision at each relevant rank, averaged |
+| **HN rank** | Where do hard negatives rank vs positives? |
+| **HN outranks %** | How often does a hard negative appear before any positive? |
+
+### Flags
+
+- `--dataset` (required): Path to the generated dataset CSV
+- `--embedding-model` (required): Model name matching a column in SQLite
+- `--top-k`: K values to evaluate (default: `1 5 10 20`)
+- `--pdf-store-db`: Custom SQLite path (default: `processed/pdf_page_store.sqlite`)
+- `--provider`: `auto` / `openai` / `azure` (for embedding queries)
+- `--output`: Custom output path (default: `output/eval_{model}.json`)
+
+### Evaluating a new model
+
+When you specify a model that doesn't have embeddings in SQLite yet, the script automatically:
+1. Adds model-specific columns to the SQLite table
+2. Embeds all corpus pages using that model (one-time cost)
+3. Stores the embeddings for future reuse
+4. Proceeds with evaluation
+
+```bash
+# First run: embeds all 24K pages (takes a while, costs API credits)
+python evaluate_search.py \
+  --dataset output/dataset_with_negatives_v11.csv \
+  --embedding-model text-embedding-3-small
+
+# Second run: instant (embeddings loaded from SQLite)
+python evaluate_search.py \
+  --dataset output/dataset_with_negatives_v11.csv \
+  --embedding-model text-embedding-3-small
+```
+
+---
+
+## Multi-model embedding storage
+
+The SQLite store supports **multiple embedding models** side by side. Each model gets its own column pair:
+
+```
+emb__text_embedding_3_large       BLOB
+emb_dims__text_embedding_3_large  INTEGER
+emb__text_embedding_3_small       BLOB
+emb_dims__text_embedding_3_small  INTEGER
+```
+
+Model names are sanitized for column names (e.g., `text-embedding-3-large` becomes `text_embedding_3_large`). Columns are added dynamically via `ALTER TABLE` when a new model is first used.
+
+The legacy columns (`embedding_f32`, `embedding_model`, `embedding_dims`) are preserved for backward compatibility. When `--pdf-store-embeddings` is used in the generation pipeline, embeddings are written to both legacy and model-specific columns.
+
+**Important:** If you add new PDFs with `--pdf-store-embeddings`, the new pages get embeddings for the current model only. Other model columns remain NULL for those pages. The evaluation script handles this by auto-computing missing embeddings.
 
 ---
 
