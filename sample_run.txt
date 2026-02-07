@@ -1,25 +1,11 @@
 python generate_synthetic_dataset.py \
   --specific-folders "Claires" \
-  --max-files 20 \
-  --testset-size 10 \
+  --max-pdfs 100 \
+  --testset-size 5 \
   --hard-negatives \
   --num-bm25-negatives 10 \
   --num-embedding-negatives 10 \
-  --output dataset_with_negatives_v7 \
-  --reprocess \
-  --output-formats csv
-
-
-
-
-
-  python generate_synthetic_dataset.py \
-  --specific-folders "Claires" \
-  --max-files 20 \
-  --testset-size 10 \
-  --hard-negatives \
-  --num-bm25-negatives 10 \
-  --num-embedding-negatives 10 \
-  --output dataset_with_negatives_v7 \
+  --output dataset_with_negatives_v11 \
   --output-formats csv \
-  --pdf-store-use
+  --pdf-store-embeddings \
+  --num-personas 5

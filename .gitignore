@@ -4,9 +4,10 @@
 /_duplicate_backup/
 /search-dataset-backup/
 /processed/
+/output/*.json
+/output/*.csv
+/output/*.parquet
 .env
-*.json
-*.csv
 
 # Python
 __pycache__/
