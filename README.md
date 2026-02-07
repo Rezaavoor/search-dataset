@@ -272,6 +272,10 @@ If no personas are provided, RAGAS:
 
 Personas influence query style and framing (e.g., "law clerk" vs "compliance analyst").
 
+This repo exposes two knobs:
+- `--num-personas N`: generate more personas (default: 3)
+- `--personas-path personas.json`: supply your own personas (skips persona generation)
+
 ### 2) Pick query synthesizers ("query distribution")
 
 By default, RAGAS uses up to three synthesizers (it may skip ones that don't fit your KG):
@@ -390,6 +394,10 @@ If you want full control, you can:
 RAGAS accepts `query_distribution=...` (a list of `(synthesizer, probability)` pairs).
 
 This script starts from the default RAGAS distribution, and when `--standalone-queries` is enabled (default) it patches the synthesizer prompts to encourage **standalone, corpus-level** search queries. Disable this behavior with `--no-standalone-queries` if you want unmodified RAGAS prompts.
+
+This repo also exposes:
+- `--query-mix ...`: override the synthesizer mix (names or `name=weight` pairs)
+- `--list-query-synthesizers`: print available synthesizer names
 
 ### PDF profiles (improving query realism across many PDFs)
 

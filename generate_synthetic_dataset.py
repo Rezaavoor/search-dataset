@@ -52,6 +52,7 @@ from ragas.testset.transforms.splitters import HeadlineSplitter
 from ragas.testset.transforms import (
     default_transforms,
     HeadlinesExtractor,
+    SummaryExtractor,
     NodeFilter,
     apply_transforms,
 )
@@ -154,7 +155,209 @@ class HeadlinesRequiredFilter(NodeFilter):
         return True
 
 
-def patch_transforms_with_safe_splitter(transforms, llm, embedding_model, *, add_content_embeddings: bool = True):
+RAGAS_DOC_EXTRACT_CACHE_VERSION = 1
+
+
+@dataclass
+class SQLiteCachedHeadlinesExtractor(HeadlinesExtractor):
+    """
+    A HeadlinesExtractor that can reuse/stash per-page extractions in the SQLite PDF store.
+
+    This avoids re-calling the LLM for the same (PDF page) documents across runs when
+    `--pdf-store-use` is enabled.
+    """
+
+    conn: Optional[sqlite3.Connection] = field(default=None, repr=False)
+    base_input_dir: Optional[Path] = None
+    model_tag: Optional[str] = None
+
+    _store_value_col: str = "ragas_headlines_json"
+    _store_model_col: str = "ragas_headlines_model"
+
+    def _node_store_key(self, node: Node) -> Optional[Tuple[str, int]]:
+        md = node.get_property("document_metadata")
+        if not isinstance(md, dict):
+            return None
+        source = md.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return None
+        page0 = md.get("page")
+        try:
+            page_number = int(page0) + 1
+        except Exception:
+            return None
+        if page_number < 1:
+            return None
+        if self.base_input_dir is None:
+            return None
+        try:
+            rel_path = _compute_rel_path_for_store(Path(source), self.base_input_dir)
+        except Exception:
+            return None
+        return (str(rel_path), int(page_number))
+
+    def generate_execution_plan(self, kg: KnowledgeGraph) -> Any:  # type: ignore[override]
+        filtered = self.filter(kg)
+
+        # Only consider nodes where the property is missing.
+        nodes_with_key: List[Tuple[Node, Tuple[str, int]]] = []
+        nodes_missing_key: List[Node] = []
+        for node in filtered.nodes:
+            if node.get_property(self.property_name) is not None:
+                continue
+            key = self._node_store_key(node)
+            if key is None:
+                nodes_missing_key.append(node)
+            else:
+                nodes_with_key.append((node, key))
+
+        cache: Dict[Tuple[str, int], Tuple[Optional[str], Optional[str]]] = {}
+        if (
+            self.conn is not None
+            and isinstance(self.model_tag, str)
+            and self.model_tag.strip()
+            and nodes_with_key
+        ):
+            rel_paths = sorted({k[0] for _, k in nodes_with_key})
+            cache = _pdf_store_load_cached_pairs(
+                self.conn,
+                rel_paths=rel_paths,
+                value_col=self._store_value_col,
+                model_col=self._store_model_col,
+            )
+
+        # Populate from cache when possible; queue the rest for extraction.
+        nodes_to_extract: List[Node] = list(nodes_missing_key)
+        for node, key in nodes_with_key:
+            cached = cache.get(key)
+            if not cached:
+                nodes_to_extract.append(node)
+                continue
+            blob, model = cached
+            if not isinstance(model, str) or model.strip() != str(self.model_tag):
+                nodes_to_extract.append(node)
+                continue
+            if not isinstance(blob, str) or not blob.strip():
+                nodes_to_extract.append(node)
+                continue
+            try:
+                parsed = json.loads(blob)
+            except Exception:
+                nodes_to_extract.append(node)
+                continue
+            if not isinstance(parsed, list):
+                nodes_to_extract.append(node)
+                continue
+            node.add_property(self.property_name, parsed)
+
+        async def apply_extract(node: Node):
+            property_name, property_value = await self.extract(node)
+            # Only write if still missing (idempotent).
+            if node.get_property(property_name) is None:
+                node.add_property(property_name, property_value)
+
+        return [apply_extract(node) for node in nodes_to_extract]
+
+
+@dataclass
+class SQLiteCachedSummaryExtractor(SummaryExtractor):
+    """
+    A SummaryExtractor that can reuse/stash per-page summaries in the SQLite PDF store.
+    """
+
+    conn: Optional[sqlite3.Connection] = field(default=None, repr=False)
+    base_input_dir: Optional[Path] = None
+    model_tag: Optional[str] = None
+
+    _store_value_col: str = "ragas_summary"
+    _store_model_col: str = "ragas_summary_model"
+
+    def _node_store_key(self, node: Node) -> Optional[Tuple[str, int]]:
+        md = node.get_property("document_metadata")
+        if not isinstance(md, dict):
+            return None
+        source = md.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return None
+        page0 = md.get("page")
+        try:
+            page_number = int(page0) + 1
+        except Exception:
+            return None
+        if page_number < 1:
+            return None
+        if self.base_input_dir is None:
+            return None
+        try:
+            rel_path = _compute_rel_path_for_store(Path(source), self.base_input_dir)
+        except Exception:
+            return None
+        return (str(rel_path), int(page_number))
+
+    def generate_execution_plan(self, kg: KnowledgeGraph) -> Any:  # type: ignore[override]
+        filtered = self.filter(kg)
+
+        nodes_with_key: List[Tuple[Node, Tuple[str, int]]] = []
+        nodes_missing_key: List[Node] = []
+        for node in filtered.nodes:
+            if node.get_property(self.property_name) is not None:
+                continue
+            key = self._node_store_key(node)
+            if key is None:
+                nodes_missing_key.append(node)
+            else:
+                nodes_with_key.append((node, key))
+
+        cache: Dict[Tuple[str, int], Tuple[Optional[str], Optional[str]]] = {}
+        if (
+            self.conn is not None
+            and isinstance(self.model_tag, str)
+            and self.model_tag.strip()
+            and nodes_with_key
+        ):
+            rel_paths = sorted({k[0] for _, k in nodes_with_key})
+            cache = _pdf_store_load_cached_pairs(
+                self.conn,
+                rel_paths=rel_paths,
+                value_col=self._store_value_col,
+                model_col=self._store_model_col,
+            )
+
+        nodes_to_extract: List[Node] = list(nodes_missing_key)
+        for node, key in nodes_with_key:
+            cached = cache.get(key)
+            if not cached:
+                nodes_to_extract.append(node)
+                continue
+            blob, model = cached
+            if not isinstance(model, str) or model.strip() != str(self.model_tag):
+                nodes_to_extract.append(node)
+                continue
+            if not isinstance(blob, str):
+                nodes_to_extract.append(node)
+                continue
+            # Note: empty string is treated as a cached value to avoid repeated LLM calls.
+            node.add_property(self.property_name, blob)
+
+        async def apply_extract(node: Node):
+            property_name, property_value = await self.extract(node)
+            if node.get_property(property_name) is None:
+                node.add_property(property_name, property_value)
+
+        return [apply_extract(node) for node in nodes_to_extract]
+
+
+def patch_transforms_with_safe_splitter(
+    transforms,
+    llm,
+    embedding_model,
+    *,
+    add_content_embeddings: bool = True,
+    pdf_store_conn: Optional[sqlite3.Connection] = None,
+    base_input_dir: Optional[Path] = None,
+    reuse_cached_store_extractions: bool = True,
+    ragas_doc_extraction_model_tag_base: Optional[str] = None,
+):
     """
     Patch RAGAS transforms to enforce headline-only generation and add page_content embeddings:
 
@@ -175,8 +378,28 @@ def patch_transforms_with_safe_splitter(transforms, llm, embedding_model, *, add
         t for t in transforms if not isinstance(t, HeadlinesExtractor)
     ]
 
+    use_store_cache = bool(
+        reuse_cached_store_extractions
+        and pdf_store_conn is not None
+        and base_input_dir is not None
+        and isinstance(ragas_doc_extraction_model_tag_base, str)
+        and ragas_doc_extraction_model_tag_base.strip()
+    )
+
+    if use_store_cache:
+        headlines_tag = f"{ragas_doc_extraction_model_tag_base}:headlines:max5"
+        headlines_extractor = SQLiteCachedHeadlinesExtractor(
+            llm=llm,
+            filter_nodes=doc_nodes_only,
+            conn=pdf_store_conn,
+            base_input_dir=base_input_dir,
+            model_tag=headlines_tag,
+        )
+    else:
+        headlines_extractor = HeadlinesExtractor(llm=llm, filter_nodes=doc_nodes_only)
+
     patched = [
-        HeadlinesExtractor(llm=llm, filter_nodes=doc_nodes_only),
+        headlines_extractor,
         HeadlinesRequiredFilter(filter_nodes=doc_nodes_only),
     ]
 
@@ -189,6 +412,23 @@ def patch_transforms_with_safe_splitter(transforms, llm, embedding_model, *, add
                 filter_nodes=transform.filter_nodes,
             )
             patched.append(safe_splitter)
+        elif use_store_cache and isinstance(transform, SummaryExtractor):
+            summary_tag = f"{ragas_doc_extraction_model_tag_base}:summary"
+            patched.append(
+                SQLiteCachedSummaryExtractor(
+                    name=transform.name,
+                    filter_nodes=transform.filter_nodes,
+                    llm=transform.llm,
+                    merge_if_possible=transform.merge_if_possible,
+                    max_token_limit=transform.max_token_limit,
+                    tokenizer=transform.tokenizer,
+                    property_name=transform.property_name,
+                    prompt=transform.prompt,
+                    conn=pdf_store_conn,
+                    base_input_dir=base_input_dir,
+                    model_tag=summary_tag,
+                )
+            )
         else:
             patched.append(transform)
 
@@ -339,7 +579,7 @@ def load_documents_cache(path: Path) -> List[Document]:
 # ---------------------------
 # SQLite PDF page store (single-table, corpus-derived)
 # ---------------------------
-PDF_STORE_SCHEMA_VERSION = 1
+PDF_STORE_SCHEMA_VERSION = 2
 DEFAULT_PDF_STORE_DB_NAME = "pdf_page_store.sqlite"
 
 _EXTRACTIVE_SUMMARY_MODEL = "extractive_v1"
@@ -451,6 +691,10 @@ def init_pdf_page_store(conn: sqlite3.Connection) -> None:
           embedding_dims INTEGER,
           pdf_profile_json TEXT,
           pdf_profile_model TEXT,
+          ragas_headlines_json TEXT,
+          ragas_headlines_model TEXT,
+          ragas_summary TEXT,
+          ragas_summary_model TEXT,
           metadata_json TEXT NOT NULL DEFAULT '{}',
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           updated_at TEXT,
@@ -458,6 +702,28 @@ def init_pdf_page_store(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Lightweight schema migration: add missing columns in-place.
+    try:
+        existing_cols = {
+            str(r[1]) for r in conn.execute("PRAGMA table_info(pdf_page_store)").fetchall() if r and r[1]
+        }
+    except Exception:
+        existing_cols = set()
+
+    def _add_col_if_missing(col: str, decl: str) -> None:
+        if col in existing_cols:
+            return
+        try:
+            conn.execute(f"ALTER TABLE pdf_page_store ADD COLUMN {col} {decl}")
+            existing_cols.add(col)
+        except Exception:
+            # If ALTER fails (older SQLite / permissions), keep going; code will just skip caching.
+            pass
+
+    _add_col_if_missing("ragas_headlines_json", "TEXT")
+    _add_col_if_missing("ragas_headlines_model", "TEXT")
+    _add_col_if_missing("ragas_summary", "TEXT")
+    _add_col_if_missing("ragas_summary_model", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS pdf_page_store_path_page_idx ON pdf_page_store(rel_path, page_number)"
     )
@@ -473,6 +739,155 @@ def init_pdf_page_store(conn: sqlite3.Connection) -> None:
     except Exception:
         pass
     conn.commit()
+
+
+def _pdf_store_load_cached_pairs(
+    conn: sqlite3.Connection,
+    *,
+    rel_paths: List[str],
+    value_col: str,
+    model_col: str,
+) -> Dict[Tuple[str, int], Tuple[Optional[str], Optional[str]]]:
+    """
+    Load cached (value, model_tag) pairs from the SQLite store keyed by (rel_path, page_number).
+    """
+    out: Dict[Tuple[str, int], Tuple[Optional[str], Optional[str]]] = {}
+    if not rel_paths:
+        return out
+    for chunk in _iter_batched(rel_paths, batch_size=800):
+        placeholders = ",".join(["?"] * len(chunk))
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT rel_path, page_number, {value_col}, {model_col}
+                FROM pdf_page_store
+                WHERE rel_path IN ({placeholders})
+                  AND {value_col} IS NOT NULL
+                """,
+                tuple(chunk),
+            ).fetchall()
+        except Exception:
+            continue
+        for rel_path, page_number, blob, model in rows:
+            try:
+                pn = int(page_number)
+            except Exception:
+                continue
+            out[(str(rel_path), pn)] = (
+                str(blob) if blob is not None else None,
+                str(model) if model is not None else None,
+            )
+    return out
+
+
+def _pdf_store_persist_ragas_extractions_from_kg(
+    conn: sqlite3.Connection,
+    *,
+    kg: KnowledgeGraph,
+    base_input_dir: Path,
+    headlines_model_tag: str,
+    summary_model_tag: str,
+) -> Dict[str, int]:
+    """
+    Persist per-page RAGAS LLM extractions from the KG back into SQLite for reuse.
+
+    Only DOCUMENT nodes are considered (1:1 with PDF pages in this repo's pipeline).
+    """
+    counts = {"headlines": 0, "summary": 0}
+    now = _utc_now_iso()
+
+    with conn:
+        for node in kg.nodes:
+            if node.type != NodeType.DOCUMENT:
+                continue
+
+            md = node.get_property("document_metadata")
+            if not isinstance(md, dict):
+                continue
+            source = md.get("source")
+            page0 = md.get("page")
+            if not isinstance(source, str) or not source.strip():
+                continue
+            try:
+                page_number = int(page0) + 1
+            except Exception:
+                continue
+            if page_number < 1:
+                continue
+            try:
+                rel_path = _compute_rel_path_for_store(Path(source), base_input_dir)
+            except Exception:
+                continue
+
+            # Headlines (JSON list)
+            headlines = node.get_property("headlines")
+            if isinstance(headlines, list):
+                try:
+                    blob = json.dumps(headlines, ensure_ascii=False)
+                except Exception:
+                    blob = None
+                if isinstance(blob, str):
+                    try:
+                        cur = conn.execute(
+                            """
+                            UPDATE pdf_page_store
+                            SET ragas_headlines_json = ?, ragas_headlines_model = ?, updated_at = ?
+                            WHERE rel_path = ? AND page_number = ?
+                              AND (
+                                ragas_headlines_json IS NULL OR ragas_headlines_json = '' OR
+                                ragas_headlines_model IS NULL OR ragas_headlines_model = '' OR
+                                ragas_headlines_model != ?
+                              )
+                            """,
+                            (
+                                blob,
+                                str(headlines_model_tag),
+                                now,
+                                str(rel_path),
+                                int(page_number),
+                                str(headlines_model_tag),
+                            ),
+                        )
+                        try:
+                            counts["headlines"] += int(cur.rowcount or 0)
+                        except Exception:
+                            pass
+                    except Exception:
+                        # Column may not exist if migration failed; skip silently.
+                        pass
+
+            # Summary (raw text)
+            summary = node.get_property("summary")
+            if isinstance(summary, str):
+                try:
+                    cur = conn.execute(
+                        """
+                        UPDATE pdf_page_store
+                        SET ragas_summary = ?, ragas_summary_model = ?, updated_at = ?
+                        WHERE rel_path = ? AND page_number = ?
+                          AND (
+                            ragas_summary IS NULL OR
+                            ragas_summary_model IS NULL OR ragas_summary_model = '' OR
+                            ragas_summary_model != ?
+                          )
+                        """,
+                        (
+                            summary,
+                            str(summary_model_tag),
+                            now,
+                            str(rel_path),
+                            int(page_number),
+                            str(summary_model_tag),
+                        ),
+                    )
+                    try:
+                        counts["summary"] += int(cur.rowcount or 0)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+    return counts
 
 
 def pdf_store_needs_refresh(
@@ -1074,6 +1489,69 @@ def load_personas_cache(path: Path) -> List[Persona]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return [Persona(**p) for p in data]
+
+
+def load_personas_from_file(path: Path) -> List[Persona]:
+    """
+    Load a persona list from a JSON or JSONL file.
+
+    Supported formats:
+      - JSON list: [{"name": "...", "role_description": "..."}, ...]
+      - JSON object with "personas": {"personas": [ ... ]}
+      - JSONL: one persona object per line (when suffix is .jsonl)
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Personas file not found: {path}")
+
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise ValueError(f"Personas file is empty: {path}")
+
+    items: List[Any] = []
+    if path.suffix.lower() == ".jsonl":
+        for i, line in enumerate(raw.splitlines(), start=1):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                items.append(json.loads(s))
+            except Exception as e:
+                raise ValueError(f"Invalid JSON on line {i} of {path}: {e}") from e
+    else:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "personas" in data:
+            data = data["personas"]
+        if not isinstance(data, list):
+            raise ValueError(
+                f"Expected a JSON list (or object with 'personas') in {path}, got {type(data).__name__}"
+            )
+        items = data
+
+    personas: List[Persona] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Invalid persona entry at index {idx} in {path}: expected object, got {type(item).__name__}"
+            )
+        try:
+            p = Persona(**item)
+        except Exception as e:
+            raise ValueError(f"Invalid persona entry at index {idx} in {path}: {e}") from e
+        if not str(p.name or "").strip():
+            raise ValueError(f"Persona at index {idx} has empty 'name' in {path}")
+        if not str(p.role_description or "").strip():
+            raise ValueError(f"Persona '{p.name}' has empty 'role_description' in {path}")
+        personas.append(p)
+
+    # De-dupe by name (preserve order of first occurrence)
+    deduped: Dict[str, Persona] = {}
+    for p in personas:
+        if p.name not in deduped:
+            deduped[p.name] = p
+    out = list(deduped.values())
+    if not out:
+        raise ValueError(f"No valid personas found in {path}")
+    return out
 
 
 _HOP_PREFIX_RE = re.compile(r"^\s*<\d+-hop>\s*", flags=re.IGNORECASE)
@@ -2412,6 +2890,10 @@ def build_knowledge_graph(
     generator_embeddings,
     *,
     add_content_embeddings: bool = True,
+    pdf_store_conn: Optional[sqlite3.Connection] = None,
+    base_input_dir: Optional[Path] = None,
+    reuse_cached_store_extractions: bool = True,
+    ragas_doc_extraction_model_tag_base: Optional[str] = None,
 ) -> KnowledgeGraph:
     """
     Build a RAGAS KnowledgeGraph from loaded documents by applying transforms.
@@ -2443,6 +2925,10 @@ def build_knowledge_graph(
         llm=generator_llm,
         embedding_model=generator_embeddings,
         add_content_embeddings=add_content_embeddings,
+        pdf_store_conn=pdf_store_conn,
+        base_input_dir=base_input_dir,
+        reuse_cached_store_extractions=reuse_cached_store_extractions,
+        ragas_doc_extraction_model_tag_base=ragas_doc_extraction_model_tag_base,
     )
     print("Headline-only generation enabled (skipping documents without usable headlines)")
     if add_content_embeddings:
@@ -2463,6 +2949,31 @@ def build_knowledge_graph(
     kg = KnowledgeGraph(nodes=nodes)
     apply_transforms(kg, transforms, run_config=RunConfig())
     print(f"Knowledge graph ready: {len(kg.nodes)} nodes, {len(kg.relationships)} relationships")
+
+    # Persist per-page LLM extractions (headlines + summary) back into SQLite for reuse.
+    if (
+        pdf_store_conn is not None
+        and base_input_dir is not None
+        and isinstance(ragas_doc_extraction_model_tag_base, str)
+        and ragas_doc_extraction_model_tag_base.strip()
+    ):
+        try:
+            counts = _pdf_store_persist_ragas_extractions_from_kg(
+                pdf_store_conn,
+                kg=kg,
+                base_input_dir=base_input_dir,
+                headlines_model_tag=f"{ragas_doc_extraction_model_tag_base}:headlines:max5",
+                summary_model_tag=f"{ragas_doc_extraction_model_tag_base}:summary",
+            )
+            if counts.get("headlines") or counts.get("summary"):
+                print(
+                    f"SQLite PDF store: cached RAGAS extractions "
+                    f"(headlines+={counts.get('headlines', 0)}, summary+={counts.get('summary', 0)})"
+                )
+        except Exception:
+            # If the store is read-only or missing columns, proceed without caching.
+            pass
+
     return kg
 
 
@@ -2572,6 +3083,7 @@ def build_query_distribution_for_pipeline(
     standalone_queries: bool,
     llm_context: Optional[str],
     pdf_profiles_by_source: Optional[Dict[str, Dict[str, Any]]] = None,
+    query_mix: Optional[List[str]] = None,
 ):
     """
     Build a query_distribution that nudges RAGAS to produce *standalone, corpus-appropriate* queries.
@@ -2582,7 +3094,7 @@ def build_query_distribution_for_pipeline(
       - Otherwise, returns a query_distribution with compatible synthesizers.
     """
     use_pdf_profiles = bool(pdf_profiles_by_source)
-    if not standalone_queries and not use_pdf_profiles:
+    if query_mix is None and not standalone_queries and not use_pdf_profiles:
         return None
 
     # Use RAGAS's compatibility filtering, then override the prompts.
@@ -2594,7 +3106,145 @@ def build_query_distribution_for_pipeline(
         QueryAnswerGenerationPrompt as MultiHopQueryAnswerGenerationPrompt,
     )
 
-    if use_pdf_profiles:
+    _QUERY_SYNTHESIZER_SPECS: Dict[str, Dict[str, Any]] = {
+        # Single-hop: one context node, focus term from a node property.
+        "single_hop_entities": {
+            "description": "Single-hop specific queries driven by `entities` (default RAGAS behavior).",
+            "cls": SingleHopSpecificQuerySynthesizer,
+            "pdf_cls": PdfProfileSingleHopSpecificQuerySynthesizer,
+            "kwargs": {"property_name": "entities"},
+        },
+        "single_hop_themes": {
+            "description": "Single-hop specific queries driven by `themes` (often more abstract, less named-entity heavy).",
+            "cls": SingleHopSpecificQuerySynthesizer,
+            "pdf_cls": PdfProfileSingleHopSpecificQuerySynthesizer,
+            "kwargs": {"property_name": "themes"},
+        },
+        # Multi-hop abstract: traverse similarity graph, then pick abstract concepts (themes).
+        "multi_hop_abstract_summary": {
+            "description": "Multi-hop abstract queries using summary similarity edges (default RAGAS behavior).",
+            "cls": MultiHopAbstractQuerySynthesizer,
+            "pdf_cls": PdfProfileMultiHopAbstractQuerySynthesizer,
+            "kwargs": {
+                "relation_property": "summary_similarity",
+                "abstract_property_name": "themes",
+            },
+        },
+        "multi_hop_abstract_content": {
+            "description": "Multi-hop abstract queries using content similarity edges (requires `content_similarity` relationships).",
+            "cls": MultiHopAbstractQuerySynthesizer,
+            "pdf_cls": PdfProfileMultiHopAbstractQuerySynthesizer,
+            "kwargs": {
+                "relation_property": "content_similarity",
+                "abstract_property_name": "themes",
+            },
+        },
+        # Multi-hop specific: two contexts connected by overlap relationships, focus on overlapped items.
+        "multi_hop_specific_entities": {
+            "description": "Multi-hop specific queries using entity-overlap edges (default RAGAS behavior).",
+            "cls": MultiHopSpecificQuerySynthesizer,
+            "pdf_cls": PdfProfileMultiHopSpecificQuerySynthesizer,
+            "kwargs": {
+                "property_name": "entities",
+                "relation_type": "entities_overlap",
+                "relation_overlap_property": "overlapped_items",
+            },
+        },
+    }
+    _QUERY_SYNTHESIZER_ALIASES: Dict[str, str] = {
+        # Accept RAGAS's default synthesizer names as aliases.
+        "single_hop_specific_query_synthesizer": "single_hop_entities",
+        "multi_hop_abstract_query_synthesizer": "multi_hop_abstract_summary",
+        "multi_hop_specific_query_synthesizer": "multi_hop_specific_entities",
+    }
+
+    def _normalize_synth_key(key: str) -> str:
+        k = str(key or "").strip()
+        if not k:
+            return ""
+        k = k.lower()
+        return _QUERY_SYNTHESIZER_ALIASES.get(k, k)
+
+    def _parse_query_mix(specs: List[str]) -> List[Tuple[str, float]]:
+        ordered_keys: List[str] = []
+        weights_by_key: Dict[str, float] = {}
+        for raw_spec in specs:
+            spec = str(raw_spec or "").strip()
+            if not spec:
+                continue
+            if "=" in spec:
+                name_part, weight_part = spec.split("=", 1)
+                key = _normalize_synth_key(name_part)
+                if not key:
+                    raise ValueError(f"Invalid --query-mix entry: {raw_spec!r}")
+                try:
+                    w = float(str(weight_part).strip())
+                except Exception as e:
+                    raise ValueError(
+                        f"Invalid weight for --query-mix {name_part!r}: {weight_part!r}"
+                    ) from e
+            else:
+                key = _normalize_synth_key(spec)
+                if not key:
+                    raise ValueError(f"Invalid --query-mix entry: {raw_spec!r}")
+                w = 1.0
+
+            if key not in _QUERY_SYNTHESIZER_SPECS:
+                raise ValueError(
+                    f"Unknown query synthesizer {key!r}. Use --list-query-synthesizers to see options."
+                )
+            if not (w > 0):
+                raise ValueError(
+                    f"Invalid weight for query synthesizer {key!r}: {w} (must be > 0)"
+                )
+            if key not in weights_by_key:
+                ordered_keys.append(key)
+                weights_by_key[key] = 0.0
+            weights_by_key[key] += float(w)
+
+        out = [(k, weights_by_key[k]) for k in ordered_keys if weights_by_key.get(k, 0) > 0]
+        if not out:
+            raise ValueError("Empty --query-mix: provide at least one synthesizer name.")
+        return out
+
+    def _make_synth(key: str):
+        spec = _QUERY_SYNTHESIZER_SPECS[key]
+        cls = spec["pdf_cls"] if use_pdf_profiles else spec["cls"]
+        kwargs = dict(spec.get("kwargs", {}) or {})
+        kwargs.update({"llm": llm, "llm_context": llm_context, "name": key})
+        if use_pdf_profiles:
+            kwargs["pdf_profiles_by_source"] = pdf_profiles_by_source or {}
+        return cls(**kwargs)
+
+    if query_mix:
+        requested = _parse_query_mix(query_mix)
+        candidates = [(_make_synth(key), weight) for key, weight in requested]
+
+        available = []
+        for query, weight in candidates:
+            try:
+                if query.get_node_clusters(kg):
+                    available.append((query, weight))
+                else:
+                    print(
+                        f"Warning: Skipping {getattr(query, 'name', type(query).__name__)} (incompatible with KnowledgeGraph)"
+                    )
+            except Exception as e:
+                print(
+                    f"Warning: Skipping {getattr(query, 'name', type(query).__name__)} due to unexpected error: {e}"
+                )
+                continue
+
+        if not available:
+            raise ValueError(
+                "No compatible query synthesizers for the provided KnowledgeGraph."
+            )
+
+        total = sum(w for _q, w in available) or 0.0
+        if total <= 0:
+            raise ValueError("Invalid query mix: total probability weight is <= 0.")
+        qd = [(q, float(w) / float(total)) for q, w in available]
+    elif use_pdf_profiles:
         # Build our PDF-profile-aware synthesizers and run the same compatibility filtering logic
         # as RAGAS's default_query_distribution.
         candidates = [
@@ -2964,6 +3614,25 @@ def main():
         help="Number of test samples to generate (default: 50)",
     )
     parser.add_argument(
+        "--num-personas",
+        type=int,
+        default=3,
+        help=(
+            "Number of personas to generate from the Knowledge Graph when --personas-path is not provided "
+            "(default: 3)."
+        ),
+    )
+    parser.add_argument(
+        "--personas-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a JSON/JSONL file containing personas. "
+            "If provided, persona generation is skipped and these personas are used instead. "
+            "Expected fields: {name, role_description}."
+        ),
+    )
+    parser.add_argument(
         "--standalone-queries",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2989,6 +3658,22 @@ def main():
             "Optional additional guidance passed to RAGAS as llm_context for query generation. "
             "When --standalone-queries is enabled, this will be appended to the default corpus guidance."
         ),
+    )
+    parser.add_argument(
+        "--query-mix",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional custom query synthesizer mix as a list of names or name=weight pairs. "
+            "Example: --query-mix single_hop_entities=0.5 multi_hop_abstract_content=0.3 multi_hop_specific_entities=0.2. "
+            "Use --list-query-synthesizers to see available names."
+        ),
+    )
+    parser.add_argument(
+        "--list-query-synthesizers",
+        action="store_true",
+        help="Print available --query-mix synthesizer names and exit.",
     )
     parser.add_argument(
         "--pdf-profiles",
@@ -3185,6 +3870,27 @@ def main():
     print("=" * 60)
     print("RAGAS Synthetic Dataset Generator")
     print("=" * 60)
+
+    if args.num_personas is not None and int(args.num_personas) <= 0:
+        print("\nError: --num-personas must be a positive integer.")
+        return 1
+
+    if args.list_query_synthesizers:
+        print("\nAvailable query synthesizers for --query-mix:\n")
+        # Keep the list in sync with build_query_distribution_for_pipeline registry.
+        for name, desc in [
+            ("single_hop_entities", "Single-hop specific queries driven by `entities` (default RAGAS behavior)."),
+            ("single_hop_themes", "Single-hop specific queries driven by `themes` (more abstract)."),
+            ("multi_hop_abstract_summary", "Multi-hop abstract queries using summary similarity edges (default)."),
+            ("multi_hop_abstract_content", "Multi-hop abstract queries using content similarity edges (requires content embeddings)."),
+            ("multi_hop_specific_entities", "Multi-hop specific queries using entity-overlap edges (default)."),
+        ]:
+            print(f"  - {name}: {desc}")
+        print("\nAliases also accepted:")
+        print("  - single_hop_specific_query_synthesizer")
+        print("  - multi_hop_abstract_query_synthesizer")
+        print("  - multi_hop_specific_query_synthesizer")
+        return 0
 
     # Resolve base input dir (handles script moved one level up)
     base_input_dir = resolve_input_dir(args.input_dir)
@@ -3568,6 +4274,12 @@ def main():
         else "openai-default"
     )
 
+    ragas_doc_extraction_model_tag_base = (
+        f"{provider_used}:{args.model}:ragas{getattr(ragas, '__version__', 'unknown')}:"
+        f"doc_extract_v{int(RAGAS_DOC_EXTRACT_CACHE_VERSION)}"
+    )
+    reuse_cached_store_extractions = bool(pdf_store_conn is not None and not args.reprocess)
+
     # PDF profiles (LLM-derived, per-PDF high-level metadata) — enabled by default.
     #
     # This is intentionally done early (right after loading documents and setting up the LLM),
@@ -3637,7 +4349,7 @@ def main():
     )
     kg_cache_path = kg_cache_dir / f"kg_{kg_cache_id}.json.gz"
     kg_meta_path = meta_dir / f"kg_{kg_cache_id}.json"
-    personas_cache_path = personas_cache_dir / f"personas_{kg_cache_id}.json"
+    personas_cache_path = personas_cache_dir / f"personas_{kg_cache_id}__n{int(args.num_personas)}.json"
 
     # Load or build knowledge graph
     if cache_enabled and kg_cache_path.exists() and not args.reprocess:
@@ -3650,6 +4362,10 @@ def main():
             generator_llm,
             generator_embeddings,
             add_content_embeddings=add_content_embeddings,
+            pdf_store_conn=pdf_store_conn,
+            base_input_dir=base_input_dir,
+            reuse_cached_store_extractions=reuse_cached_store_extractions,
+            ragas_doc_extraction_model_tag_base=ragas_doc_extraction_model_tag_base,
         )
         if cache_enabled:
             print(f"\nSaving knowledge graph cache: {kg_cache_path}")
@@ -3680,13 +4396,22 @@ def main():
 
     # Load or build personas
     personas: Optional[List[Persona]] = None
-    if cache_enabled and personas_cache_path.exists() and not args.reprocess:
+    if args.personas_path:
+        personas_path = Path(args.personas_path).expanduser()
+        if not personas_path.is_absolute():
+            personas_path = (Path.cwd() / personas_path).resolve()
+        print(f"\nLoading personas from file: {personas_path}")
+        personas = load_personas_from_file(personas_path)
+        print(f"  Loaded {len(personas)} persona(s)")
+    elif cache_enabled and personas_cache_path.exists() and not args.reprocess:
         print(f"\nLoading cached personas: {personas_cache_path}")
         personas = load_personas_cache(personas_cache_path)
         print(f"  Loaded {len(personas)} persona(s)")
     else:
         print("\nGenerating personas (will be cached)...")
-        personas = generate_personas_from_kg(kg=kg, llm=generator_llm, num_personas=3)
+        personas = generate_personas_from_kg(
+            kg=kg, llm=generator_llm, num_personas=int(args.num_personas)
+        )
         if cache_enabled:
             save_personas_cache(personas, personas_cache_path)
             print(f"  Saved personas cache: {personas_cache_path}")
@@ -3710,6 +4435,7 @@ def main():
         standalone_queries=args.standalone_queries,
         llm_context=llm_context,
         pdf_profiles_by_source=pdf_profiles_by_source if args.pdf_profiles else None,
+        query_mix=args.query_mix,
     )
 
     # Generate testset from the (cached) knowledge graph
