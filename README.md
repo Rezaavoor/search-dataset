@@ -6,6 +6,26 @@ The main entrypoint is `generate_synthetic_dataset.py`.
 
 ---
 
+## Project structure
+
+```
+generate_synthetic_dataset.py   # Main entrypoint (argparse + step-by-step orchestration)
+modules/
+  config.py                     # Constants and defaults
+  utils.py                      # Shared helpers (hashing, JSON, paths, text)
+  db.py                         # SQLite PDF page store operations
+  transforms.py                 # RAGAS transform patches (SafeHeadlineSplitter, etc.)
+  llm_setup.py                  # LLM/embedding setup (OpenAI / Azure OpenAI)
+  profiles.py                   # PDF profile generation & formatting
+  synthesizers.py               # Query synthesizers + distribution building
+  hard_negatives.py             # Hard negative mining (BM25, embedding, LLM judge)
+  testset.py                    # KG building, testset gen/save, persona management
+output/                         # Generated CSV/JSON/Parquet datasets
+processed/                      # Cached intermediate artifacts (KG, personas, SQLite store)
+```
+
+---
+
 ## Quick start
 
 ### Install
@@ -31,13 +51,13 @@ python generate_synthetic_dataset.py \
   --output-formats csv json
 ```
 
+Output files are saved to the `output/` folder (e.g., `output/synthetic_dataset.csv`).
+
 Common flags:
-- `--file-types pdf` (non-PDF entries are ignored)
 - `--specific-folders folderA folderB`
 - `--files path/to/one.pdf path/to/another.pdf`
 - `--no-recursive` (don't search subdirectories)
-- `--max-pdfs N` (cap the number of PDF files before loading pages; default: no limit)
-- `--max-files N` (cap extracted *LangChain Documents*; for PDFs this usually means **pages**; default: no limit)
+- `--max-pdfs N` (cap the number of PDF files; default: no limit)
 - `--standalone-queries` / `--no-standalone-queries` (default: enabled; generate standalone, corpus-level search queries)
 - `--corpus-size-hint N` (used only when `--standalone-queries` is enabled; default: 7000)
 - `--query-llm-context "..."` (extra guidance appended to the default corpus guidance)
@@ -47,10 +67,9 @@ Common flags:
 - `--provider auto|openai|azure`
 - `--model gpt-4o-mini` (or your Azure deployment name)
 - `--processed-dir processed` (where intermediate caches are stored)
-- `--no-cache` (disable cache reuse)
-- `--reprocess` (ignore caches and rebuild them)
-- `--pdf-store-build` / `--pdf-store-use` (optional SQLite PDF page store; see below)
 - `--pdf-store-db PATH` (override SQLite store location; default: `processed/pdf_page_store.sqlite`)
+- `--no-cache` (disable cache reuse for KG/personas)
+- `--reprocess` (ignore caches and rebuild everything)
 
 ### Hard negative mining (for IR evaluation)
 
@@ -65,7 +84,7 @@ python generate_synthetic_dataset.py \
 ```
 
 Hard negatives are saved to a single `hard_negatives` column as a JSON list of
-`"<filename>.pdf (page N)"` strings. (In the exported CSV/JSON, this is stored as a JSON-encoded string.) Some queries may have **no** hard negatives (`[]`)
+`"<filename>.pdf (page N)"` strings. Some queries may have **no** hard negatives (`[]`)
 if the miner cannot find negatives reliably.
 
 Hard negative flags:
@@ -74,67 +93,60 @@ Hard negative flags:
 - `--num-embedding-negatives N` (embedding candidate mining budget per query, default: 5)
 - `--no-content-embeddings` (disable page_content embeddings, use summary_embedding only)
 
-### Reusing processed artifacts
+---
 
-By default the script saves intermediate artifacts to `processed/` and reuses them on subsequent runs:
-- `processed/docs/`: extracted PDF pages (LangChain `Document`s)
-- `processed/kg/`: the processed RAGAS Knowledge Graph (after transforms)
-- `processed/personas/`: generated personas
-- `processed/pdf_profiles/`: per-PDF LLM “profiles” used to improve query realism (folder/filename hints + high-level summary)
-- `processed/meta/`: metadata JSON describing cache keys + inputs for each artifact
-- `processed/pdf_page_store.sqlite`: optional single-table SQLite store of extracted PDF pages (plus derived fields like page summary, page embeddings, and per-PDF profiles)
+## Pipeline steps
 
-This is useful when you want to regenerate testsets (e.g., different `--testset-size`) without re-running the expensive transform step.
+The script runs a clear step-by-step pipeline with progress indicators:
 
-### SQLite PDF page store (optional, precompute once)
+```
+[Step  1/10] Collecting PDF paths
+[Step  2/10] Syncing SQLite PDF store
+[Step  3/10] Loading documents from SQLite store
+[Step  4/10] Setting up LLM & embeddings
+[Step  5/10] Building PDF profiles
+[Step  6/10] Building knowledge graph
+[Step  7/10] Generating personas
+[Step  8/10] Generating testset
+[Step  9/10] Mining hard negatives
+[Step 10/10] Saving results
+```
 
-If you want to extract PDF pages **once** and reuse them across runs (e.g., run on a small subset first, then rerun on a larger subset and skip already-processed PDFs), you can use an optional **single-table SQLite database** called `pdf_page_store`.
+The step count adjusts dynamically based on which optional features (PDF profiles, hard negatives) are enabled.
+
+---
+
+## SQLite PDF page store
+
+All PDF pages are extracted and stored in a **single-table SQLite database** (`pdf_page_store`). This is always active — the store is automatically created and synced on every run.
 
 - **Row granularity**: 1 row per **PDF page** (matches `PyPDFLoader`)
 - **Stored fields** (from PDFs): `doc_content` + loader metadata (`source`, `page`, etc.)
 - **Derived fields**:
   - `summary`: cheap extractive snippet (offline, deterministic)
-  - `embedding_f32`: optional float32 BLOB, computed when building with `--pdf-store-embeddings` (stored for reuse; the RAGAS transform pipeline still computes its own embeddings as needed)
-  - `pdf_profile_json`: optional per-PDF profile (stored once per PDF; typically on page 1) computed when building with `--pdf-store-profiles` or when profiles are generated during a run
+  - `embedding_f32`: optional float32 BLOB, computed with `--pdf-store-embeddings` (stored for reuse; the RAGAS transform pipeline still computes its own embeddings as needed)
+  - `pdf_profile_json`: per-PDF profile (one per PDF; computed when `--pdf-profiles` is enabled)
+  - `ragas_headlines_json`, `ragas_summary`: RAGAS LLM extractions cached for reuse across runs
 
 **Default DB path:** `processed/pdf_page_store.sqlite` (override with `--pdf-store-db`).
 
-Build/update the store (pages + summaries; no API calls):
+On each run, the store automatically:
+- Inserts any **missing or stale** PDFs (based on file size + modification time)
+- Backfills extractive summaries for pages that don't have them
+- Optionally computes page embeddings (`--pdf-store-embeddings`)
+- Generates PDF profiles as needed (`--pdf-profiles`)
 
-```bash
-python generate_synthetic_dataset.py \
-  --input-dir . \
-  --pdf-store-build
-```
+Use `--reprocess` to force re-extraction of all PDFs into the store.
 
-Build/update the store and also compute embeddings and/or profiles (requires API credentials):
+### Reusing cached artifacts
 
-```bash
-python generate_synthetic_dataset.py \
-  --specific-folders "Claires" \
-  --max-pdfs 20 \
-  --pdf-store-build \
-  --pdf-store-embeddings \
-  --pdf-store-profiles
-```
+Intermediate artifacts are saved under `processed/` and reused on subsequent runs:
+- `processed/kg/`: the processed RAGAS Knowledge Graph (after transforms)
+- `processed/personas/`: generated personas
+- `processed/meta/`: metadata JSON describing cache keys + inputs for each artifact
+- `processed/pdf_page_store.sqlite`: SQLite store of extracted PDF pages + derived fields
 
-Generate using the SQLite store (no PDF re-read; still uses the same KG/persona/testset pipeline):
-
-```bash
-python generate_synthetic_dataset.py \
-  --specific-folders "Claires" \
-  --max-files 200 \
-  --testset-size 50 \
-  --pdf-store-use \
-  --output synthetic_dataset \
-  --output-formats csv json
-```
-
-Notes:
-- `--pdf-store-use` defaults to `--pdf-store-auto-build`, which will automatically insert **missing/stale PDFs** into the store as needed.
-- If you want newly inserted pages to also get `embedding_f32` and/or `pdf_profile_json`, add `--pdf-store-embeddings` and/or `--pdf-store-profiles` to the same run.
-- For strict “read only from DB”, use `--no-pdf-store-auto-build` (it will error if the DB is missing/stale for selected PDFs).
-- Use `--pdf-store-reprocess` to force re-extraction into the SQLite store for selected PDFs. `--reprocess` forces rebuilding all intermediate caches as usual.
+This is useful when you want to regenerate testsets (e.g., different `--testset-size`) without re-running the expensive transform step.
 
 ---
 
@@ -145,7 +157,7 @@ RAGAS generates the synthetic dataset in two big phases:
 - **Phase A: Build a Knowledge Graph (KG)** from your documents via a **transform pipeline** (LLM-based extractors + embedding-based steps).
 - **Phase B: Generate samples** by sampling nodes/relationships from the KG and using the **LLM** to write the final **(question, answer)** grounded in the chosen context(s).
 
-This repo wires those phases together in `generate_synthetic_dataset.py` using:
+This repo wires those phases together using:
 - `ragas.testset.TestsetGenerator`
 - `ragas.testset.transforms.default_transforms(...)` (plus patches described below)
 - `testset.to_pandas()` for export
@@ -154,14 +166,9 @@ This repo wires those phases together in `generate_synthetic_dataset.py` using:
 
 ## Phase A: Documents → Knowledge Graph (Transforms)
 
-### 1) Load documents (LangChain loaders)
+### 1) Load documents from SQLite store
 
-`load_documents(...)` loads **PDF files only** into LangChain `Document` objects (non-PDF inputs are skipped).
-
-Important detail:
-- PDFs loaded via `PyPDFLoader` are typically **one `Document` per page** and include `metadata["page"]` (0-indexed). This affects `--max-files` and source mapping.
-- Use `--max-pdfs` if you want to cap the number of PDF files instead of pages.
-- Optional: use `--pdf-store-use` to load those per-page `Document`s from the SQLite store (`processed/pdf_page_store.sqlite`) instead of reading PDFs from disk. The downstream pipeline sees the same `page_content` + `metadata["source"]`/`metadata["page"]`.
+PDF pages are loaded from the SQLite page store (auto-synced in Step 2). Each page becomes a LangChain `Document` with `metadata["source"]` (absolute path) and `metadata["page"]` (0-indexed).
 
 ### 2) Initialize LLM + embeddings
 
@@ -211,8 +218,8 @@ Typical transform sequence:
 - **Parallel step**:
   - **Embeddings/math**: `CosineSimilarityBuilder(property_name="summary_embedding")` → adds `summary_similarity` edges
   - **String overlap**: `OverlapScoreBuilder(property_name="entities")` → adds `entities_overlap` edges + `overlapped_items`
-- **Embeddings**: `EmbeddingExtractor(property_name="page_content_embedding", embed_property_name="page_content")` → adds `page_content_embedding` (NEW)
-- **Embeddings/math**: `CosineSimilarityBuilder(property_name="page_content_embedding")` → adds `content_similarity` edges (NEW)
+- **Embeddings**: `EmbeddingExtractor(property_name="page_content_embedding", embed_property_name="page_content")` → adds `page_content_embedding`
+- **Embeddings/math**: `CosineSimilarityBuilder(property_name="page_content_embedding")` → adds `content_similarity` edges
 
 #### Medium-doc pipeline (roughly "many docs are 101–500 tokens")
 
@@ -226,7 +233,7 @@ Same idea, but it typically:
 In practice, some documents won't yield `headlines` (or RAGAS may decide not to extract them for shorter docs).
 The stock `HeadlineSplitter` raises if `headlines` is missing.
 
-This repo replaces it with `SafeHeadlineSplitter` and adds a headline-required filter:
+This repo replaces it with `SafeHeadlineSplitter` (in `modules/transforms.py`) and adds a headline-required filter:
 - if `headlines` is missing/empty (or none of the extracted headlines match the text), the document is **filtered out** (no queries are generated from it)
 - otherwise, standard headline splitting behavior is used
 
@@ -349,7 +356,7 @@ When hard negatives are enabled, the output includes:
 
 ## Outputs and schema
 
-`generate_synthetic_dataset.py` saves a `Testset` via `testset.to_pandas()` into the formats you request:
+Output files are saved to the `output/` directory in the formats you request:
 - `--output-formats csv json parquet`
 
 Typical core columns:
@@ -379,7 +386,7 @@ This mapping is **heuristic string matching** against loaded `Document.page_cont
 ### Change transform behavior
 
 This script currently uses:
-- `default_transforms(...)` from RAGAS, then patches:
+- `default_transforms(...)` from RAGAS, then patches (in `modules/transforms.py`):
   - `HeadlineSplitter` → `SafeHeadlineSplitter` (no fallback chunking)
   - adds a `HeadlinesExtractor` + filter step to **skip documents without usable headlines**
   - adds `EmbeddingExtractor` for `page_content` → `page_content_embedding`
@@ -387,7 +394,7 @@ This script currently uses:
 
 If you want full control, you can:
 - build your own transform list (extractors/splitters/relationship builders)
-- replace the `transforms = ...` block in `build_knowledge_graph(...)` and call `apply_transforms(kg, your_transforms, ...)`
+- replace the `transforms = ...` block in `build_knowledge_graph(...)` (in `modules/testset.py`) and call `apply_transforms(kg, your_transforms, ...)`
 
 ### Change query mix
 
@@ -401,12 +408,12 @@ This repo also exposes:
 
 ### PDF profiles (improving query realism across many PDFs)
 
-When `--pdf-profiles` is enabled (default), the script generates a **PDF-level profile** for each PDF (cached under `processed/pdf_profiles/`) and injects it into query generation as additional context. This helps the LLM write questions that sound like what a person would search for when looking across **thousands of documents**, not just “what’s on this page.”
+When `--pdf-profiles` is enabled (default), the script generates a **PDF-level profile** for each PDF (stored in the SQLite page store) and injects it into query generation as additional context. This helps the LLM write questions that sound like what a person would search for when looking across **thousands of documents**, not just "what's on this page."
 
-If you also use the SQLite PDF page store, profiles are additionally persisted in the SQLite DB (one profile per PDF) so reruns across different subsets can reuse them.
+Profiles are persisted in the SQLite DB (one profile per PDF) so reruns across different subsets can reuse them.
 
 Profile inputs include:
-- the PDF’s **folder path** (e.g., `Claires/…`)
+- the PDF's **folder path** (e.g., `Claires/…`)
 - the **filename stem** (e.g., `222_Notice_of_Appearance.._Filed_by_Wichita_County._(Lerew_Mollie)`)
 - a short excerpt from the first few pages
 
@@ -458,7 +465,7 @@ Cost drivers:
 
 Ways to reduce:
 - lower `--testset-size`
-- reduce the number of loaded PDFs/pages via `--max-pdfs`, `--max-files`, or narrower folders
+- reduce the number of loaded PDFs via `--max-pdfs` or narrower `--specific-folders`
 - use a smaller/cheaper model
 - use `--no-content-embeddings` to skip page_content embedding (not recommended)
 
@@ -469,4 +476,4 @@ The caching system uses stable cache keys derived from:
 - Provider/model/embedding id
 - Pipeline configuration changes (e.g., toggling `--no-content-embeddings`)
 
-To force a rebuild, use `--reprocess`. If you are using the SQLite PDF page store, you can also use `--pdf-store-reprocess` to force re-extraction into SQLite for the selected PDFs.
+To force a rebuild, use `--reprocess`.
