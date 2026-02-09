@@ -1,4 +1,8 @@
-"""SQLite PDF page store operations (single-table, corpus-derived)."""
+"""SQLite document page store operations (single-table, corpus-derived).
+
+Supports PDF and non-PDF formats (DOCX, XLSX, PPTX, TXT, CSV, JSON, etc.)
+via the format-specific loaders in ``modules.loaders``.
+"""
 
 import json
 import re
@@ -11,6 +15,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 
 from .config import EXTRACTIVE_SUMMARY_MODEL, PDF_STORE_SCHEMA_VERSION
+from .loaders import SUPPORTED_EXTENSIONS, load_file_pages
 from .utils import (
     compute_rel_path_for_store,
     compute_source_path_from_rel_path,
@@ -21,6 +26,9 @@ from .utils import (
     sort_documents_deterministically,
     utc_now_iso,
 )
+
+# Allowed file_type values for the CHECK constraint
+_ALLOWED_FILE_TYPES = tuple(sorted(set(SUPPORTED_EXTENSIONS.values())))
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +181,7 @@ def init_pdf_page_store(conn: sqlite3.Connection) -> None:
           pdf_sha256 TEXT NOT NULL,
           rel_path TEXT NOT NULL,
           filename TEXT NOT NULL,
-          file_type TEXT NOT NULL DEFAULT 'pdf' CHECK(file_type = 'pdf'),
+          file_type TEXT NOT NULL DEFAULT 'pdf',
           size_bytes INTEGER NOT NULL,
           mtime_ns INTEGER,
           page_number INTEGER NOT NULL CHECK(page_number >= 1),
@@ -244,9 +252,111 @@ def init_pdf_page_store(conn: sqlite3.Connection) -> None:
         pass
     conn.commit()
 
+    # Migrate the CHECK constraint to allow all supported file types.
+    # SQLite doesn't support ALTER TABLE DROP CONSTRAINT, so we recreate
+    # the table if the old CHECK(file_type = 'pdf') is still present.
+    _migrate_file_type_check(conn)
+
     # Migrate existing embedding_f32 data to model-specific columns.
     # This is a one-time operation; subsequent runs are a no-op.
     _migrate_embeddings_to_model_columns(conn)
+
+
+def _migrate_file_type_check(conn: sqlite3.Connection) -> None:
+    """Recreate the table without the old CHECK(file_type = 'pdf') if needed.
+
+    This is a one-time migration.  We detect the old constraint by trying to
+    insert a dummy non-pdf file_type; if it fails with a CHECK constraint
+    violation the migration runs.
+    """
+    needs_migration = False
+    try:
+        conn.execute(
+            "INSERT INTO pdf_page_store "
+            "(pdf_sha256, rel_path, filename, file_type, size_bytes, page_number, "
+            " doc_content, content_sha256, content_chars, metadata_json) "
+            "VALUES ('__migration_probe__', '__probe__', '__probe__', 'docx', "
+            "0, 1, '', '', 0, '{}')"
+        )
+        # If it succeeded, the constraint is already relaxed — delete probe row.
+        conn.execute(
+            "DELETE FROM pdf_page_store WHERE pdf_sha256 = '__migration_probe__'"
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        needs_migration = True
+    except Exception:
+        # Some other error — skip migration to be safe
+        return
+
+    if not needs_migration:
+        return
+
+    # Rollback any partial state from the probe
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+    # Read the current column names (we need them for the copy)
+    cols_info = conn.execute("PRAGMA table_info(pdf_page_store)").fetchall()
+    col_names = [str(r[1]) for r in cols_info]
+    cols_csv = ", ".join(col_names)
+
+    # Build new CREATE TABLE without the CHECK on file_type
+    # We get the original SQL and patch it
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='pdf_page_store'"
+    ).fetchone()
+    if not row:
+        return
+    original_sql = str(row[0])
+
+    # Remove CHECK(file_type = 'pdf') or CHECK(file_type='pdf') patterns
+    import re as _re
+    new_sql = _re.sub(
+        r"\s*CHECK\s*\(\s*file_type\s*=\s*'pdf'\s*\)\s*",
+        " ",
+        original_sql,
+        flags=_re.IGNORECASE,
+    )
+    # Replace the table name for the temp table
+    new_sql = new_sql.replace("pdf_page_store", "pdf_page_store_new", 1)
+
+    try:
+        conn.execute(new_sql)
+        conn.execute(
+            f"INSERT INTO pdf_page_store_new ({cols_csv}) "
+            f"SELECT {cols_csv} FROM pdf_page_store"
+        )
+        conn.execute("DROP TABLE pdf_page_store")
+        conn.execute("ALTER TABLE pdf_page_store_new RENAME TO pdf_page_store")
+        # Recreate indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS pdf_page_store_path_page_idx "
+            "ON pdf_page_store(rel_path, page_number)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS pdf_page_store_pdfsha_idx "
+            "ON pdf_page_store(pdf_sha256)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS pdf_profile_one_per_pdf_idx "
+            "ON pdf_page_store(pdf_sha256) WHERE pdf_profile_json IS NOT NULL"
+        )
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        # If we can't migrate, log and continue — the old CHECK will
+        # prevent non-pdf rows but won't crash existing PDF workflows.
+        import sys
+        print(
+            f"[db] WARNING: file_type CHECK migration failed: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _migrate_embeddings_to_model_columns(conn: sqlite3.Connection) -> None:
@@ -782,6 +892,90 @@ def upsert_pdf_into_store(
                     f"WHERE rel_path = ? AND page_number = ?",
                     (arr.tobytes(), int(arr.shape[0]), rel_path, page_number),
                 )
+
+    return stored
+
+
+# ---------------------------------------------------------------------------
+# Upsert (any supported format → store) — generalized version
+# ---------------------------------------------------------------------------
+def upsert_file_into_store(
+    conn: sqlite3.Connection,
+    *,
+    file_path: Path,
+    base_input_dir: Path,
+    reprocess: bool = False,
+) -> int:
+    """Extract pages from *file_path* (any supported format) and upsert into the store.
+
+    Uses ``modules.loaders.load_file_pages`` for format-specific extraction.
+    Does NOT compute embeddings — that is handled separately by the embedding
+    pipeline for better resume safety.
+
+    Returns the number of pages stored.
+    """
+    resolved = file_path.expanduser().resolve()
+    st = resolved.stat()
+    rel_path = compute_rel_path_for_store(resolved, base_input_dir)
+    filename = resolved.name
+    size_bytes = int(st.st_size)
+    mtime_ns = int(st.st_mtime_ns)
+
+    if reprocess:
+        conn.execute("DELETE FROM pdf_page_store WHERE rel_path = ?", (rel_path,))
+
+    file_sha256 = sha256_file(resolved)
+    file_type, pages = load_file_pages(resolved)
+
+    now = utc_now_iso()
+    stored = 0
+
+    with conn:
+        for page_number, content, extra_md in pages:
+            content = str(content or "")
+            content_sha256 = sha256_hex(content)
+            content_chars = int(len(content))
+            summary = extractive_summary(content)
+            summary_model = EXTRACTIVE_SUMMARY_MODEL
+
+            md = dict(extra_md) if isinstance(extra_md, dict) else {}
+            md["source"] = str(resolved)
+            md["page"] = int(page_number - 1)
+            md["file_type"] = file_type
+            metadata_json = json.dumps(md, ensure_ascii=False)
+
+            conn.execute(
+                """
+                INSERT INTO pdf_page_store (
+                  pdf_sha256, rel_path, filename, file_type,
+                  size_bytes, mtime_ns, page_number,
+                  doc_content, content_sha256, content_chars,
+                  summary, summary_model,
+                  metadata_json, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(pdf_sha256, page_number) DO UPDATE SET
+                  rel_path = excluded.rel_path,
+                  filename = excluded.filename,
+                  file_type = excluded.file_type,
+                  size_bytes = excluded.size_bytes,
+                  mtime_ns = excluded.mtime_ns,
+                  doc_content = excluded.doc_content,
+                  content_sha256 = excluded.content_sha256,
+                  content_chars = excluded.content_chars,
+                  summary = excluded.summary,
+                  summary_model = excluded.summary_model,
+                  metadata_json = excluded.metadata_json,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    file_sha256, rel_path, filename, file_type,
+                    size_bytes, mtime_ns, page_number,
+                    content, content_sha256, content_chars,
+                    summary, summary_model,
+                    metadata_json, now,
+                ),
+            )
+            stored += 1
 
     return stored
 
