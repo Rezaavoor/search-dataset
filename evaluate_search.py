@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -78,15 +79,25 @@ def parse_json_col(value: Any) -> List[str]:
 # Embedding model setup
 # ============================================================================
 def setup_embedding_model(model: str, provider: str = "auto"):
-    """Set up an embedding model (same provider detection as generate script)."""
+    """Set up an embedding model.
+
+    Providers:
+      - openai: Uses OPENAI_API_KEY
+      - azure: Uses AZURE_OPENAI_* vars
+      - bedrock: Uses AWS credentials (AWS_ACCESS_KEY_ID/SECRET or default profile)
+      - auto: Detects from env vars
+    """
     if provider == "auto":
         if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
             provider = "azure"
         elif os.environ.get("OPENAI_API_KEY"):
             provider = "openai"
+        elif os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_BEDROCK_REGION"):
+            provider = "bedrock"
         else:
             raise ValueError(
-                "No API credentials found. Set OPENAI_API_KEY or Azure vars."
+                "No API credentials found. Set OPENAI_API_KEY, Azure vars, "
+                "or AWS_ACCESS_KEY_ID + AWS_BEDROCK_REGION."
             )
 
     if provider == "azure":
@@ -95,27 +106,86 @@ def setup_embedding_model(model: str, provider: str = "auto"):
         endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
         api_key = os.environ.get("AZURE_OPENAI_API_KEY")
         api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+        print(f"  Provider: Azure OpenAI (deployment: {model})")
         return AzureOpenAIEmbeddings(
             azure_endpoint=endpoint,
             api_key=api_key,
             api_version=api_version,
             azure_deployment=model,
         )
+    elif provider == "bedrock":
+        import boto3
+        from langchain_aws.embeddings import BedrockEmbeddings
+
+        region = os.environ.get("AWS_BEDROCK_REGION", "eu-central-1")
+        client = boto3.client("bedrock-runtime", region_name=region)
+        print(f"  Provider: AWS Bedrock (model: {model}, region: {region})")
+        return BedrockEmbeddings(
+            client=client,
+            model_id=model,
+        )
     else:
         from langchain_openai import OpenAIEmbeddings
 
+        print(f"  Provider: OpenAI (model: {model})")
         return OpenAIEmbeddings(model=model)
 
 
 # ============================================================================
 # Corpus embedding computation (for new models)
 # ============================================================================
+def _embed_batch_with_retry(
+    embedding_model,
+    texts: List[str],
+    *,
+    max_retries: int = 6,
+    base_delay: float = 5.0,
+) -> List[Optional[List[float]]]:
+    """Embed a batch of texts with exponential backoff on throttling errors."""
+    for attempt in range(max_retries):
+        try:
+            batch_vecs = embedding_model.embed_documents(texts)
+            if isinstance(batch_vecs, list) and len(batch_vecs) == len(texts):
+                return batch_vecs
+            raise ValueError("Unexpected batch result shape")
+        except Exception as e:
+            err_str = str(e).lower()
+            is_throttle = "throttl" in err_str or "rate" in err_str or "too many" in err_str
+            if is_throttle and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f"  Throttled, retrying in {delay:.0f}s (attempt {attempt + 2}/{max_retries})...")
+                time.sleep(delay)
+                continue
+            # Last attempt or non-throttle error: fall back to per-text
+            results: List[Optional[List[float]]] = []
+            for t in texts:
+                for sub_attempt in range(max_retries):
+                    try:
+                        v = embedding_model.embed_query(t)
+                        results.append(v if isinstance(v, list) else None)
+                        break
+                    except Exception as sub_e:
+                        sub_err = str(sub_e).lower()
+                        if ("throttl" in sub_err or "rate" in sub_err or "too many" in sub_err) and sub_attempt < max_retries - 1:
+                            time.sleep(base_delay * (2 ** sub_attempt))
+                            continue
+                        results.append(None)
+                        break
+            return results
+    return [None] * len(texts)
+
+
 def compute_and_store_corpus_embeddings(
     conn,
     model_name: str,
     embedding_model,
+    *,
+    batch_size: int = 16,
 ) -> int:
-    """Compute embeddings for all pages missing the model's column and store them."""
+    """Compute embeddings for all pages missing the model's column and store them.
+
+    Uses small batches + exponential backoff to handle API throttling.
+    """
     ensure_embedding_columns(conn, model_name)
     blob_col = _emb_col(model_name)
 
@@ -132,38 +202,33 @@ def compute_and_store_corpus_embeddings(
 
     ids = [int(r[0]) for r in rows]
     texts = [str(r[1] or "") for r in rows]
+    total = len(texts)
 
-    print(f"  Computing embeddings for {len(texts)} pages...")
-
-    vecs: List[Optional[List[float]]] = []
-    for i, batch in enumerate(iter_batched(texts, batch_size=64)):
-        try:
-            batch_vecs = embedding_model.embed_documents(batch)
-            if isinstance(batch_vecs, list) and len(batch_vecs) == len(batch):
-                vecs.extend(batch_vecs)
-            else:
-                raise ValueError("Unexpected batch result")
-        except Exception:
-            for t in batch:
-                try:
-                    v = embedding_model.embed_query(t)
-                    vecs.append(v if isinstance(v, list) else None)
-                except Exception:
-                    vecs.append(None)
-        done = min(len(vecs), len(texts))
-        if (i + 1) % 10 == 0 or done == len(texts):
-            print(f"  Embedded {done}/{len(texts)} pages")
+    print(f"  Computing embeddings for {total} pages (batch_size={batch_size})...")
 
     stored = 0
-    with conn:
-        for row_id, v in zip(ids, vecs):
-            if not isinstance(v, list) or not v:
-                continue
-            arr = np.asarray(v, dtype=np.float32)
-            store_page_embedding(
-                conn, model_name, row_id=row_id, embedding=arr,
-            )
-            stored += 1
+    processed = 0
+    for batch_ids, batch_texts in zip(
+        iter_batched(ids, batch_size=batch_size),
+        iter_batched(texts, batch_size=batch_size),
+    ):
+        vecs = _embed_batch_with_retry(embedding_model, batch_texts)
+
+        # Store immediately after each batch (resume-safe)
+        with conn:
+            for row_id, v in zip(batch_ids, vecs):
+                if not isinstance(v, list) or not v:
+                    continue
+                arr = np.asarray(v, dtype=np.float32)
+                store_page_embedding(
+                    conn, model_name, row_id=row_id, embedding=arr,
+                )
+                stored += 1
+
+        processed += len(batch_texts)
+        if processed % (batch_size * 10) == 0 or processed == total:
+            print(f"  Embedded {processed}/{total} pages (stored: {stored})")
+
     return stored
 
 
@@ -285,8 +350,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="SQLite DB path (default: processed/pdf_page_store.sqlite)",
     )
     parser.add_argument(
-        "--provider", type=str, choices=["auto", "openai", "azure"], default="auto",
-        help="Embedding provider (default: auto-detect)",
+        "--provider", type=str,
+        choices=["auto", "openai", "azure", "bedrock"],
+        default="auto",
+        help="Embedding provider (default: auto-detect from env vars)",
     )
     parser.add_argument(
         "--output", type=str, default=None,
