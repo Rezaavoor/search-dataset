@@ -78,8 +78,33 @@ def parse_json_col(value: Any) -> List[str]:
 # ============================================================================
 # Embedding model setup
 # ============================================================================
+def _detect_provider(provider: str) -> str:
+    """Resolve 'auto' provider to a concrete provider name."""
+    if provider != "auto":
+        return provider
+    if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
+        return "azure"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    if os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_BEDROCK_REGION"):
+        return "bedrock"
+    raise ValueError(
+        "No API credentials found. Set OPENAI_API_KEY, Azure vars, "
+        "or AWS_ACCESS_KEY_ID + AWS_BEDROCK_REGION."
+    )
+
+
+def _is_cohere_model(model: str) -> bool:
+    """Check if the model ID refers to a Cohere embedding model."""
+    m = model.lower()
+    return "cohere" in m or m.startswith("eu.cohere") or m.startswith("us.cohere")
+
+
 def setup_embedding_model(model: str, provider: str = "auto"):
-    """Set up an embedding model.
+    """Set up an embedding model for **document** embedding.
+
+    For Bedrock Cohere models this uses ``input_type="search_document"``,
+    which is the correct mode for indexing corpus pages.
 
     Providers:
       - openai: Uses OPENAI_API_KEY
@@ -87,18 +112,7 @@ def setup_embedding_model(model: str, provider: str = "auto"):
       - bedrock: Uses AWS credentials (AWS_ACCESS_KEY_ID/SECRET or default profile)
       - auto: Detects from env vars
     """
-    if provider == "auto":
-        if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
-            provider = "azure"
-        elif os.environ.get("OPENAI_API_KEY"):
-            provider = "openai"
-        elif os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_BEDROCK_REGION"):
-            provider = "bedrock"
-        else:
-            raise ValueError(
-                "No API credentials found. Set OPENAI_API_KEY, Azure vars, "
-                "or AWS_ACCESS_KEY_ID + AWS_BEDROCK_REGION."
-            )
+    provider = _detect_provider(provider)
 
     if provider == "azure":
         from langchain_openai import AzureOpenAIEmbeddings
@@ -129,6 +143,33 @@ def setup_embedding_model(model: str, provider: str = "auto"):
 
         print(f"  Provider: OpenAI (model: {model})")
         return OpenAIEmbeddings(model=model)
+
+
+def setup_query_embedding_model(model: str, provider: str = "auto"):
+    """Set up an embedding model for **query** embedding.
+
+    For Bedrock Cohere models this configures ``input_type="search_query"``
+    so that queries receive the correct asymmetric special tokens.
+    For non-Cohere models this returns the same model as
+    ``setup_embedding_model`` (symmetric models don't distinguish).
+    """
+    provider = _detect_provider(provider)
+
+    if provider == "bedrock" and _is_cohere_model(model):
+        import boto3
+        from langchain_aws.embeddings import BedrockEmbeddings
+
+        region = os.environ.get("AWS_BEDROCK_REGION", "eu-central-1")
+        client = boto3.client("bedrock-runtime", region_name=region)
+        print(f"  Query embedder: AWS Bedrock (model: {model}, input_type: search_query)")
+        return BedrockEmbeddings(
+            client=client,
+            model_id=model,
+            model_kwargs={"input_type": "search_query"},
+        )
+
+    # For OpenAI / Azure / non-Cohere Bedrock: symmetric — same model works
+    return setup_embedding_model(model, provider)
 
 
 # ============================================================================
@@ -452,18 +493,19 @@ def main() -> int:
     print(f"\n[3/5] Embedding {len(df)} queries")
     queries = df["user_input"].tolist()
 
-    if emb_model is None:
-        emb_model = setup_embedding_model(model_name, args.provider)
+    # Use a query-specific embedding model so that asymmetric models
+    # (e.g., Cohere) receive the correct input_type="search_query".
+    query_emb_model = setup_query_embedding_model(model_name, args.provider)
 
     try:
-        query_embeddings = emb_model.embed_documents(queries)
+        query_embeddings = query_emb_model.embed_documents(queries)
         print(f"  Embedded {len(queries)} queries (batched)")
     except Exception as e:
         print(f"  Batch embedding failed ({e}), falling back to per-query...")
         query_embeddings = []
         for q in queries:
             try:
-                query_embeddings.append(emb_model.embed_query(q))
+                query_embeddings.append(query_emb_model.embed_query(q))
             except Exception:
                 query_embeddings.append(None)
 
@@ -575,6 +617,44 @@ def main() -> int:
         ),
     }
 
+    # Dataset quality diagnostics
+    positive_set_sizes = []
+    for r in valid_results:
+        pos = r.get("positives", [])
+        positive_set_sizes.append(len(pos) if isinstance(pos, list) else 0)
+
+    quality_warnings: List[str] = []
+    if n_valid < 50:
+        quality_warnings.append(
+            f"Small query set (n={n_valid}). Results may have high variance. "
+            f"Consider generating >= 100 queries."
+        )
+    large_pos = sum(1 for s in positive_set_sizes if s > 50)
+    if large_pos > 0:
+        quality_warnings.append(
+            f"{large_pos}/{n_valid} queries have >50 positive pages. "
+            f"This may indicate boilerplate contamination in ground truth. "
+            f"Run: python refine_dataset.py --dataset <your_csv> --analyze-only"
+        )
+    huge_pos = sum(1 for s in positive_set_sizes if s > 100)
+    if huge_pos > 0:
+        quality_warnings.append(
+            f"{huge_pos}/{n_valid} queries have >100 positive pages — likely "
+            f"inflated by shared headers/footers. Use refine_dataset.py to fix."
+        )
+
+    dataset_quality: Dict[str, Any] = {
+        "positive_set_sizes": {
+            "min": int(min(positive_set_sizes)) if positive_set_sizes else 0,
+            "max": int(max(positive_set_sizes)) if positive_set_sizes else 0,
+            "mean": float(np.mean(positive_set_sizes)) if positive_set_sizes else 0.0,
+            "median": float(np.median(positive_set_sizes)) if positive_set_sizes else 0.0,
+        },
+        "queries_with_large_positives_gt50": large_pos,
+        "queries_with_huge_positives_gt100": huge_pos,
+        "warnings": quality_warnings,
+    }
+
     # Print summary
     print(f"\n{'=' * 60}")
     print(f"Results: {model_name}")
@@ -590,6 +670,18 @@ def main() -> int:
         if all_hn_ranks:
             print(f"    Mean hard negative rank: {np.mean(all_hn_ranks):.1f}")
         print(f"    Hard neg outranks positive: {hn_analysis['hard_neg_outranks_positive_pct']:.1%}")
+
+    # Print dataset quality info
+    print()
+    print(f"  Dataset quality:")
+    print(f"    Positive set sizes: min={dataset_quality['positive_set_sizes']['min']}, "
+          f"max={dataset_quality['positive_set_sizes']['max']}, "
+          f"mean={dataset_quality['positive_set_sizes']['mean']:.1f}, "
+          f"median={dataset_quality['positive_set_sizes']['median']:.1f}")
+    if quality_warnings:
+        print()
+        for w in quality_warnings:
+            print(f"  ⚠ WARNING: {w}")
     print(f"{'=' * 60}")
 
     # Build output
@@ -600,6 +692,7 @@ def main() -> int:
         "top_k_values": top_k_values,
         "metrics": agg_metrics,
         "hard_negative_analysis": hn_analysis,
+        "dataset_quality": dataset_quality,
         "per_query": per_query_results,
     }
 
