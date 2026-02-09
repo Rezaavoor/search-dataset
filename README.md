@@ -430,30 +430,47 @@ Results are saved to `output/eval_text_embedding_3_large.json` and a summary is 
 ### Flags
 
 - `--dataset` (required): Path to the generated dataset CSV
-- `--embedding-model` (required): Model name matching a column in SQLite
+- `--embedding-model` (required): Model name or deployment ID (e.g., `text-embedding-3-large`, `eu.cohere.embed-v4:0`)
 - `--top-k`: K values to evaluate (default: `1 5 10 20`)
 - `--pdf-store-db`: Custom SQLite path (default: `processed/pdf_page_store.sqlite`)
-- `--provider`: `auto` / `openai` / `azure` (for embedding queries)
+- `--provider`: `auto` / `openai` / `azure` / `bedrock` (default: auto-detect from env vars)
 - `--output`: Custom output path (default: `output/eval_{model}.json`)
+
+### Supported embedding providers
+
+| Provider | `--provider` | Env vars needed | Example model |
+|----------|-------------|-----------------|---------------|
+| OpenAI | `openai` | `OPENAI_API_KEY` | `text-embedding-3-large` |
+| Azure OpenAI | `azure` | `AZURE_OPENAI_*` | `text-embedding-3-large` |
+| AWS Bedrock | `bedrock` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_BEDROCK_REGION` | `eu.cohere.embed-v4:0` |
+
+With `--provider auto`, the script detects the provider from environment variables (Azure > OpenAI > Bedrock).
 
 ### Evaluating a new model
 
 When you specify a model that doesn't have embeddings in SQLite yet, the script automatically:
 1. Adds model-specific columns to the SQLite table
-2. Embeds all corpus pages using that model (one-time cost)
-3. Stores the embeddings for future reuse
+2. Embeds all corpus pages using that model (one-time cost, with retry/backoff for throttling)
+3. Stores embeddings after each batch (resume-safe -- if interrupted, re-run picks up where it left off)
 4. Proceeds with evaluation
 
 ```bash
-# First run: embeds all 24K pages (takes a while, costs API credits)
+# OpenAI model
 python evaluate_search.py \
   --dataset output/dataset_with_negatives_v11.csv \
   --embedding-model text-embedding-3-small
 
-# Second run: instant (embeddings loaded from SQLite)
+# AWS Bedrock / Cohere model
 python evaluate_search.py \
   --dataset output/dataset_with_negatives_v11.csv \
-  --embedding-model text-embedding-3-small
+  --embedding-model eu.cohere.embed-v4:0 \
+  --provider bedrock
+
+# Second run with same model: instant (embeddings loaded from SQLite)
+python evaluate_search.py \
+  --dataset output/dataset_with_negatives_v11.csv \
+  --embedding-model eu.cohere.embed-v4:0 \
+  --provider bedrock
 ```
 
 ---
