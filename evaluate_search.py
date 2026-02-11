@@ -300,6 +300,14 @@ def cosine_similarity_search(
 # ============================================================================
 # Scoring
 # ============================================================================
+def _dcg_at_k(relevances: List[int], k: int) -> float:
+    """Compute Discounted Cumulative Gain at rank k."""
+    dcg = 0.0
+    for i, rel in enumerate(relevances[:k]):
+        dcg += rel / np.log2(i + 2)  # i is 0-indexed, so rank = i+1, log2(rank+1) = log2(i+2)
+    return dcg
+
+
 def compute_metrics(
     ranked: List[Tuple[str, float]],
     positives: set,
@@ -323,8 +331,15 @@ def compute_metrics(
         hit = 1 if positives & top_k_keys else 0
         results[f"recall@{k}"] = hit
 
-    # Reciprocal Rank
+    # Reciprocal Rank (unbounded)
     results["reciprocal_rank"] = (1.0 / first_positive_rank) if first_positive_rank else 0.0
+
+    # MRR@K — reciprocal rank truncated at K (0 if first positive is beyond K)
+    for k in top_k_values:
+        if first_positive_rank is not None and first_positive_rank <= k:
+            results[f"mrr@{k}"] = 1.0 / first_positive_rank
+        else:
+            results[f"mrr@{k}"] = 0.0
 
     # Average Precision
     num_relevant = 0
@@ -336,6 +351,21 @@ def compute_metrics(
     results["average_precision"] = (
         (precision_sum / len(positives)) if positives else 0.0
     )
+
+    # nDCG@K — binary relevance
+    # Build relevance vector for as many ranks as we need
+    max_k = max(top_k_values)
+    relevances = [
+        1 if page_key in positives else 0
+        for page_key, _ in ranked[:max_k]
+    ]
+    # Ideal relevance: all positives at the top
+    n_pos = len(positives)
+    for k in top_k_values:
+        dcg = _dcg_at_k(relevances, k)
+        ideal_rels = [1] * min(n_pos, k) + [0] * max(0, k - n_pos)
+        idcg = _dcg_at_k(ideal_rels, k)
+        results[f"ndcg@{k}"] = (dcg / idcg) if idcg > 0 else 0.0
 
     # Hard negative analysis
     hard_neg_ranks: List[int] = []
@@ -591,11 +621,16 @@ def main() -> int:
     # Aggregate metrics
     agg_metrics: Dict[str, float] = {}
     for k in top_k_values:
-        key = f"recall@{k}"
-        agg_metrics[key] = sum(r[key] for r in valid_results) / n_valid
+        agg_metrics[f"recall@{k}"] = sum(r[f"recall@{k}"] for r in valid_results) / n_valid
 
     agg_metrics["mrr"] = sum(r["reciprocal_rank"] for r in valid_results) / n_valid
+    for k in top_k_values:
+        agg_metrics[f"mrr@{k}"] = sum(r[f"mrr@{k}"] for r in valid_results) / n_valid
+
     agg_metrics["map"] = sum(r["average_precision"] for r in valid_results) / n_valid
+
+    for k in top_k_values:
+        agg_metrics[f"ndcg@{k}"] = sum(r[f"ndcg@{k}"] for r in valid_results) / n_valid
 
     # Hard negative analysis
     results_with_hn = [r for r in valid_results if r.get("hard_negative_ranks")]
