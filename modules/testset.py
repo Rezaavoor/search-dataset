@@ -17,11 +17,23 @@ from ragas.testset.transforms import apply_transforms, default_transforms
 
 import pandas as pd
 
+import re as _re
+
 from .config import REFERENTIAL_QUERY_RE, RAGAS_DOC_EXTRACT_CACHE_VERSION
 from .db import pdf_store_persist_ragas_extractions
 from .hard_negatives import find_source_files
 from .transforms import patch_transforms_with_safe_splitter
 from .utils import parse_reference_contexts, strip_hop_prefix, utc_now_iso
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse all whitespace runs (spaces, newlines, tabs) to a single space.
+
+    RAGAS sometimes inserts extra spaces around newlines when building
+    reference contexts from KG nodes.  This normaliser lets us match
+    reference-context text back to page content despite those differences.
+    """
+    return _re.sub(r"\s+", " ", text.lower()).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -285,34 +297,44 @@ def _build_kg_page_content_index(
     """Build a lookup from normalised page_content → source metadata.
 
     Only DOCUMENT nodes are used (they carry page-level metadata).
-    The key is the lowercased, stripped ``page_content``; the value is a
-    dict with ``source`` (absolute path) and ``page`` (0-indexed).
+    Returns **two** dicts:
+
+    * ``exact`` — keyed by lowercased, stripped ``page_content``
+    * ``ws``    — keyed by whitespace-collapsed ``page_content``
+      (via ``_normalize_ws``), used as a fallback when RAGAS has
+      inserted extra spaces or newlines into reference contexts.
     """
-    index: Dict[str, Dict[str, Any]] = {}
+    exact: Dict[str, Dict[str, Any]] = {}
+    ws: Dict[str, Dict[str, Any]] = {}
     for node in kg.nodes:
         if node.type != NodeType.DOCUMENT:
             continue
         md = node.get_property("document_metadata")
         if not isinstance(md, dict):
             continue
-        pc = str(node.get_property("page_content") or "").lower().strip()
+        pc_raw = str(node.get_property("page_content") or "")
+        pc = pc_raw.lower().strip()
         if not pc:
             continue
         source = md.get("source")
         page = md.get("page")
         if source is None:
             continue
+        info = {"source": str(source), "page": page}
         # First node wins (should be unique per page anyway)
-        if pc not in index:
-            index[pc] = {"source": str(source), "page": page}
-    return index
+        if pc not in exact:
+            exact[pc] = info
+        pc_ws = _normalize_ws(pc_raw)
+        if pc_ws not in ws:
+            ws[pc_ws] = info
+    return {"exact": exact, "ws": ws}
 
 
 def _find_sources_from_kg(
     reference_contexts: List[str],
     kg: KnowledgeGraph,
     *,
-    _kg_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    _kg_index: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Map reference contexts back to their KG source nodes.
 
@@ -324,14 +346,21 @@ def _find_sources_from_kg(
 
     Matching strategy (per hop context, after stripping ``<N-hop>``):
       1. Exact match — context text == node page_content.
-      2. Containment — context is a substring of a node, or vice-versa;
+      2. Whitespace-normalised exact match (collapses all whitespace to
+         single spaces before comparison — handles RAGAS inserting extra
+         spaces/newlines when it builds reference contexts).
+      3. Containment — context is a substring of a node, or vice-versa;
          pick the node with the largest overlap.
-      3. Head-chunk fallback — first 150 chars of context found in a node.
+      4. Whitespace-normalised containment.
+      5. Head-chunk fallback — first 150 normalised chars.
 
     Returns at most **one source page per hop context**.
     """
     if _kg_index is None:
         _kg_index = _build_kg_page_content_index(kg)
+
+    exact_index = _kg_index["exact"]
+    ws_index = _kg_index["ws"]
 
     all_sources: List[str] = []
     all_sources_with_pages: List[str] = []
@@ -342,18 +371,26 @@ def _find_sources_from_kg(
         ctx = strip_hop_prefix(str(raw_context)).lower().strip()
         if not ctx:
             continue
+        ctx_ws = _normalize_ws(raw_context)
 
         # --- Strategy 1: exact match ---
-        info = _kg_index.get(ctx)
+        info = exact_index.get(ctx)
         if info is not None:
             _append_source(info, all_sources, all_sources_with_pages,
                            all_page_numbers, seen_pairs)
             continue
 
-        # --- Strategy 2: containment (best overlap) ---
+        # --- Strategy 2: whitespace-normalised exact match ---
+        info = ws_index.get(ctx_ws)
+        if info is not None:
+            _append_source(info, all_sources, all_sources_with_pages,
+                           all_page_numbers, seen_pairs)
+            continue
+
+        # --- Strategy 3: containment on exact text (best overlap) ---
         best_info: Optional[Dict[str, Any]] = None
         best_overlap = 0
-        for pc, node_info in _kg_index.items():
+        for pc, node_info in exact_index.items():
             overlap = 0
             if ctx in pc:
                 overlap = len(ctx)
@@ -368,11 +405,29 @@ def _find_sources_from_kg(
                            all_page_numbers, seen_pairs)
             continue
 
-        # --- Strategy 3: head-chunk fallback ---
-        if len(ctx) > 150:
-            head = ctx[:150]
-            for pc, node_info in _kg_index.items():
-                if head in pc:
+        # --- Strategy 4: whitespace-normalised containment ---
+        best_info = None
+        best_overlap = 0
+        for pc_ws, node_info in ws_index.items():
+            overlap = 0
+            if ctx_ws in pc_ws:
+                overlap = len(ctx_ws)
+            elif pc_ws in ctx_ws:
+                overlap = len(pc_ws)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_info = node_info
+
+        if best_info is not None:
+            _append_source(best_info, all_sources, all_sources_with_pages,
+                           all_page_numbers, seen_pairs)
+            continue
+
+        # --- Strategy 5: head-chunk fallback (normalised) ---
+        if len(ctx_ws) > 100:
+            head = ctx_ws[:100]
+            for pc_ws, node_info in ws_index.items():
+                if head in pc_ws:
                     _append_source(node_info, all_sources,
                                    all_sources_with_pages,
                                    all_page_numbers, seen_pairs)
