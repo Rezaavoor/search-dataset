@@ -10,6 +10,7 @@ The main entrypoint is `generate_synthetic_dataset.py`.
 
 ```
 generate_synthetic_dataset.py   # Generate synthetic Q&A dataset from PDFs
+generate_single_hop.py          # Standalone parallel single-hop generator (no KG)
 evaluate_search.py              # Evaluate embedding model search quality
 modules/
   config.py                     # Constants and defaults
@@ -21,6 +22,7 @@ modules/
   synthesizers.py               # Query synthesizers + distribution building
   hard_negatives.py             # Hard negative mining (BM25, embedding, LLM judge)
   testset.py                    # KG building, testset gen/save, persona management
+  single_hop.py                 # Reusable single-hop generation (no KG needed)
 output/                         # Generated datasets + evaluation results
 processed/                      # Cached intermediate artifacts (KG, personas, SQLite store)
 ```
@@ -72,6 +74,46 @@ Common flags:
 - `--no-cache` (disable cache reuse for KG/personas)
 - `--reprocess` (ignore caches and rebuild everything)
 
+### World-based generation (full corpus single-hop + per-world multi-hop)
+
+When the corpus is too large to build a single Knowledge Graph, use **world mode** to:
+1. Generate **single-hop queries** from the **full corpus** (no KG required)
+2. Generate **multi-hop queries** from **per-world KGs** (one KG per subfolder/world)
+
+```bash
+python generate_synthetic_dataset.py \
+  --input-dir search-dataset \
+  --multi-hop-worlds Claires "Law worlds/415" "Law worlds/416" \
+  --testset-size 200 \
+  --output combined_dataset
+```
+
+This generates ~100 single-hop queries from the full corpus + ~100 multi-hop queries split across the three worlds (~33 each).
+
+You can also set the split explicitly:
+
+```bash
+python generate_synthetic_dataset.py \
+  --input-dir search-dataset \
+  --multi-hop-worlds Claires "Law worlds/415" "Law worlds/416" \
+  --single-hop-size 300 \
+  --multi-hop-size 100 \
+  --output combined_dataset
+```
+
+World-mode flags:
+- `--multi-hop-worlds world1 world2 ...` (activates world mode; paths relative to `--input-dir`, supports nested paths like `"Law worlds/415"`)
+- `--single-hop-size N` (single-hop queries from full corpus; default: `testset-size / 2`)
+- `--multi-hop-size N` (total multi-hop queries across all worlds; default: `testset-size / 2`)
+- `--seed N` (random seed for single-hop file sampling)
+
+How it works:
+- **Single-hop**: randomly samples PDFs from the full SQLite store, picks the best page per file, and generates a Q&A pair using the LLM (similar to `generate_single_hop.py`). No KG is needed.
+- **Multi-hop**: for each world subfolder, collects PDFs, loads docs, builds (or loads cached) a per-world KG, and generates multi-hop queries using only multi-hop RAGAS synthesizers.
+- **Output**: a combined CSV/JSON with a `synthesizer_name` column (`single_hop_direct` or `multi_hop_ragas`) and a `world` column for multi-hop rows.
+
+Without `--multi-hop-worlds`, the script falls back to the original single-KG pipeline.
+
 ### Hard negative mining (for IR evaluation)
 
 ```bash
@@ -98,7 +140,9 @@ Hard negative flags:
 
 ## Pipeline steps
 
-The script runs a clear step-by-step pipeline with progress indicators:
+The script runs a clear step-by-step pipeline with progress indicators.
+
+**Legacy mode** (no `--multi-hop-worlds`):
 
 ```
 [Step 1/9] Collecting PDF paths
@@ -112,7 +156,22 @@ The script runs a clear step-by-step pipeline with progress indicators:
 [Step 9/9] Saving results
 ```
 
-When hard negatives are enabled, a "Mining hard negatives" step is added before saving. The step count adjusts dynamically based on which optional features (PDF profiles, hard negatives) are enabled.
+**World mode** (`--multi-hop-worlds Claires "Law worlds/415" "Law worlds/416"`):
+
+```
+[Step 1/9] Collecting PDF paths
+[Step 2/9] Setting up LLM & embeddings
+[Step 3/9] Syncing SQLite PDF store
+[Step 4/9] Loading documents from SQLite store
+[Step 5/9] Building PDF profiles
+[Step 6/9] Generating single-hop queries (full corpus)
+[Step 7/9] Multi-hop for world: Claires (1/3)
+[Step 8/9] Multi-hop for world: Law worlds/415 (2/3)
+[Step 9/9] Multi-hop for world: Law worlds/416 (3/3)
+[Step 10/10] Saving results
+```
+
+The step count adjusts dynamically based on which optional features (PDF profiles, hard negatives, number of worlds) are enabled.
 
 ---
 
