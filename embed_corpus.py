@@ -202,17 +202,52 @@ def _create_azure_client(cred: Dict[str, str]):
     )
 
 
-def _create_bedrock_client(model: str):
-    """Create a LangChain BedrockEmbeddings client for Cohere."""
-    import boto3
-    from langchain_aws.embeddings import BedrockEmbeddings
+class _DirectBedrockCohereEmbedder:
+    """Direct Bedrock API wrapper for Cohere Embed v4.
 
+    Bypasses langchain_aws which has parameter compatibility issues with
+    Cohere v4.  Uses the same proven approach as run_mleb.py.
+    """
+
+    def __init__(self, model_id: str, region: str = "eu-central-1"):
+        import boto3
+        self.model_id = model_id
+        self.client = boto3.client("bedrock-runtime", region_name=region)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed a batch of texts as documents (search_document input_type)."""
+        import json as _json
+
+        body = _json.dumps({
+            "texts": texts,
+            "input_type": "search_document",
+            "embedding_types": ["float"],
+        })
+        response = self.client.invoke_model(
+            body=body,
+            modelId=self.model_id,
+            accept="*/*",
+            contentType="application/json",
+        )
+        response_body = _json.loads(response["body"].read())
+
+        embeddings = response_body.get("embeddings", {})
+        if isinstance(embeddings, dict) and "float" in embeddings:
+            return embeddings["float"]
+        if isinstance(embeddings, list):
+            return embeddings
+        raise ValueError(f"Unexpected Bedrock Cohere response: {list(response_body.keys())}")
+
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single text (fallback, uses search_document type)."""
+        results = self.embed_documents([text])
+        return results[0] if results else []
+
+
+def _create_bedrock_client(model: str):
+    """Create a direct Bedrock Cohere embedder (bypasses langchain_aws)."""
     region = os.environ.get("AWS_BEDROCK_REGION", "eu-central-1")
-    client = boto3.client("bedrock-runtime", region_name=region)
-    return BedrockEmbeddings(
-        client=client,
-        model_id=model,
-    )
+    return _DirectBedrockCohereEmbedder(model_id=model, region=region)
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +460,13 @@ def embed_corpus(
         ORDER BY id
         """
     ).fetchall()
+
+    # Filter out pages with empty/whitespace-only content — these can't be embedded
+    # and would cause API errors (especially with Cohere)
+    empty_ids = [int(r[0]) for r in rows if not str(r[1] or "").strip()]
+    rows = [r for r in rows if str(r[1] or "").strip()]
+    if empty_ids:
+        log.info("Skipping %d pages with empty content (can't embed empty text)", len(empty_ids))
 
     total_in_db = conn.execute("SELECT COUNT(*) FROM pdf_page_store").fetchone()[0]
     already_done = total_in_db - len(rows)
