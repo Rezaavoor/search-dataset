@@ -935,9 +935,22 @@ def _run_world_pipeline(
                     world_df, world_docs, strict=True, kg=world_kg,
                 )
 
+                # Drop queries whose source pages could not be resolved
+                before_filter = len(world_df)
+                has_source = world_df["source_files_with_pages"].apply(
+                    lambda x: "unknown" not in str(x).lower()
+                )
+                world_df = world_df[has_source].reset_index(drop=True)
+                dropped = before_filter - len(world_df)
+                if dropped:
+                    print(
+                        f"  Dropped {dropped}/{before_filter} queries "
+                        f"with unresolvable source pages"
+                    )
+
             multi_hop_dfs.append(world_df)
             print(
-                f"  Generated {len(world_df)} multi-hop queries "
+                f"  Kept {len(world_df)} multi-hop queries "
                 f"for world '{world_name}'"
             )
 
