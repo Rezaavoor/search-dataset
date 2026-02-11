@@ -50,7 +50,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 load_dotenv(SCRIPT_DIR / ".env")
 
-from modules.utils import extract_json_object, normalize_ynu, truncate_for_judge
+from modules.utils import extract_json_object, normalize_ynu, strip_hop_prefix, truncate_for_judge
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -235,12 +235,80 @@ def _parse_hard_negatives(value) -> List[Tuple[str, int]]:
     return results
 
 
+def _fetch_positive_page_content(
+    row,
+    conn: Optional[sqlite3.Connection],
+) -> Optional[str]:
+    """Fetch the actual page content for the labeled positive page(s) from SQLite.
+
+    This ensures the validator checks whether the LABELED source pages
+    actually answer the query — not the reference_contexts (which may
+    contain text from pages that were never mapped to the positive label).
+
+    Falls back to None if no content can be fetched (caller should use
+    reference_contexts as a fallback).
+    """
+    if conn is None:
+        return None
+
+    # Try source_files_with_pages (JSON array — works for both single- and multi-hop)
+    raw = row.get("source_files_with_pages")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            items = json.loads(raw)
+        except Exception:
+            items = []
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+
+    # Also try the single-hop column
+    sfwp = row.get("source_file_with_page")
+    if isinstance(sfwp, str) and sfwp.strip() and sfwp.strip().lower() != "nan":
+        if sfwp.strip() not in items:
+            items.insert(0, sfwp.strip())
+
+    if not items:
+        return None
+
+    page_texts = []
+    for item in items:
+        parsed = _parse_page_ref(str(item))
+        if parsed is None:
+            continue
+        fname, page_num = parsed
+        content = _fetch_page_content(conn, fname, page_num)
+        if content:
+            page_texts.append(content)
+
+    return "\n\n".join(page_texts) if page_texts else None
+
+
+def _parse_page_ref(ref: str) -> Optional[tuple]:
+    """Parse 'filename.pdf (page N)' into (filename, page_number)."""
+    ref = ref.strip()
+    if " (page " in ref and ref.endswith(")"):
+        idx = ref.rfind(" (page ")
+        fname = ref[:idx].strip()
+        try:
+            page = int(ref[idx + 7:-1])
+            return (fname, page)
+        except ValueError:
+            return None
+    return None
+
+
 def _parse_reference_contexts(value) -> List[str]:
-    """Parse reference_contexts column into a list of strings."""
+    """Parse reference_contexts column into a list of strings.
+
+    Strips ``<N-hop>`` prefixes that multi-hop rows include so the LLM
+    judge sees clean passage text.
+    """
     if pd.isna(value) or not value:
         return []
     if isinstance(value, list):
-        return [str(v) for v in value if v is not None]
+        return [strip_hop_prefix(str(v)) for v in value if v is not None]
     if isinstance(value, str):
         s = value.strip()
         if not s:
@@ -248,17 +316,51 @@ def _parse_reference_contexts(value) -> List[str]:
         try:
             v = json.loads(s)
             if isinstance(v, list):
-                return [str(x) for x in v if x is not None]
-            return [str(v)]
+                return [strip_hop_prefix(str(x)) for x in v if x is not None]
+            return [strip_hop_prefix(str(v))]
         except Exception:
             try:
                 v = ast.literal_eval(s)
                 if isinstance(v, list):
-                    return [str(x) for x in v if x is not None]
-                return [str(v)]
+                    return [strip_hop_prefix(str(x)) for x in v if x is not None]
+                return [strip_hop_prefix(str(v))]
             except Exception:
-                return [s]
-    return [str(value)]
+                return [strip_hop_prefix(s)]
+    return [strip_hop_prefix(str(value))]
+
+
+def _resolve_source_display(row) -> str:
+    """Return a human-readable source string for both single-hop and multi-hop rows.
+
+    Single-hop rows have ``source_file_with_page`` populated directly.
+    Multi-hop rows leave that column empty and instead populate
+    ``source_files_with_pages_readable`` (comma-separated) or
+    ``source_files_with_pages`` (JSON array).  This helper falls back
+    through all three.
+    """
+    # 1. Try the single-hop column
+    sfwp = row.get("source_file_with_page")
+    if isinstance(sfwp, str) and sfwp.strip() and sfwp.strip().lower() != "nan":
+        return sfwp.strip()
+
+    # 2. Try the readable multi-hop column
+    readable = row.get("source_files_with_pages_readable")
+    if isinstance(readable, str) and readable.strip() and readable.strip().lower() != "nan":
+        return readable.strip()
+
+    # 3. Parse the JSON array column
+    raw = row.get("source_files_with_pages")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            items = json.loads(raw)
+            if isinstance(items, list):
+                valid = [str(x) for x in items if x and str(x).lower() != "unknown"]
+                if valid:
+                    return ", ".join(valid)
+        except Exception:
+            pass
+
+    return "(source unknown)"
 
 
 # ============================================================================
@@ -510,8 +612,8 @@ def main() -> int:
         answer = str(row.get("reference", ""))
         contexts = _parse_reference_contexts(row.get("reference_contexts"))
         context_text = "\n\n".join(contexts) if contexts else ""
-        source_file = str(row.get("source_file", ""))
-        source_with_page = str(row.get("source_file_with_page", ""))
+        source_with_page = _resolve_source_display(row)
+        synth_name = str(row.get("synthesizer_name", "")).strip()
         hard_negs_raw = row.get("hard_negatives", "[]")
 
         log.info("[%d/%d] Evaluating: %.80s...", idx + 1, len(df), query)
@@ -520,7 +622,12 @@ def main() -> int:
         qc = evaluate_query_quality(llm, query, idx)
 
         # --- 2. Source Answerability ---
-        sa = evaluate_source_answerability(llm, query, answer, context_text, idx)
+        # For proper validation we check whether the LABELED positive page(s)
+        # actually answer the query — not the reference_contexts which may
+        # come from different (possibly correct) pages that were never mapped.
+        positive_page_text = _fetch_positive_page_content(row, conn)
+        sa_context = positive_page_text if positive_page_text else context_text
+        sa = evaluate_source_answerability(llm, query, answer, sa_context, idx)
 
         # --- 3. Hard Negative Quality ---
         hn_evaluations: List[Dict[str, Any]] = []
@@ -554,6 +661,7 @@ def main() -> int:
             "query": query,
             "answer": answer[:200],
             "source_file_with_page": source_with_page,
+            "synthesizer_name": synth_name,
             "query_quality": qc,
             "source_answerability": sa,
             "hard_negative_count": len(hard_neg_pairs),
@@ -654,6 +762,19 @@ def main() -> int:
         h for h in hn_evaluated
         if h.get("answers_the_query") in ("yes", "Yes")
     ]
+
+    # --- Per synthesizer type breakdown ---
+    synth_types = sorted(set(r.get("synthesizer_name", "") for r in row_results))
+    synth_breakdown: Dict[str, Dict[str, int]] = {}
+    for st in synth_types:
+        st_rows = [r for r in row_results if r.get("synthesizer_name", "") == st]
+        synth_breakdown[st or "(unknown)"] = {
+            "count": len(st_rows),
+            "qc_pass": sum(1 for r in st_rows if r["query_quality"].get("verdict") == "pass"),
+            "qc_fail": sum(1 for r in st_rows if r["query_quality"].get("verdict") == "fail"),
+            "sa_pass": sum(1 for r in st_rows if r["source_answerability"].get("verdict") == "pass"),
+            "sa_fail": sum(1 for r in st_rows if r["source_answerability"].get("verdict") == "fail"),
+        }
 
     # --- Rows with ALL checks passing ---
     fully_passing = sum(
@@ -756,6 +877,7 @@ def main() -> int:
                 "fully_passing_rows": fully_passing,
                 "fully_passing_rate": round(fully_passing / max(evaluated, 1) * 100, 1),
             },
+            "by_synthesizer": synth_breakdown,
         },
         "failures": {
             "query_quality_issues": query_quality_failures,
@@ -778,6 +900,7 @@ def main() -> int:
     for r in row_results:
         csv_rows.append({
             "row_index": r["row_index"],
+            "synthesizer": r.get("synthesizer_name", ""),
             "query": r["query"][:120],
             "source": r["source_file_with_page"],
             "query_quality_verdict": r["query_quality"].get("verdict"),
@@ -861,7 +984,16 @@ def main() -> int:
     print(f"  Rows without hard negatives:  {rows_without_hn}/{evaluated}")
 
     print(f"\n{'─' * 70}")
-    print("4. OVERALL")
+    print("4. BY SYNTHESIZER TYPE")
+    print(f"{'─' * 70}")
+    for st, stats in synth_breakdown.items():
+        n = stats["count"]
+        print(f"  {st}:  {n} rows")
+        print(f"    Query quality  — pass: {stats['qc_pass']}, fail: {stats['qc_fail']}")
+        print(f"    Source answer   — pass: {stats['sa_pass']}, fail: {stats['sa_fail']}")
+
+    print(f"\n{'─' * 70}")
+    print("5. OVERALL")
     print(f"{'─' * 70}")
     print(f"  Fully passing rows:  {fully_passing:>4}/{evaluated}  ({fully_passing/max(evaluated,1)*100:5.1f}%)")
 
