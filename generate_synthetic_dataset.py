@@ -25,6 +25,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
+
 import ragas
 from dotenv import load_dotenv
 from ragas.testset.persona import Persona, generate_personas_from_kg
@@ -56,12 +58,15 @@ from modules.synthesizers import (
     build_query_distribution_for_pipeline,
     list_query_synthesizers,
 )
+from modules.single_hop import generate_single_hop_queries
 from modules.testset import (
+    add_source_mapping_columns,
     build_knowledge_graph,
     generate_testset,
     load_knowledge_graph_cache,
     load_personas_cache,
     load_personas_from_file,
+    save_combined_dataframe,
     save_knowledge_graph_cache,
     save_personas_cache,
     save_testset,
@@ -195,6 +200,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a JSON/JSONL file with pre-defined personas",
     )
 
+    # --- World-based generation (single-hop + per-world multi-hop) ---
+    parser.add_argument(
+        "--multi-hop-worlds", type=str, nargs="+", default=None,
+        help=(
+            "Enable world-based generation: list of subfolder paths (relative "
+            "to --input-dir) for which per-world KGs are built and multi-hop "
+            "queries are generated.  Single-hop queries are generated from the "
+            "full corpus without a KG.  Supports nested paths.  Example: "
+            '--multi-hop-worlds Claires "Law worlds/415"'
+        ),
+    )
+    parser.add_argument(
+        "--single-hop-size", type=int, default=None,
+        help=(
+            "Number of single-hop queries to generate from the full corpus "
+            "(world mode only; default: half of --testset-size)"
+        ),
+    )
+    parser.add_argument(
+        "--multi-hop-size", type=int, default=None,
+        help=(
+            "Total number of multi-hop queries across all worlds "
+            "(world mode only; default: half of --testset-size)"
+        ),
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for single-hop file sampling (world mode)",
+    )
+
     # --- Query generation ---
     parser.add_argument(
         "--standalone-queries", action=argparse.BooleanOptionalAction, default=True,
@@ -304,12 +339,29 @@ def main() -> int:
         return 1
 
     # --- Compute total steps ---
-    # collect, setup LLM, sync store, load docs, build KG, personas, testset, save
-    total_steps = 8
-    if args.pdf_profiles:
-        total_steps += 1
-    if args.hard_negatives:
-        total_steps += 1
+    world_mode = bool(args.multi_hop_worlds)
+    if world_mode:
+        # collect, setup LLM, sync store, load docs,
+        # [profiles], single-hop, N×(world KG+multihop), save
+        total_steps = 5  # collect, LLM, store, load docs, save
+        if args.pdf_profiles:
+            total_steps += 1
+        single_hop_size = (
+            args.single_hop_size
+            if args.single_hop_size is not None
+            else max(args.testset_size, 1) // 2
+        )
+        if single_hop_size > 0:
+            total_steps += 1  # single-hop step
+        total_steps += len(args.multi_hop_worlds)  # one step per world
+    else:
+        # collect, setup LLM, sync store, load docs,
+        # [profiles], KG, personas, testset, save
+        total_steps = 8
+        if args.pdf_profiles:
+            total_steps += 1
+        if args.hard_negatives:
+            total_steps += 1
     steps = StepTracker(total_steps)
 
     print("\n" + "=" * 60)
@@ -527,8 +579,451 @@ def main() -> int:
     else:
         print("\n  PDF profiles: disabled (--no-pdf-profiles)")
 
+    # ===================================================================
+    # Build LLM context (shared by both world and legacy modes)
+    # ===================================================================
+    llm_context: Optional[str] = None
+    if args.standalone_queries:
+        llm_context = build_corpus_llm_context(corpus_size_hint=args.corpus_size_hint)
+        extra = str(args.query_llm_context or "").strip()
+        if extra:
+            llm_context = llm_context.rstrip() + "\n" + extra + "\n"
+    else:
+        extra = str(args.query_llm_context or "").strip()
+        llm_context = extra if extra else None
+
+    # ===================================================================
+    # Decide pipeline mode
+    # ===================================================================
+    world_mode = bool(args.multi_hop_worlds)
+
+    if world_mode:
+        # ==============================================================
+        # WORLD MODE: single-hop from full corpus + multi-hop per world
+        # ==============================================================
+        return _run_world_pipeline(
+            args=args,
+            steps=steps,
+            pdf_paths=pdf_paths,
+            pdf_store_conn=pdf_store_conn,
+            base_input_dir=base_input_dir,
+            all_docs=all_docs,
+            generator_llm=generator_llm,
+            generator_embeddings=generator_embeddings,
+            provider_used=provider_used,
+            embedding_id=embedding_id,
+            add_content_embeddings=add_content_embeddings,
+            cache_enabled=cache_enabled,
+            kg_cache_dir=kg_cache_dir,
+            meta_dir=meta_dir,
+            personas_cache_dir=personas_cache_dir,
+            pdf_profiles_by_source=pdf_profiles_by_source,
+            llm_context=llm_context,
+            reuse_cached_store_extractions=reuse_cached_store_extractions,
+            ragas_doc_extraction_model_tag_base=ragas_doc_extraction_model_tag_base,
+        )
+    else:
+        # ==============================================================
+        # LEGACY MODE: single KG for all docs
+        # ==============================================================
+        return _run_legacy_pipeline(
+            args=args,
+            steps=steps,
+            pdf_paths=pdf_paths,
+            pdf_store_conn=pdf_store_conn,
+            base_input_dir=base_input_dir,
+            all_docs=all_docs,
+            generator_llm=generator_llm,
+            generator_embeddings=generator_embeddings,
+            provider_used=provider_used,
+            embedding_id=embedding_id,
+            add_content_embeddings=add_content_embeddings,
+            cache_enabled=cache_enabled,
+            kg_cache_dir=kg_cache_dir,
+            meta_dir=meta_dir,
+            personas_cache_dir=personas_cache_dir,
+            pdf_profiles_by_source=pdf_profiles_by_source,
+            llm_context=llm_context,
+            reuse_cached_store_extractions=reuse_cached_store_extractions,
+            ragas_doc_extraction_model_tag_base=ragas_doc_extraction_model_tag_base,
+        )
+
+
+# ============================================================================
+# Helper: check if a path is under a directory
+# ============================================================================
+def _is_under_dir(path: Path, directory: Path) -> bool:
+    """Return True if *path* is inside *directory* (inclusive)."""
+    try:
+        path.resolve().relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+# ============================================================================
+# WORLD MODE pipeline
+# ============================================================================
+def _run_world_pipeline(
+    *,
+    args,
+    steps: StepTracker,
+    pdf_paths: List[Path],
+    pdf_store_conn,
+    base_input_dir: Path,
+    all_docs,
+    generator_llm,
+    generator_embeddings,
+    provider_used: str,
+    embedding_id: str,
+    add_content_embeddings: bool,
+    cache_enabled: bool,
+    kg_cache_dir: Path,
+    meta_dir: Path,
+    personas_cache_dir: Path,
+    pdf_profiles_by_source: Dict[str, Dict[str, Any]],
+    llm_context: Optional[str],
+    reuse_cached_store_extractions: bool,
+    ragas_doc_extraction_model_tag_base: Optional[str],
+) -> int:
+    """Single-hop from full corpus + multi-hop from per-world KGs."""
+    worlds: List[str] = args.multi_hop_worlds
+
+    # --- Determine sizes ---
+    total = max(args.testset_size, 1)
+    single_hop_size = (
+        args.single_hop_size
+        if args.single_hop_size is not None
+        else total // 2
+    )
+    multi_hop_size = (
+        args.multi_hop_size
+        if args.multi_hop_size is not None
+        else total - single_hop_size
+    )
+
+    print("\n  World mode enabled")
+    print(f"  Worlds: {', '.join(worlds)}")
+    print(f"  Single-hop from full corpus: {single_hop_size}")
+    print(f"  Multi-hop across worlds: {multi_hop_size}")
+
+    # -------------------------------------------------------------------
+    # Phase A: Single-hop queries from full corpus (no KG)
+    # -------------------------------------------------------------------
+    single_hop_results: List[Dict[str, Any]] = []
+    if single_hop_size > 0:
+        steps.next("Generating single-hop queries (full corpus)")
+        print("  Standalone queries: enabled" if args.standalone_queries
+              else "  Standalone queries: disabled")
+
+        # Use the raw LangChain LLM (not the RAGAS wrapper)
+        raw_llm = getattr(generator_llm, "langchain_llm", generator_llm)
+
+        single_hop_results = generate_single_hop_queries(
+            raw_llm,
+            pdf_store_conn,
+            num_queries=single_hop_size,
+            seed=args.seed,
+            corpus_size_hint=args.corpus_size_hint,
+        )
+        print(f"  Generated {len(single_hop_results)} single-hop queries")
+
+    # -------------------------------------------------------------------
+    # Phase B: Per-world multi-hop queries
+    # -------------------------------------------------------------------
+    multi_hop_dfs: List[pd.DataFrame] = []
+    if multi_hop_size > 0 and worlds:
+        queries_per_world = max(1, multi_hop_size // len(worlds))
+        remainder = multi_hop_size - queries_per_world * len(worlds)
+
+        if cache_enabled:
+            kg_cache_dir.mkdir(parents=True, exist_ok=True)
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            personas_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        for world_idx, world_name in enumerate(worlds):
+            steps.next(
+                f"Multi-hop for world: {world_name} "
+                f"({world_idx + 1}/{len(worlds)})"
+            )
+
+            # --- Filter PDFs for this world ---
+            world_dir = base_input_dir / world_name
+            world_pdf_paths = sorted([
+                p for p in pdf_paths if _is_under_dir(p, world_dir)
+            ])
+            if not world_pdf_paths:
+                print(f"  No PDFs found in world '{world_name}', skipping")
+                continue
+            print(f"  World '{world_name}': {len(world_pdf_paths)} PDF(s)")
+
+            # --- Load docs for this world ---
+            world_docs = load_documents_from_store(
+                pdf_store_conn,
+                base_input_dir=base_input_dir,
+                pdf_paths=world_pdf_paths,
+            )
+            print(f"  Loaded {len(world_docs)} pages for world '{world_name}'")
+            if not world_docs:
+                print(f"  Warning: No document pages for world '{world_name}'")
+                continue
+
+            # --- Build / load KG for this world ---
+            world_docs_fp = compute_docs_fingerprint(world_pdf_paths)
+            world_kg_id = compute_kg_cache_id(
+                world_docs_fp,
+                provider=provider_used,
+                llm_id=args.model,
+                embedding_id=embedding_id,
+                add_content_embeddings=add_content_embeddings,
+            )
+            world_kg_cache_path = kg_cache_dir / f"kg_{world_kg_id}.json.gz"
+            world_kg_meta_path = meta_dir / f"kg_{world_kg_id}.json"
+
+            if (
+                cache_enabled
+                and world_kg_cache_path.exists()
+                and not args.reprocess
+            ):
+                print(f"  Loading cached KG: {world_kg_cache_path.name}")
+                world_kg = load_knowledge_graph_cache(world_kg_cache_path)
+                print(
+                    f"  KG: {len(world_kg.nodes)} nodes, "
+                    f"{len(world_kg.relationships)} relationships"
+                )
+            else:
+                print(
+                    f"  Building KG for '{world_name}' "
+                    f"({len(world_pdf_paths)} PDFs, "
+                    f"{len(world_docs)} pages)..."
+                )
+                world_kg = build_knowledge_graph(
+                    world_docs,
+                    generator_llm,
+                    generator_embeddings,
+                    add_content_embeddings=add_content_embeddings,
+                    pdf_store_conn=pdf_store_conn,
+                    base_input_dir=base_input_dir,
+                    reuse_cached_store_extractions=reuse_cached_store_extractions,
+                    ragas_doc_extraction_model_tag_base=(
+                        ragas_doc_extraction_model_tag_base
+                    ),
+                )
+                if cache_enabled:
+                    print(f"  Saving KG cache: {world_kg_cache_path.name}")
+                    save_knowledge_graph_cache(world_kg, world_kg_cache_path)
+
+                    pipeline_id = PIPELINE_ID_BASE
+                    if add_content_embeddings:
+                        pipeline_id += "__content_embeddings"
+                    with open(world_kg_meta_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "created_at": utc_now_iso(),
+                                "schema_version": CACHE_SCHEMA_VERSION,
+                                "pipeline_id": pipeline_id,
+                                "ragas_version": getattr(
+                                    ragas, "__version__", "unknown"
+                                ),
+                                "world": world_name,
+                                "docs_fingerprint": world_docs_fp,
+                                "kg_cache_id": world_kg_id,
+                                "provider": provider_used,
+                                "llm_id": args.model,
+                                "embedding_id": embedding_id,
+                                "add_content_embeddings": add_content_embeddings,
+                                "num_nodes": len(world_kg.nodes),
+                                "num_relationships": len(world_kg.relationships),
+                            },
+                            f, ensure_ascii=False, indent=2,
+                        )
+
+            # --- Generate personas for this world ---
+            world_personas_cache_path = (
+                personas_cache_dir
+                / f"personas_{world_kg_id}__n{int(args.num_personas)}.json"
+            )
+            world_personas: Optional[List[Persona]] = None
+            if args.personas_path:
+                personas_path = Path(args.personas_path).expanduser()
+                if not personas_path.is_absolute():
+                    personas_path = (Path.cwd() / personas_path).resolve()
+                world_personas = load_personas_from_file(personas_path)
+            elif (
+                cache_enabled
+                and world_personas_cache_path.exists()
+                and not args.reprocess
+            ):
+                print(
+                    f"  Loading cached personas: "
+                    f"{world_personas_cache_path.name}"
+                )
+                world_personas = load_personas_cache(world_personas_cache_path)
+            else:
+                print("  Generating personas from world KG...")
+                world_personas = generate_personas_from_kg(
+                    kg=world_kg,
+                    llm=generator_llm,
+                    num_personas=int(args.num_personas),
+                )
+                if cache_enabled:
+                    save_personas_cache(
+                        world_personas, world_personas_cache_path,
+                    )
+            print(
+                f"  Personas: "
+                f"{len(world_personas) if world_personas else 0}"
+            )
+
+            # --- Build multi-hop-only query distribution ---
+            multi_hop_synth_names = [
+                "multi_hop_abstract_summary",
+                "multi_hop_abstract_content",
+                "multi_hop_specific_entities",
+            ]
+            try:
+                world_qd = build_query_distribution_for_pipeline(
+                    generator_llm,
+                    world_kg,
+                    standalone_queries=args.standalone_queries,
+                    llm_context=llm_context,
+                    pdf_profiles_by_source=(
+                        pdf_profiles_by_source if args.pdf_profiles else None
+                    ),
+                    query_mix=multi_hop_synth_names,
+                )
+            except ValueError as e:
+                print(
+                    f"  Warning: No multi-hop synthesizers compatible "
+                    f"with '{world_name}': {e}"
+                )
+                continue
+
+            # --- Generate multi-hop testset ---
+            # Give the first world any remainder queries
+            world_size = queries_per_world
+            if world_idx == 0 and remainder > 0:
+                world_size += remainder
+
+            print(f"  Generating {world_size} multi-hop queries...")
+            world_testset = generate_testset(
+                world_kg,
+                generator_llm,
+                generator_embeddings,
+                testset_size=world_size,
+                personas=world_personas,
+                llm_context=llm_context,
+                query_distribution=world_qd,
+            )
+
+            if args.standalone_queries:
+                warn_on_referential_queries(world_testset)
+
+            # --- Convert to DataFrame + source mapping ---
+            world_df = world_testset.to_pandas()
+            world_df["world"] = world_name
+            world_df["synthesizer_name"] = "multi_hop_ragas"
+
+            if world_docs:
+                add_source_mapping_columns(
+                    world_df, world_docs, strict=True, kg=world_kg,
+                )
+
+            multi_hop_dfs.append(world_df)
+            print(
+                f"  Generated {len(world_df)} multi-hop queries "
+                f"for world '{world_name}'"
+            )
+
+    # -------------------------------------------------------------------
+    # Combine all results
+    # -------------------------------------------------------------------
+    all_dfs: List[pd.DataFrame] = []
+    if single_hop_results:
+        sh_df = pd.DataFrame(single_hop_results)
+        all_dfs.append(sh_df)
+    all_dfs.extend(multi_hop_dfs)
+
+    if not all_dfs:
+        print("\n  Error: No queries generated in any phase.")
+        return 1
+
+    combined_df = pd.concat(all_dfs, ignore_index=True)
+
+    # -------------------------------------------------------------------
+    # Hard negatives (optional) — uses full-corpus KG from legacy mode
+    # only; skipped in world mode with a note
+    # -------------------------------------------------------------------
+    if args.hard_negatives:
+        print(
+            "\n  Note: Hard negative mining in world mode is not yet "
+            "supported via RAGAS KG.  Use generate_single_hop.py or "
+            "evaluate_search.py for hard negatives on world-mode output."
+        )
+
+    # -------------------------------------------------------------------
+    # FINAL STEP: Save combined results to output/
+    # -------------------------------------------------------------------
+    steps.next("Saving results")
+
+    output_path = str(OUTPUT_DIR / args.output)
+    save_combined_dataframe(
+        combined_df, output_path, formats=args.output_formats,
+    )
+
+    # Summary
+    sh_count = int(
+        (combined_df.get("synthesizer_name", pd.Series())
+         == "single_hop_direct").sum()
+    )
+    mh_count = len(combined_df) - sh_count
+    world_counts = {}
+    if "world" in combined_df.columns:
+        for w in combined_df["world"].dropna().unique():
+            world_counts[w] = int((combined_df["world"] == w).sum())
+
+    print(f"\n{'=' * 60}")
+    print("Generation complete!")
+    print(f"  Total samples: {len(combined_df)}")
+    print(f"  Single-hop (full corpus): {sh_count}")
+    print(f"  Multi-hop (per-world KGs): {mh_count}")
+    for w, c in world_counts.items():
+        print(f"    - {w}: {c}")
+    print(f"  Output directory: {OUTPUT_DIR}")
+    print(f"{'=' * 60}")
+
+    return 0
+
+
+# ============================================================================
+# LEGACY MODE pipeline (original single-KG approach)
+# ============================================================================
+def _run_legacy_pipeline(
+    *,
+    args,
+    steps: StepTracker,
+    pdf_paths: List[Path],
+    pdf_store_conn,
+    base_input_dir: Path,
+    all_docs,
+    generator_llm,
+    generator_embeddings,
+    provider_used: str,
+    embedding_id: str,
+    add_content_embeddings: bool,
+    cache_enabled: bool,
+    kg_cache_dir: Path,
+    meta_dir: Path,
+    personas_cache_dir: Path,
+    pdf_profiles_by_source: Dict[str, Dict[str, Any]],
+    llm_context: Optional[str],
+    reuse_cached_store_extractions: bool,
+    ragas_doc_extraction_model_tag_base: Optional[str],
+) -> int:
+    """Original pipeline: build a single KG from all docs, generate mixed queries."""
+
     # -----------------------------------------------------------------------
-    # STEP 6: Build or load knowledge graph (file-cached)  
+    # Build or load knowledge graph (file-cached)
     # -----------------------------------------------------------------------
     steps.next("Building knowledge graph")
 
@@ -551,7 +1046,10 @@ def main() -> int:
     if cache_enabled and kg_cache_path.exists() and not args.reprocess:
         print(f"  Loading cached KG: {kg_cache_path.name}")
         kg = load_knowledge_graph_cache(kg_cache_path)
-        print(f"  Loaded KG: {len(kg.nodes)} nodes, {len(kg.relationships)} relationships")
+        print(
+            f"  Loaded KG: {len(kg.nodes)} nodes, "
+            f"{len(kg.relationships)} relationships"
+        )
     else:
         kg = build_knowledge_graph(
             all_docs,
@@ -589,7 +1087,7 @@ def main() -> int:
                 )
 
     # -----------------------------------------------------------------------
-    # STEP 7: Generate or load personas (file-cached)
+    # Generate or load personas (file-cached)
     # -----------------------------------------------------------------------
     steps.next("Generating personas")
 
@@ -623,29 +1121,23 @@ def main() -> int:
     print(f"  Personas ready: {len(personas) if personas else 0}")
 
     # -----------------------------------------------------------------------
-    # STEP 8: Generate testset
+    # Generate testset
     # -----------------------------------------------------------------------
     steps.next("Generating testset")
 
-    # Build query distribution
-    llm_context: Optional[str] = None
-    if args.standalone_queries:
-        llm_context = build_corpus_llm_context(corpus_size_hint=args.corpus_size_hint)
-        extra = str(args.query_llm_context or "").strip()
-        if extra:
-            llm_context = llm_context.rstrip() + "\n" + extra + "\n"
-        print("  Standalone queries: enabled")
-    else:
-        extra = str(args.query_llm_context or "").strip()
-        llm_context = extra if extra else None
-        print("  Standalone queries: disabled (RAGAS defaults)")
+    print(
+        "  Standalone queries: "
+        + ("enabled" if args.standalone_queries else "disabled (RAGAS defaults)")
+    )
 
     query_distribution = build_query_distribution_for_pipeline(
         generator_llm,
         kg,
         standalone_queries=args.standalone_queries,
         llm_context=llm_context,
-        pdf_profiles_by_source=pdf_profiles_by_source if args.pdf_profiles else None,
+        pdf_profiles_by_source=(
+            pdf_profiles_by_source if args.pdf_profiles else None
+        ),
         query_mix=args.query_mix,
     )
 
@@ -663,7 +1155,7 @@ def main() -> int:
         warn_on_referential_queries(testset)
 
     # -----------------------------------------------------------------------
-    # STEP 9 (optional): Mine hard negatives
+    # Mine hard negatives (optional)
     # -----------------------------------------------------------------------
     hard_negatives = None
     source_mappings = None
