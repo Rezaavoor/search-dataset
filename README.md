@@ -1,30 +1,45 @@
-## Synthetic Q&A Dataset Generator (RAGAS)
+## Legal Document Search Evaluation Toolkit
 
-This project generates a **synthetic Q&A testset** from your **PDF documents** using **RAGAS**. It is designed for building evaluation datasets for retrieval/search/RAG pipelines: each row includes a **question** (`user_input`), a **grounded answer** (`reference`), the **supporting context** (`reference_contexts`), and optionally **hard negatives** for IR evaluation.
+This project builds **synthetic Q&A evaluation datasets** from a corpus of legal documents (PDF, DOCX, XLSX, and more). It is designed end-to-end for evaluating retrieval/search/RAG pipelines: each row includes a **question** (`user_input`), a **grounded answer** (`reference`), the **supporting context** (`reference_contexts`), and optionally **hard negatives** for IR evaluation.
 
-The main entrypoint is `generate_synthetic_dataset.py`.
+The toolkit covers the full lifecycle: **corpus ingestion** → **embedding** → **profiling** → **dataset generation** (single-hop + multi-hop) → **hard negative mining** → **search evaluation** → **dataset validation**.
 
 ---
 
 ## Project structure
 
 ```
-generate_synthetic_dataset.py   # Generate synthetic Q&A dataset from PDFs
-generate_single_hop.py          # Standalone parallel single-hop generator (no KG)
-evaluate_search.py              # Evaluate embedding model search quality
+# --- Corpus preparation ---
+ingest_corpus.py                # Ingest documents into SQLite page store (PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON)
+embed_corpus.py                 # Compute page embeddings (multi-key parallelism, resume-safe)
+profile_corpus.py               # Generate per-file LLM profiles (multi-endpoint parallelism)
+
+# --- Dataset generation ---
+generate_synthetic_dataset.py   # Main pipeline: single-hop + multi-hop Q&A generation (world mode or legacy)
+generate_single_hop.py          # Standalone parallel single-hop generator (no KG, multi-endpoint)
+
+# --- Evaluation & validation ---
+evaluate_search.py              # Evaluate embedding model retrieval quality (Recall@K, MRR, MRR@K, nDCG@K, MAP)
+validate_dataset.py             # LLM-as-a-judge validation of generated datasets
+run_mleb.py                     # Run Massive Legal Embedding Benchmark (MLEB) with MTEB
+
+# --- Modules ---
 modules/
   config.py                     # Constants and defaults
   utils.py                      # Shared helpers (hashing, JSON, paths, text)
-  db.py                         # SQLite PDF page store operations
+  db.py                         # SQLite page store operations + multi-model embedding storage
+  loaders.py                    # Format-specific page extractors (PDF, DOCX, XLSX, etc.)
   transforms.py                 # RAGAS transform patches (SafeHeadlineSplitter, etc.)
   llm_setup.py                  # LLM/embedding setup (OpenAI / Azure OpenAI)
   profiles.py                   # PDF profile generation & formatting
   synthesizers.py               # Query synthesizers + distribution building
-  hard_negatives.py             # Hard negative mining (BM25, embedding, LLM judge)
-  testset.py                    # KG building, testset gen/save, persona management
   single_hop.py                 # Reusable single-hop generation (no KG needed)
+  hard_negatives.py             # Hard negative mining (BM25 + embedding + RRF + tiered LLM judge + SQLite loader)
+  testset.py                    # KG building, testset gen/save, persona management, source mapping
+
+# --- Data ---
 output/                         # Generated datasets + evaluation results
-processed/                      # Cached intermediate artifacts (KG, personas, SQLite store)
+processed/                      # Cached artifacts (KG, personas, SQLite store, profiles)
 ```
 
 ---
@@ -42,55 +57,50 @@ pip install -r requirements.txt
 ### Configure credentials
 
 - Copy `.env.example` → `.env`
-- Configure **either** OpenAI **or** Azure OpenAI (the script auto-detects based on which variables are set).
+- Configure **either** OpenAI **or** Azure OpenAI (auto-detected from env vars).
+- For multi-endpoint Azure parallelism (used by `profile_corpus.py`, `generate_single_hop.py`, `embed_corpus.py`), add `AZURE_OPENAI_API_KEY_2` + `AZURE_OPENAI_ENDPOINT_2`, etc.
 
-### Run
+---
 
-```bash
-python generate_synthetic_dataset.py \
-  --input-dir . \
-  --testset-size 50 \
-  --output synthetic_dataset \
-  --output-formats csv json
-```
+## Corpus preparation pipeline
 
-Output files are saved to the `output/` folder (e.g., `output/synthetic_dataset.csv`).
+Before generating a dataset, prepare the corpus:
 
-Common flags:
-- `--specific-folders folderA folderB`
-- `--files path/to/one.pdf path/to/another.pdf`
-- `--no-recursive` (don't search subdirectories)
-- `--max-pdfs N` (cap the number of PDF files; default: no limit)
-- `--standalone-queries` / `--no-standalone-queries` (default: enabled; generate standalone, corpus-level search queries)
-- `--corpus-size-hint N` (used only when `--standalone-queries` is enabled; default: 7000)
-- `--query-llm-context "..."` (extra guidance appended to the default corpus guidance)
-- `--pdf-profiles` / `--no-pdf-profiles` (default: enabled; generate per-PDF LLM profiles and inject them into query generation)
-- `--pdf-profile-max-pages N` (default: 3; lower to reduce cost)
-- `--pdf-profile-max-chars-per-page N` (default: 2500; lower to reduce cost)
-- `--provider auto|openai|azure`
-- `--model gpt-4o-mini` (or your Azure deployment name)
-- `--processed-dir processed` (where intermediate caches are stored)
-- `--pdf-store-db PATH` (override SQLite store location; default: `processed/pdf_page_store.sqlite`)
-- `--no-cache` (disable cache reuse for KG/personas)
-- `--reprocess` (ignore caches and rebuild everything)
-
-### World-based generation (full corpus single-hop + per-world multi-hop)
-
-When the corpus is too large to build a single Knowledge Graph, use **world mode** to:
-1. Generate **single-hop queries** from the **full corpus** (no KG required)
-2. Generate **multi-hop queries** from **per-world KGs** (one KG per subfolder/world)
+### 1. Ingest documents into SQLite
 
 ```bash
-python generate_synthetic_dataset.py \
-  --input-dir search-dataset \
-  --multi-hop-worlds Claires "Law worlds/415" "Law worlds/416" \
-  --testset-size 200 \
-  --output combined_dataset
+python ingest_corpus.py --input-dir search-dataset
 ```
 
-This generates ~100 single-hop queries from the full corpus + ~100 multi-hop queries split across the three worlds (~33 each).
+Extracts all documents (PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON) into the SQLite page store (`processed/pdf_page_store.sqlite`). Each page becomes one row with `doc_content`, `rel_path`, `filename`, `page_number`, and metadata.
 
-You can also set the split explicitly:
+### 2. Compute page embeddings
+
+```bash
+python embed_corpus.py --embedding-model text-embedding-3-large
+```
+
+Computes and stores page embeddings for the specified model. Multi-key parallelism and resume-safe (picks up where it left off if interrupted).
+
+### 3. Generate per-file profiles
+
+```bash
+python profile_corpus.py
+```
+
+Generates LLM-based metadata per file (title, doc type, summary, topics, key entities, likely user intents). Profiles are stored in the SQLite store and reused by the query generation pipeline to make queries more realistic. Multi-endpoint Azure parallelism with retry/backoff.
+
+---
+
+## Dataset generation
+
+The main entrypoint is `generate_synthetic_dataset.py`, which supports two modes:
+
+### World mode (recommended for large corpora)
+
+When the corpus is too large to build a single Knowledge Graph, use **world mode**:
+1. **Single-hop queries** from the **full corpus** (no KG needed — fast)
+2. **Multi-hop queries** from **per-world KGs** (one KG per subfolder)
 
 ```bash
 python generate_synthetic_dataset.py \
@@ -98,49 +108,109 @@ python generate_synthetic_dataset.py \
   --multi-hop-worlds Claires "Law worlds/415" "Law worlds/416" \
   --single-hop-size 300 \
   --multi-hop-size 100 \
+  --hard-negatives \
+  --no-pdf-profiles \
   --output combined_dataset
 ```
 
-World-mode flags:
-- `--multi-hop-worlds world1 world2 ...` (activates world mode; paths relative to `--input-dir`, supports nested paths like `"Law worlds/415"`)
-- `--single-hop-size N` (single-hop queries from full corpus; default: `testset-size / 2`)
-- `--multi-hop-size N` (total multi-hop queries across all worlds; default: `testset-size / 2`)
-- `--seed N` (random seed for single-hop file sampling)
-
 How it works:
-- **Single-hop**: randomly samples PDFs from the full SQLite store, picks the best page per file, and generates a Q&A pair using the LLM (similar to `generate_single_hop.py`). No KG is needed.
-- **Multi-hop**: for each world subfolder, collects PDFs, loads docs, builds (or loads cached) a per-world KG, and generates multi-hop queries using only multi-hop RAGAS synthesizers.
-- **Output**: a combined CSV/JSON with a `synthesizer_name` column (`single_hop_direct` or `multi_hop_ragas`) and a `world` column for multi-hop rows.
+- **Single-hop**: randomly samples PDFs from the full SQLite store, picks the best page per file, generates a Q&A pair using the LLM. No KG needed.
+- **Multi-hop**: for each world subfolder, collects its PDFs, builds (or loads cached) a per-world KG, generates multi-hop queries using only multi-hop RAGAS synthesizers.
+- **Hard negatives**: mines from the full corpus via SQLite (BM25 + embedding retrieval, RRF merge, tiered LLM judge).
+- **Output**: a combined CSV/JSON with `synthesizer_name` (`single_hop_direct` or `multi_hop_ragas`) and `world` column for multi-hop rows.
 
-Without `--multi-hop-worlds`, the script falls back to the original single-KG pipeline.
+World-mode flags:
+- `--multi-hop-worlds world1 world2 ...` — activates world mode; paths relative to `--input-dir`, supports nested paths like `"Law worlds/415"`
+- `--single-hop-size N` — single-hop queries from full corpus (default: `testset-size / 2`)
+- `--multi-hop-size N` — total multi-hop queries split across worlds (default: `testset-size / 2`)
+- `--seed N` — random seed for single-hop file sampling
+- `--hard-negatives` — enable hard negative mining on combined output
 
-### Hard negative mining (for IR evaluation)
+### Legacy mode (single KG)
+
+Without `--multi-hop-worlds`, the script builds **one KG from all loaded documents** and generates a mixed single-hop + multi-hop testset via RAGAS. This is the original approach, suitable for smaller corpora.
 
 ```bash
 python generate_synthetic_dataset.py \
-  --input-dir . \
+  --input-dir search-dataset \
+  --specific-folders Claires \
   --testset-size 50 \
   --hard-negatives \
-  --num-bm25-negatives 5 \
-  --num-embedding-negatives 5 \
-  --output synthetic_dataset_with_negatives
+  --output synthetic_dataset
 ```
 
-Hard negatives are saved to a single `hard_negatives` column as a JSON list of
-`"<filename>.pdf (page N)"` strings. Some queries may have **no** hard negatives (`[]`)
-if the miner cannot find negatives reliably.
+### Standalone single-hop generator
 
-Hard negative flags:
-- `--hard-negatives` (enable hard negative mining)
-- `--num-bm25-negatives N` (BM25 candidate mining budget per query, default: 5)
-- `--num-embedding-negatives N` (embedding candidate mining budget per query, default: 5)
-- `--no-content-embeddings` (disable page_content embeddings, use summary_embedding only)
+For maximum throughput on single-hop queries, use the dedicated parallel script:
+
+```bash
+python generate_single_hop.py \
+  --num-queries 500 \
+  --seed 42 \
+  --output single_hop_dataset
+```
+
+Features: multi-endpoint Azure parallelism, exponential backoff, graceful Ctrl+C shutdown, resume-safe, built-in hard negative mining.
+
+### Common flags
+
+Input/output:
+- `--input-dir PATH` — corpus root directory
+- `--output NAME` — output file base name (saved to `output/`)
+- `--output-formats csv json parquet`
+- `--specific-folders folderA folderB` — only load PDFs from these subdirectories
+- `--files path/to/one.pdf` — specific files to include
+- `--max-pdfs N` — cap number of files
+- `--no-recursive` — don't search subdirectories
+
+LLM/provider:
+- `--model gpt-4o-mini` — LLM model (or Azure deployment name)
+- `--provider auto|openai|azure`
+
+Query generation:
+- `--testset-size N` — number of samples (default: 50)
+- `--standalone-queries` / `--no-standalone-queries` — corpus-level standalone queries (default: enabled)
+- `--corpus-size-hint N` — approximate corpus size for prompt context (default: 7000)
+- `--query-llm-context "..."` — extra LLM guidance for query generation
+- `--query-mix ...` — override synthesizer distribution (e.g., `single_hop_entities=0.5`)
+- `--list-query-synthesizers` — print available synthesizer names
+
+PDF profiles:
+- `--pdf-profiles` / `--no-pdf-profiles` — per-PDF LLM profiles (default: enabled)
+- `--pdf-profile-max-pages N` (default: 3)
+- `--pdf-profile-max-chars-per-page N` (default: 2500)
+
+Hard negatives:
+- `--hard-negatives` — enable hard negative mining
+- `--num-bm25-negatives N` (default: 5)
+- `--num-embedding-negatives N` (default: 5)
+
+Caching:
+- `--processed-dir processed` — where intermediate caches are stored
+- `--pdf-store-db PATH` — override SQLite store location
+- `--no-cache` — disable cache reuse for KG/personas
+- `--reprocess` — ignore caches and rebuild everything
 
 ---
 
 ## Pipeline steps
 
-The script runs a clear step-by-step pipeline with progress indicators.
+Step counts adjust dynamically based on enabled features and number of worlds.
+
+**World mode** (`--multi-hop-worlds Claires "Law worlds/415"` with `--hard-negatives`):
+
+```
+[Step  1/10] Collecting PDF paths
+[Step  2/10] Setting up LLM & embeddings
+[Step  3/10] Syncing SQLite PDF store
+[Step  4/10] Loading documents from SQLite store
+[Step  5/10] Generating single-hop queries (full corpus)
+[Step  6/10] Multi-hop for world: Claires (1/2)
+[Step  7/10] Multi-hop for world: Law worlds/415 (2/2)
+[Step  8/10] Mining hard negatives
+[Step  9/10] Saving results
+[Step 10/10] Done
+```
 
 **Legacy mode** (no `--multi-hop-worlds`):
 
@@ -156,346 +226,95 @@ The script runs a clear step-by-step pipeline with progress indicators.
 [Step 9/9] Saving results
 ```
 
-**World mode** (`--multi-hop-worlds Claires "Law worlds/415" "Law worlds/416"`):
-
-```
-[Step 1/9] Collecting PDF paths
-[Step 2/9] Setting up LLM & embeddings
-[Step 3/9] Syncing SQLite PDF store
-[Step 4/9] Loading documents from SQLite store
-[Step 5/9] Building PDF profiles
-[Step 6/9] Generating single-hop queries (full corpus)
-[Step 7/9] Multi-hop for world: Claires (1/3)
-[Step 8/9] Multi-hop for world: Law worlds/415 (2/3)
-[Step 9/9] Multi-hop for world: Law worlds/416 (3/3)
-[Step 10/10] Saving results
-```
-
-The step count adjusts dynamically based on which optional features (PDF profiles, hard negatives, number of worlds) are enabled.
-
 ---
 
-## SQLite PDF page store
-
-All PDF pages are extracted and stored in a **single-table SQLite database** (`pdf_page_store`). This is always active — the store is automatically created and synced on every run.
-
-- **Row granularity**: 1 row per **PDF page** (matches `PyPDFLoader`)
-- **Stored fields** (from PDFs): `doc_content` + loader metadata (`source`, `page`, etc.)
-- **Derived fields**:
-  - `summary`: cheap extractive snippet (offline, deterministic)
-  - `embedding_f32` + `emb__{model}`: page embeddings stored per model (see "Multi-model embedding storage" below). Computed with `--pdf-store-embeddings`. Reused by the KG transform pipeline for DOCUMENT-level nodes and by `evaluate_search.py` for retrieval evaluation.
-  - `pdf_profile_json`: per-PDF profile (one per PDF; computed when `--pdf-profiles` is enabled)
-  - `ragas_headlines_json`, `ragas_summary`: RAGAS LLM extractions cached for reuse across KG builds (skips LLM calls when cached)
-  - `ragas_entities_json`, `ragas_themes_json`: RAGAS chunk-level extractions persisted after KG build for inspection (not loaded back — see caching notes below)
-
-**Default DB path:** `processed/pdf_page_store.sqlite` (override with `--pdf-store-db`).
-
-On each run, the store automatically:
-- Inserts any **missing or stale** PDFs (based on file size + modification time)
-- Backfills extractive summaries for pages that don't have them
-- Optionally computes page embeddings (`--pdf-store-embeddings`)
-- Generates PDF profiles as needed (`--pdf-profiles`)
-
-Use `--reprocess` to force re-extraction of all PDFs into the store.
-
-### Reusing cached artifacts
-
-Intermediate artifacts are saved under `processed/` and reused on subsequent runs:
-- `processed/kg/`: the processed RAGAS Knowledge Graph (after transforms)
-- `processed/personas/`: generated personas
-- `processed/meta/`: metadata JSON describing cache keys + inputs for each artifact
-- `processed/pdf_page_store.sqlite`: SQLite store of extracted PDF pages + derived fields
-
-This is useful when you want to regenerate testsets (e.g., different `--testset-size`) without re-running the expensive transform step.
-
-### What is cached in SQLite vs the KG file
-
-The SQLite store caches **page-level** (DOCUMENT node) extractions that map 1:1 to a page row:
-
-| Extraction | SQLite columns | Reused on KG rebuild? |
-|------------|----------------|----------------------|
-| Headlines | `ragas_headlines_json` | Yes — skips LLM call |
-| Summary | `ragas_summary` | Yes — skips LLM call |
-| Page embedding | `emb__{model}` | Yes — skips embedding API call (DOCUMENT nodes only) |
-
-**Chunk-level** data (entities, themes, chunk embeddings) is NOT loaded from SQLite because multiple chunks can exist per page and the per-page key would cause collisions. This data is written to SQLite for inspection but the **KG file cache** (`processed/kg/*.json.gz`) is what prevents recomputation on re-runs with the same PDFs.
-
----
-
-## How RAGAS works here (what gets called, and why)
-
-RAGAS generates the synthetic dataset in two big phases:
-
-- **Phase A: Build a Knowledge Graph (KG)** from your documents via a **transform pipeline** (LLM-based extractors + embedding-based steps).
-- **Phase B: Generate samples** by sampling nodes/relationships from the KG and using the **LLM** to write the final **(question, answer)** grounded in the chosen context(s).
-
-This repo wires those phases together using:
-- `ragas.testset.TestsetGenerator`
-- `ragas.testset.transforms.default_transforms(...)` (plus patches described below)
-- `testset.to_pandas()` for export
-
----
-
-## Phase A: Documents → Knowledge Graph (Transforms)
-
-### 1) Initialize LLM + embeddings and load documents
-
-LLM and embedding models are set up once (Step 2) and reused for all subsequent operations including store sync, profile generation, KG building, and testset generation. PDF pages are loaded from the SQLite page store (auto-synced in Step 3). Each page becomes a LangChain `Document` with `metadata["source"]` (absolute path) and `metadata["page"]` (0-indexed).
-
-### 2) LLM + embedding setup
-
-`setup_llm_and_embeddings(...)` creates:
-- an **LLM** (for summarization, NER/themes extraction, and finally Q/A generation)
-- an **embedding model** (for summary embeddings + content embeddings + similarity edges)
-
-Both are wrapped for RAGAS using:
-- `LangchainLLMWrapper`
-- `LangchainEmbeddingsWrapper`
-
-Azure note:
-- `AzureChatOpenAI` is instantiated with `temperature=1` because some Azure deployments only support that value.
-
-### 3) RAGAS converts documents into graph nodes
-
-Inside RAGAS, each input document becomes a node like:
-- `Node(type=DOCUMENT, properties={"page_content": ..., "document_metadata": ...})`
-
-### 4) Default transforms (chosen based on document length)
-
-RAGAS's `default_transforms(...)` chooses one of two pipelines based on how many docs fall into token-length bins:
-- \(101–500\) tokens
-- \(501+\) tokens
-
-If your docs are mostly \(\le 100\) tokens, RAGAS raises an error ("documents too short") and you'll need longer inputs or custom transforms.
-
-### 5) What transforms are used (LLM vs embeddings)
-
-RAGAS transforms are applied **in order**. Each transform either:
-- adds **properties** to nodes (e.g., `summary`, `entities`, `themes`, `summary_embedding`, `page_content_embedding`), or
-- adds **relationships** (e.g., `child`, `next`, `summary_similarity`, `content_similarity`, `entities_overlap`), or
-- **filters/removes nodes** from the graph.
-
-#### Long-doc pipeline (roughly "many docs are 501+ tokens")
-
-Typical transform sequence:
-- **LLM**: `HeadlinesExtractor` → adds `headlines` (used for splitting)
-- **Filter**: `HeadlinesRequiredFilter` → removes documents without usable headlines
-- **Splitter**: `HeadlineSplitter` → creates `CHUNK` nodes + `child`/`next` relationships
-- **LLM**: `SummaryExtractor` → adds `summary` (usually on DOCUMENT nodes)
-- **LLM**: `CustomNodeFilter` → removes low "question potential" chunks
-- **Parallel step**:
-  - **Embeddings**: `EmbeddingExtractor(embed_property_name="summary")` → adds `summary_embedding`
-  - **LLM**: `ThemesExtractor` → adds `themes`
-  - **LLM**: `NERExtractor` → adds `entities`
-- **Parallel step**:
-  - **Embeddings/math**: `CosineSimilarityBuilder(property_name="summary_embedding")` → adds `summary_similarity` edges
-  - **String overlap**: `OverlapScoreBuilder(property_name="entities")` → adds `entities_overlap` edges + `overlapped_items`
-- **Embeddings**: `EmbeddingExtractor(property_name="page_content_embedding", embed_property_name="page_content")` → adds `page_content_embedding`
-- **Embeddings/math**: `CosineSimilarityBuilder(property_name="page_content_embedding")` → adds `content_similarity` edges
-
-#### Medium-doc pipeline (roughly "many docs are 101–500 tokens")
-
-Same idea, but it typically:
-- skips headline-based splitting
-- runs extractors over DOCUMENT nodes more directly
-- still produces `summary_embedding` + `page_content_embedding` + similarity/overlap relationships
-
-### 6) Why this repo patches the headline splitter
-
-In practice, some documents won't yield `headlines` (or RAGAS may decide not to extract them for shorter docs).
-The stock `HeadlineSplitter` raises if `headlines` is missing.
-
-This repo replaces it with `SafeHeadlineSplitter` (in `modules/transforms.py`) and adds a headline-required filter:
-- if `headlines` is missing/empty (or none of the extracted headlines match the text), the document is **filtered out** (no queries are generated from it)
-- otherwise, standard headline splitting behavior is used
-
-This makes the pipeline more robust on legal docs with inconsistent heading formatting.
-
-### 7) Page content embeddings (improved KG connectivity)
-
-By default, this repo adds **page_content embeddings** to ALL nodes (not just those with summaries). This provides:
-
-| Benefit | Description |
-|---------|-------------|
-| **100% embedding coverage** | All nodes get `page_content_embedding`, not just the ~50% with summaries |
-| **Richer similarity edges** | `content_similarity` edges connect ALL semantically related content |
-| **Better multi-hop questions** | RAGAS can find related content across all documents and chunks |
-| **Enables hard negative mining** | Full corpus coverage for finding confusing passages |
-
-Without this improvement, only nodes with summaries participate in similarity-based relationships, which limits multi-hop question generation.
-
-To disable this feature (use summary embeddings only):
-```bash
-python generate_synthetic_dataset.py --no-content-embeddings ...
-```
-
----
-
-## Phase B: Knowledge Graph → Scenarios → Synthetic Q/A samples
-
-After transforms, the Knowledge Graph contains:
-- nodes with `page_content` plus extracted properties like `summary`, `themes`, `entities`, `summary_embedding`, `page_content_embedding`
-- relationships like:
-  - `child` / `next` (document structure)
-  - `summary_similarity` (embedding-based "these docs are about similar things")
-  - `content_similarity` (embedding-based similarity on actual page content)
-  - `entities_overlap` (NER/overlap-based "these chunks share entities")
-
-RAGAS then generates test samples like this:
-
-### 1) Personas (embeddings + LLM)
-
-If no personas are provided, RAGAS:
-- clusters document summaries using **`summary_embedding`**
-- uses the **LLM** to generate a small list of personas from representative summaries
-
-Personas influence query style and framing (e.g., "law clerk" vs "compliance analyst").
-
-This repo exposes two knobs:
-- `--num-personas N`: generate more personas (default: 3)
-- `--personas-path personas.json`: supply your own personas (skips persona generation)
-
-### 2) Pick query synthesizers ("query distribution")
-
-By default, RAGAS uses up to three synthesizers (it may skip ones that don't fit your KG):
-- **Single-hop specific**: one context chunk, entity/theme-driven
-- **Multi-hop abstract**: multi-context queries using *theme* connections across similar docs
-- **Multi-hop specific**: multi-context queries using *entity overlap* connections
-
-### 3) Scenario generation (mostly KG sampling, some LLM calls)
-
-Synthesizers create *scenarios* by selecting:
-- nodes (contexts)
-- themes/entities to focus on
-- persona + query style + query length
-
-Some synthesizers call the LLM to map personas to themes/entities (to make the persona choice meaningful).
-
-### 4) Sample generation (LLM writes the final Q/A)
-
-For each scenario, the LLM is prompted to produce:
-- a **question** (`user_input`)
-- an **answer** (`reference`) that is **faithful to the provided context only**
-
-RAGAS stores the exact context strings used in:
-- `reference_contexts` (list of one chunk for single-hop, multiple tagged chunks for multi-hop)
-
----
-
-## Hard Negative Mining (for IR Evaluation)
-
-When `--hard-negatives` is enabled, the script mines challenging negative examples for each query. Hard negatives are passages that:
-- Are **similar** to the query (lexically or semantically)
-- But **do not** contain enough information to answer the query
-
-This is essential for training and evaluating retrieval systems, as random negatives are too easy to distinguish.
-
-### Mining approaches
-
-| Approach | Method | What it captures |
-|----------|--------|------------------|
-| **BM25** | Lexical similarity (term overlap) | Passages with similar vocabulary |
-| **Embedding** | Semantic similarity (cosine distance) | Passages about similar topics |
-
-In this repo, BM25/embedding retrieval is used to generate *candidates* at the **page** level.
-Candidates are then filtered for reliability:
-- Exclude any page that matches a positive `(filename,page)`
-- Exclude any page from the same **PDF file** as the positive(s)
-- Exclude near-duplicates via embedding cosine similarity against positive page(s)
-- Validate with an LLM judge: keep only pages that are **relevant** but **not answerable**
+## Hard negative mining
+
+When `--hard-negatives` is enabled, the pipeline mines challenging negative examples for each query. Hard negatives are passages that are **similar** to the query but **do not** contain enough information to answer it.
+
+### Strategy
+
+1. **Candidate retrieval**: BM25 (lexical) + embedding (semantic) retrieval from the full corpus via SQLite (no KG needed)
+2. **RRF merge**: Reciprocal Rank Fusion (`score = Σ 1/(k+rank)`) combines both ranked lists into a single ordering — candidates appearing in only one list still participate
+3. **Proximity exclusion**: positive pages ± 2 adjacent pages are excluded (replaces the old whole-file exclusion, so other pages from the same document can still be selected)
+4. **Near-duplicate filtering**: candidates with cosine similarity ≥ 0.92 to any positive page are dropped
+5. **Tiered LLM judge**: each candidate is evaluated for relevance, answerability, and **topical similarity**:
+   - **Tier 1** (ideal): relevant=yes, answerable=no, topical_similarity=high
+   - **Tier 2** (acceptable): answerable=no, relevant=yes|uncertain, topical_similarity=high|medium
+   - **Reject**: answerable=yes with valid evidence, or relevant=no
+6. **Per-file cap**: max 2 negatives per source file (up from the previous 1)
+7. **Selection**: tier 1 negatives are preferred; remaining slots filled from tier 2
+
+Hard negative mining now works in **both** world mode and legacy mode. In world mode it loads all pages directly from the SQLite store (via `load_all_pages_from_store`), so no KG is required.
 
 Because the miner prioritizes correctness, some queries may produce **no** hard negatives (`[]`).
 
-### Output columns
+### Output
 
-When hard negatives are enabled, the output includes:
-- `hard_negatives`: JSON-encoded list of strings like `"<filename>.pdf (page N)"` (stored as a string in the exported CSV/JSON)
+Hard negatives are saved as a `hard_negatives` column: a JSON-encoded list of `"<filename> (page N)"` strings.
 
-### Example output row
+---
 
-```json
-{
-  "user_input": "What are the penalties for late filing?",
-  "reference": "Late filing penalties include...",
-  "reference_contexts": ["<positive context from doc>"],
-  "hard_negatives": "[\"filing_rules.pdf (page 12)\", \"another_doc.pdf (page 5)\"]",
-  "source_files_with_pages": "[\"filing_rules.pdf (page 5)\"]",
-  "source_files_with_pages_readable": "filing_rules.pdf (page 5)"
-}
+## SQLite page store
+
+All document pages are stored in a **single-table SQLite database** (`processed/pdf_page_store.sqlite`).
+
+- **Row granularity**: 1 row per document page
+- **Supported formats**: PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, XLS, DOC
+- **Core fields**: `doc_content`, `rel_path`, `filename`, `file_type`, `page_number`, `content_chars`
+- **Derived fields**:
+  - `summary` — cheap extractive snippet (offline, deterministic)
+  - `emb__{model}` — page embeddings per model (multi-model storage)
+  - `pdf_profile_json` — per-file LLM profile
+  - `ragas_headlines_json`, `ragas_summary` — cached RAGAS extractions (skip LLM calls on KG rebuild)
+
+### Multi-model embedding storage
+
+Multiple embedding models are stored side by side. Each model gets its own column pair:
+
+```
+emb__text_embedding_3_large       BLOB
+emb_dims__text_embedding_3_large  INTEGER
 ```
 
----
+Model names are sanitized (e.g., `text-embedding-3-large` → `text_embedding_3_large`). Columns are added dynamically via `ALTER TABLE`.
 
-## Outputs and schema
+### Caching
 
-Output files are saved to the `output/` directory in the formats you request:
-- `--output-formats csv json parquet`
+Intermediate artifacts under `processed/`:
+- `processed/kg/` — RAGAS Knowledge Graphs (gzipped JSON, keyed by document fingerprint + model config)
+- `processed/personas/` — generated personas
+- `processed/meta/` — metadata JSON per cached artifact
+- `processed/pdf_page_store.sqlite` — the main page store
 
-Typical core columns:
-- `user_input`: the generated question
-- `reference`: the generated grounded answer
-- `reference_contexts`: list of context strings used to ground the answer (may be serialized as a list-like string in CSV depending on your pandas/RAGAS versions)
-
-Hard negative columns (when `--hard-negatives` is used):
-- `hard_negatives`: JSON-encoded list of `"<filename>.pdf (page N)"` strings (stored as a string in the exported CSV/JSON)
-
-Additional columns may appear depending on synthesizer/version (e.g., persona/style metadata).
-
-### Source mapping columns added by this repo
-
-When saving, this repo tries to map each `reference_contexts` entry back to the original loaded docs, then adds:
-- `source_files`: JSON-encoded list of filenames (stored as a string in the exported CSV/JSON)
-- `source_files_with_pages`: JSON-encoded list like `"file.pdf (page 5)"` (stored as a string in the exported CSV/JSON)
-- `page_numbers`: JSON-encoded list of page numbers (1-indexed; `null` for non-paginated docs; stored as a string in the exported CSV/JSON)
-- `source_files_readable`, `source_files_with_pages_readable`: comma-separated strings for quick inspection
-
-This mapping is **heuristic string matching** against loaded `Document.page_content`, so it's "best effort."
+KG caches use stable keys derived from absolute paths + file sizes + modification times. Use `--reprocess` to force a rebuild.
 
 ---
 
-## Evaluating embedding model search quality
+## Evaluating embedding models
 
-`evaluate_search.py` measures how well an embedding model retrieves the correct source pages for each query in a generated dataset. It reuses the pre-computed page embeddings stored in SQLite -- no need to re-embed the corpus.
-
-### Quick start
+`evaluate_search.py` measures retrieval quality using a generated dataset. It reuses pre-computed page embeddings from SQLite.
 
 ```bash
 python evaluate_search.py \
-  --dataset output/dataset_with_negatives_v11.csv \
+  --dataset output/combined_dataset.csv \
   --embedding-model text-embedding-3-large \
   --top-k 1 5 10 20
 ```
-
-Results are saved to `output/eval_text_embedding_3_large.json` and a summary is printed to stdout.
-
-### What it does
-
-1. Loads the dataset CSV (queries + ground truth source pages + hard negatives)
-2. Loads page embeddings from SQLite for the specified model
-3. Embeds all queries using the same model (the only API call)
-4. Ranks all corpus pages by cosine similarity to each query
-5. Computes metrics: Recall@K, MRR, MAP, hard negative rank analysis
 
 ### Metrics
 
 | Metric | Description |
 |--------|-------------|
 | **Recall@K** | Did any correct source page appear in the top K results? |
-| **MRR** | Mean Reciprocal Rank -- 1/rank of the first correct page, averaged |
-| **MAP** | Mean Average Precision -- precision at each relevant rank, averaged |
+| **MRR** | Mean Reciprocal Rank (unbounded) — 1/rank of the first correct page, averaged |
+| **MRR@K** | Truncated MRR — same as MRR but 0 if the first positive is beyond rank K |
+| **nDCG@K** | Normalised Discounted Cumulative Gain at K (binary relevance) |
+| **MAP** | Mean Average Precision — precision at each relevant rank, averaged |
 | **HN rank** | Where do hard negatives rank vs positives? |
 | **HN outranks %** | How often does a hard negative appear before any positive? |
 
-### Flags
-
-- `--dataset` (required): Path to the generated dataset CSV
-- `--embedding-model` (required): Model name or deployment ID (e.g., `text-embedding-3-large`, `eu.cohere.embed-v4:0`)
-- `--top-k`: K values to evaluate (default: `1 5 10 20`)
-- `--pdf-store-db`: Custom SQLite path (default: `processed/pdf_page_store.sqlite`)
-- `--provider`: `auto` / `openai` / `azure` / `bedrock` (default: auto-detect from env vars)
-- `--output`: Custom output path (default: `output/eval_{model}.json`)
-
-### Supported embedding providers
+### Supported providers
 
 | Provider | `--provider` | Env vars needed | Example model |
 |----------|-------------|-----------------|---------------|
@@ -503,95 +322,101 @@ Results are saved to `output/eval_text_embedding_3_large.json` and a summary is 
 | Azure OpenAI | `azure` | `AZURE_OPENAI_*` | `text-embedding-3-large` |
 | AWS Bedrock | `bedrock` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_BEDROCK_REGION` | `eu.cohere.embed-v4:0` |
 
-With `--provider auto`, the script detects the provider from environment variables (Azure > OpenAI > Bedrock).
+Bedrock uses a direct API wrapper (`_DirectBedrockCohereEmbedder`) that bypasses `langchain_aws` to avoid parameter compatibility issues with Cohere Embed v4. Pages with empty or whitespace-only content are automatically skipped during embedding.
 
-### Evaluating a new model
+If a model doesn't have embeddings in SQLite yet, the script auto-embeds all corpus pages (one-time, resume-safe).
 
-When you specify a model that doesn't have embeddings in SQLite yet, the script automatically:
-1. Adds model-specific columns to the SQLite table
-2. Embeds all corpus pages using that model (one-time cost, with retry/backoff for throttling)
-3. Stores embeddings after each batch (resume-safe -- if interrupted, re-run picks up where it left off)
-4. Proceeds with evaluation
+---
+
+## Validating datasets
+
+`validate_dataset.py` uses an LLM-as-a-judge to evaluate each query:
+
+1. **Query Quality** — Is the query appropriate for a law-focused IR dataset?
+2. **Source Answerability** — Does the **labeled positive page(s)** truly answer the query? (fetches actual page content from SQLite rather than relying on `reference_contexts`, which may contain text from different pages)
+3. **Hard Negative Quality** — Is each hard negative a true hard negative?
+
+The validator handles both single-hop and multi-hop rows transparently:
+- Strips `<N-hop>` prefixes from reference contexts before sending to the LLM judge
+- Resolves source display from `source_file_with_page`, `source_files_with_pages_readable`, or `source_files_with_pages` (JSON) — whichever is populated
+
+### Output
+
+- **JSON report** — full results including a `by_synthesizer` breakdown (pass/fail counts per synthesizer type)
+- **CSV report** — one row per evaluated query with a `synthesizer` column for filtering
+- **Console summary** — includes a "BY SYNTHESIZER TYPE" section showing per-type query quality and source answerability rates
 
 ```bash
-# OpenAI model
-python evaluate_search.py \
-  --dataset output/dataset_with_negatives_v11.csv \
-  --embedding-model text-embedding-3-small
-
-# AWS Bedrock / Cohere model
-python evaluate_search.py \
-  --dataset output/dataset_with_negatives_v11.csv \
-  --embedding-model eu.cohere.embed-v4:0 \
-  --provider bedrock
-
-# Second run with same model: instant (embeddings loaded from SQLite)
-python evaluate_search.py \
-  --dataset output/dataset_with_negatives_v11.csv \
-  --embedding-model eu.cohere.embed-v4:0 \
-  --provider bedrock
+python validate_dataset.py \
+  --dataset output/combined_dataset.csv \
+  --output validation_report
 ```
 
 ---
 
-## Multi-model embedding storage
+## Outputs and schema
 
-The SQLite store supports **multiple embedding models** side by side. Each model gets its own column pair:
+Output files are saved to `output/` in the formats you request (`--output-formats csv json parquet`).
 
-```
-emb__text_embedding_3_large       BLOB
-emb_dims__text_embedding_3_large  INTEGER
-emb__text_embedding_3_small       BLOB
-emb_dims__text_embedding_3_small  INTEGER
-```
+### Core columns
 
-Model names are sanitized for column names (e.g., `text-embedding-3-large` becomes `text_embedding_3_large`). Columns are added dynamically via `ALTER TABLE` when a new model is first used.
+| Column | Description |
+|--------|-------------|
+| `user_input` | The generated question |
+| `reference` | The grounded answer |
+| `reference_contexts` | Context strings used to ground the answer |
+| `synthesizer_name` | `single_hop_direct` or `multi_hop_ragas` (world mode) |
+| `world` | World subfolder name (multi-hop rows only) |
 
-The legacy columns (`embedding_f32`, `embedding_model`, `embedding_dims`) are preserved for backward compatibility. When `--pdf-store-embeddings` is used in the generation pipeline, embeddings are written to both legacy and model-specific columns.
+### Source mapping columns
 
-**Important:** If you add new PDFs with `--pdf-store-embeddings`, the new pages get embeddings for the current model only. Other model columns remain NULL for those pages. The evaluation script handles this by auto-computing missing embeddings.
+| Column | Description |
+|--------|-------------|
+| `source_files` | JSON list of filenames |
+| `source_files_with_pages` | JSON list like `"file.pdf (page 5)"` |
+| `page_numbers` | JSON list of 1-indexed page numbers |
+| `source_files_readable` | Comma-separated string for quick inspection |
+| `source_files_with_pages_readable` | Comma-separated string |
+
+For **single-hop** queries, source mapping is exact (the source page is known at generation time). For **multi-hop** queries, source mapping is resolved by matching reference contexts against the KG's DOCUMENT nodes (which carry exact source + page metadata) using a 5-strategy matching pipeline:
+
+1. **Exact match** — context text matches node `page_content` exactly
+2. **Whitespace-normalised exact match** — collapses all whitespace to single spaces before comparison (handles RAGAS inserting extra spaces/newlines)
+3. **Containment** — context is a substring of a node's text, or vice-versa; picks the best overlap
+4. **Whitespace-normalised containment** — same as above but with normalised text
+5. **Head-chunk fallback** — first 100 normalised characters of context found in a node
+
+### Hard negative column
+
+When `--hard-negatives` is enabled:
+- `hard_negatives` — JSON list of `"<filename> (page N)"` strings
 
 ---
 
-## Customizing the generation
+## How RAGAS works here
 
-### Change transform behavior
+RAGAS generates the dataset in two phases:
 
-This script currently uses:
-- `default_transforms(...)` from RAGAS, then patches (in `modules/transforms.py`):
-  - `HeadlineSplitter` → `SafeHeadlineSplitter` (no fallback chunking)
-  - adds a `HeadlinesExtractor` + filter step to **skip documents without usable headlines**
-  - adds `EmbeddingExtractor` for `page_content` → `page_content_embedding`
-  - adds `CosineSimilarityBuilder` for `page_content_embedding` → `content_similarity` edges
+### Phase A: Documents → Knowledge Graph
 
-If you want full control, you can:
-- build your own transform list (extractors/splitters/relationship builders)
-- replace the `transforms = ...` block in `build_knowledge_graph(...)` (in `modules/testset.py`) and call `apply_transforms(kg, your_transforms, ...)`
+1. Documents are loaded from SQLite and converted to KG DOCUMENT nodes
+2. `default_transforms(...)` applies LLM-based extractors + embedding steps:
+   - **HeadlinesExtractor** → headline-based splitting into CHUNK nodes
+   - **SummaryExtractor** → per-node summaries
+   - **NERExtractor** + **ThemesExtractor** → entities and themes
+   - **EmbeddingExtractor** → summary + page_content embeddings
+   - **CosineSimilarityBuilder** → similarity edges between nodes
+   - **OverlapScoreBuilder** → entity overlap edges
+3. This repo patches the pipeline with `SafeHeadlineSplitter` (filters out docs without usable headlines) and adds page_content embeddings for 100% node coverage
 
-### Change query mix
+### Phase B: KG → Scenarios → Q&A samples
 
-RAGAS accepts `query_distribution=...` (a list of `(synthesizer, probability)` pairs).
+1. **Personas**: clustered from document summaries via embeddings + LLM
+2. **Synthesizers**: single-hop (entity/theme-driven) + multi-hop (abstract via similarity, specific via entity overlap)
+3. **Scenarios**: sample nodes, themes, personas from the KG
+4. **Generation**: LLM produces (question, answer) faithful to the selected context(s)
 
-This script starts from the default RAGAS distribution, and when `--standalone-queries` is enabled (default) it patches the synthesizer prompts to encourage **standalone, corpus-level** search queries. Disable this behavior with `--no-standalone-queries` if you want unmodified RAGAS prompts.
-
-This repo also exposes:
-- `--query-mix ...`: override the synthesizer mix (names or `name=weight` pairs)
-- `--list-query-synthesizers`: print available synthesizer names
-
-### PDF profiles (improving query realism across many PDFs)
-
-When `--pdf-profiles` is enabled (default), the script generates a **PDF-level profile** for each PDF (stored in the SQLite page store) and injects it into query generation as additional context. This helps the LLM write questions that sound like what a person would search for when looking across **thousands of documents**, not just "what's on this page."
-
-Profiles are persisted in the SQLite DB (one profile per PDF) so reruns across different subsets can reuse them.
-
-Profile inputs include:
-- the PDF's **folder path** (e.g., `Claires/…`)
-- the **filename stem** (e.g., `222_Notice_of_Appearance.._Filed_by_Wichita_County._(Lerew_Mollie)`)
-- a short excerpt from the first few pages
-
-Notes:
-- The profiler metadata is used to improve **query framing only**; answers are still expected to be grounded in the provided context excerpt(s).
-- If you want to reduce cost/latency, lower `--pdf-profile-max-pages` and/or `--pdf-profile-max-chars-per-page`, or disable with `--no-pdf-profiles`.
+In **world mode**, Phase A runs once per world (building a smaller, tractable KG), and only multi-hop synthesizers are used. Single-hop queries are generated separately from the full corpus without any KG.
 
 ---
 
@@ -599,53 +424,28 @@ Notes:
 
 ### "No API credentials found"
 
-Set either:
-- `OPENAI_API_KEY`, or
-- `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` (plus deployment names)
-
-See `.env.example`.
+Set either `OPENAI_API_KEY`, or `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` (plus deployment names). See `.env.example`.
 
 ### "Documents appears to be too short (100 tokens or less)"
 
-RAGAS's default transform selection expects enough longer docs.
-Options:
-- provide longer source docs (or chunk them differently before feeding them), or
-- implement custom transforms that work with short docs.
+RAGAS's default transforms need longer docs. Provide longer source documents or implement custom transforms.
 
 ### "rank_bm25 is required for BM25 hard negative mining"
 
-BM25 mining is optional. If you see this error and you don't need BM25 candidates, set:
-`--num-bm25-negatives 0`.
-
-To enable BM25 mining, install the BM25 library:
-```bash
-pip install rank_bm25
-```
-
-Or reinstall all requirements:
-```bash
-pip install -r requirements.txt
-```
+Install with `pip install rank_bm25`, or set `--num-bm25-negatives 0` to skip BM25 candidates.
 
 ### Slow or expensive runs
 
-Cost drivers:
-- LLM calls during transforms (summary/NER/themes/filtering)
-- persona generation
-- Q/A generation for each sample
-- Page content embedding (relatively cheap)
+Cost drivers: LLM calls during KG transforms, persona generation, Q/A generation, page embedding.
 
 Ways to reduce:
-- lower `--testset-size`
-- reduce the number of loaded PDFs via `--max-pdfs` or narrower `--specific-folders`
-- use a smaller/cheaper model
-- use `--no-content-embeddings` to skip page_content embedding (not recommended)
+- Use world mode (`--multi-hop-worlds`) to avoid building one giant KG
+- Lower `--testset-size`, `--single-hop-size`, `--multi-hop-size`
+- Use `--max-pdfs` or narrower `--specific-folders`
+- Use a smaller/cheaper model
+- Use `--no-pdf-profiles` if profiles are already computed via `profile_corpus.py`
+- Use `--no-content-embeddings` to skip page_content embeddings (not recommended)
 
-### Cache invalidation
+### KG cache misses
 
-The caching system uses stable cache keys derived from:
-- Source PDF fingerprints (absolute path + size + modification time)
-- Provider/model/embedding id
-- Pipeline configuration changes (e.g., toggling `--no-content-embeddings`)
-
-To force a rebuild, use `--reprocess`.
+The KG cache key includes absolute file paths + modification times. If files are touched, copied, or the path changes, the cache won't match. Use `--reprocess` to force a rebuild, or create symlinks in `processed/kg/` to map the new key to an existing cache file.
