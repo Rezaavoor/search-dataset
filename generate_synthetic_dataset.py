@@ -50,7 +50,11 @@ from modules.db import (
     pdf_store_needs_refresh,
     upsert_pdf_into_store,
 )
-from modules.hard_negatives import mine_hard_negatives_for_testset
+from modules.hard_negatives import (
+    load_all_pages_from_store,
+    mine_hard_negatives_for_df,
+    mine_hard_negatives_for_testset,
+)
 from modules.llm_setup import setup_llm_and_embeddings
 from modules.profiles import build_pdf_profiles_from_store
 from modules.synthesizers import (
@@ -354,6 +358,8 @@ def main() -> int:
         if single_hop_size > 0:
             total_steps += 1  # single-hop step
         total_steps += len(args.multi_hop_worlds)  # one step per world
+        if args.hard_negatives:
+            total_steps += 1
     else:
         # collect, setup LLM, sync store, load docs,
         # [profiles], KG, personas, testset, save
@@ -951,14 +957,37 @@ def _run_world_pipeline(
     combined_df = pd.concat(all_dfs, ignore_index=True)
 
     # -------------------------------------------------------------------
-    # Hard negatives (optional) — uses full-corpus KG from legacy mode
-    # only; skipped in world mode with a note
+    # Hard negatives (optional) — mines from full corpus via SQLite
     # -------------------------------------------------------------------
     if args.hard_negatives:
+        steps.next("Mining hard negatives")
+
+        raw_embedding_model = generator_embeddings
+        judge_llm = getattr(generator_llm, "langchain_llm", None)
+
+        print("  Loading all pages from SQLite store...")
+        hn_pages = load_all_pages_from_store(
+            pdf_store_conn,
+            embedding_model_name=embedding_id,
+        )
+
+        hard_negs = mine_hard_negatives_for_df(
+            combined_df,
+            hn_pages,
+            raw_embedding_model,
+            judge_llm=judge_llm,
+            num_bm25_negatives=args.num_bm25_negatives,
+            num_embedding_negatives=args.num_embedding_negatives,
+        )
+
+        import json as _json
+        combined_df["hard_negatives"] = [
+            _json.dumps(negs, ensure_ascii=False) for negs in hard_negs
+        ]
+        neg_count = sum(len(x) for x in hard_negs)
         print(
-            "\n  Note: Hard negative mining in world mode is not yet "
-            "supported via RAGAS KG.  Use generate_single_hop.py or "
-            "evaluate_search.py for hard negatives on world-mode output."
+            f"  Added {neg_count} hard negatives "
+            f"({neg_count / max(len(combined_df), 1):.1f} avg per query)"
         )
 
     # -------------------------------------------------------------------
@@ -989,6 +1018,8 @@ def _run_world_pipeline(
     print(f"  Multi-hop (per-world KGs): {mh_count}")
     for w, c in world_counts.items():
         print(f"    - {w}: {c}")
+    if args.hard_negatives:
+        print("  Hard negatives: included")
     print(f"  Output directory: {OUTPUT_DIR}")
     print(f"{'=' * 60}")
 

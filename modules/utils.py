@@ -97,6 +97,17 @@ def normalize_ynu(value: Any) -> str:
     return "uncertain"
 
 
+def normalize_topical_similarity(value: Any) -> str:
+    s = str(value or "").strip().lower()
+    if s in {"high", "h"}:
+        return "high"
+    if s in {"medium", "med", "m", "moderate"}:
+        return "medium"
+    if s in {"low", "l"}:
+        return "low"
+    return "none"
+
+
 # ---------------------------------------------------------------------------
 # Text truncation
 # ---------------------------------------------------------------------------

@@ -1,6 +1,9 @@
 """Hard negative mining (BM25, embedding, LLM judge)."""
 
+import json
 import os
+import re
+import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -8,8 +11,10 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from ragas.testset.graph import NodeType
 
+from .db import _emb_col, _emb_dims_col
 from .utils import (
     extract_json_object,
+    normalize_topical_similarity,
     normalize_ynu,
     parse_reference_contexts,
     strip_hop_prefix,
@@ -25,11 +30,15 @@ def llm_is_hard_negative(
     *,
     question: str,
     passage: str,
-) -> Optional[bool]:
+) -> Optional[int]:
     """
     Ask an LLM whether a passage is a *hard negative* for a question.
 
-    Returns True (relevant but not answerable), False (otherwise), or None (uncertain).
+    Returns:
+        1  — tier 1 (ideal): relevant=yes, answerable=no, topical_similarity=high
+        2  — tier 2 (acceptable): answerable=no, relevant=yes|uncertain,
+             topical_similarity=high|medium
+        None — reject (answerable=yes with valid evidence, or relevant=no)
     """
     if judge_llm is None:
         return None
@@ -38,6 +47,7 @@ def llm_is_hard_negative(
         "You are a strict evaluator.\n"
         "Decide whether the PASSAGE is relevant to the QUESTION, and whether it "
         "contains enough information to answer the QUESTION.\n"
+        "Also rate how topically similar the passage is to the question's domain.\n"
         "Use ONLY the passage. Do not use outside knowledge.\n"
         'If answerable="yes", you MUST include an exact verbatim quote from the '
         "passage that contains the key information.\n"
@@ -51,6 +61,7 @@ def llm_is_hard_negative(
         'Return JSON in this exact schema:\n'
         '{"relevant":"yes|no|uncertain",'
         '"answerable":"yes|no|uncertain",'
+        '"topical_similarity":"high|medium|low|none",'
         '"evidence":"<verbatim quote if answerable=yes else empty>"}'
     )
 
@@ -67,18 +78,27 @@ def llm_is_hard_negative(
 
     relevant = normalize_ynu(data.get("relevant"))
     answerable = normalize_ynu(data.get("answerable"))
+    topical = normalize_topical_similarity(data.get("topical_similarity"))
     evidence = str(data.get("evidence") or "")
 
+    # Reject: answerable with valid evidence
     if answerable == "yes":
-        if not evidence or evidence not in passage_snippet:
+        if evidence and evidence in passage_snippet:
             return None
 
-    if relevant == "yes" and answerable == "no":
-        return True
-    if answerable == "yes":
-        return False
+    # Reject: not relevant at all
     if relevant == "no":
-        return False
+        return None
+
+    # Tier 1 (ideal): relevant=yes, answerable=no, topical_similarity=high
+    if relevant == "yes" and answerable == "no" and topical == "high":
+        return 1
+
+    # Tier 2 (acceptable): answerable=no, relevant=yes|uncertain,
+    # topical_similarity=high|medium
+    if answerable == "no" and relevant in {"yes", "uncertain"} and topical in {"high", "medium"}:
+        return 2
+
     return None
 
 
@@ -150,6 +170,47 @@ def _top_indices_desc(scores: Any, top_n: int) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
+# Reciprocal Rank Fusion (RRF) merge
+# ---------------------------------------------------------------------------
+def reciprocal_rank_fusion(
+    *ranked_lists: List[Tuple[str, int]],
+    k: int = 60,
+) -> List[Tuple[str, int]]:
+    """Merge ranked lists via RRF: score = sum(1/(k+rank)) per item.
+
+    Items appearing in only one list still participate (missing lists
+    contribute 0 for that item).  Returns a single list sorted by
+    descending RRF score.
+    """
+    scores: Dict[Tuple[str, int], float] = {}
+    for ranked_list in ranked_lists:
+        for rank, item in enumerate(ranked_list, start=1):
+            scores[item] = scores.get(item, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Proximity-based page exclusion
+# ---------------------------------------------------------------------------
+def expand_pages_with_proximity(
+    pages: set,
+    buffer: int = 2,
+) -> set:
+    """Expand a set of (filename, page) keys by ±buffer pages.
+
+    Skips page numbers < 1.  Used to replace whole-file exclusion with
+    proximity-based page exclusion.
+    """
+    expanded: set = set()
+    for filename, page in pages:
+        for offset in range(-buffer, buffer + 1):
+            p = page + offset
+            if p >= 1:
+                expanded.add((filename, p))
+    return expanded
+
+
+# ---------------------------------------------------------------------------
 # BM25 hard negative finder
 # ---------------------------------------------------------------------------
 def find_bm25_hard_negative_pages(
@@ -157,7 +218,7 @@ def find_bm25_hard_negative_pages(
     pages: List[Dict[str, Any]],
     bm25: Any,
     *,
-    exclude_files: set,
+    exclude_files: Optional[set] = None,
     exclude_pages: set,
     top_k: int = 50,
     pool_size: int = 200,
@@ -173,7 +234,7 @@ def find_bm25_hard_negative_pages(
             break
         p = pages[i]
         key = (p.get("file"), p.get("page"))
-        if key in exclude_pages or p.get("file") in exclude_files or key in seen:
+        if key in exclude_pages or (exclude_files and p.get("file") in exclude_files) or key in seen:
             continue
         if not p.get("file") or not p.get("page"):
             continue
@@ -193,7 +254,7 @@ def find_embedding_hard_negative_pages(
     pages: List[Dict[str, Any]],
     *,
     candidate_indices: Optional[List[int]] = None,
-    exclude_files: set,
+    exclude_files: Optional[set] = None,
     exclude_pages: set,
     top_k: int = 50,
     min_similarity: float = 0.25,
@@ -207,7 +268,7 @@ def find_embedding_hard_negative_pages(
             continue
         p = pages[i]
         key = (p.get("file"), p.get("page"))
-        if key in exclude_pages or p.get("file") in exclude_files:
+        if key in exclude_pages or (exclude_files and p.get("file") in exclude_files):
             continue
         emb = p.get("embedding")
         if emb is None:
@@ -418,7 +479,6 @@ def mine_hard_negatives_for_testset(
             for c in parse_reference_contexts(row.get("reference_contexts"))
         ]
         pos_info = find_source_files(contexts, docs)
-        pos_files = {f for f in (pos_info.get("sources") or []) if f and f != "unknown"}
         pos_pages = {
             (d.get("file"), d.get("page"))
             for d in (pos_info.get("source_page_pairs") or [])
@@ -427,9 +487,11 @@ def mine_hard_negatives_for_testset(
 
         source_mappings.append(pos_info)
 
-        if not pos_files or not pos_pages:
+        if not pos_pages:
             hard_negatives_list.append([])
             continue
+
+        exclude_pages = expand_pages_with_proximity(pos_pages)
 
         pos_embs = [
             page_emb_norm_by_key.get(k)
@@ -442,7 +504,7 @@ def mine_hard_negatives_for_testset(
         if bm25 is not None and num_bm25_negatives > 0:
             bm25_negs = find_bm25_hard_negative_pages(
                 query, pages, bm25,
-                exclude_files=pos_files, exclude_pages=pos_pages,
+                exclude_pages=exclude_pages,
                 top_k=max(50, num_bm25_negatives * 10),
             )
 
@@ -460,16 +522,16 @@ def mine_hard_negatives_for_testset(
                 emb_negs = find_embedding_hard_negative_pages(
                     q_emb, pages,
                     candidate_indices=cand_idxs,
-                    exclude_files=pos_files, exclude_pages=pos_pages,
+                    exclude_pages=exclude_pages,
                     top_k=max(50, num_embedding_negatives * 10),
                 )
             except Exception as e:
                 print(f"  Warning: Failed to embed query {idx}: {e}")
 
-        # Merge strategies
+        # RRF merge
         if num_bm25_negatives > 0 and num_embedding_negatives > 0:
             if bm25 is not None and bm25_negs and emb_negs:
-                base_keys = sorted(set(bm25_negs).intersection(set(emb_negs)))
+                base_keys = reciprocal_rank_fusion(bm25_negs, emb_negs)
             else:
                 base_keys = emb_negs or bm25_negs
         elif num_embedding_negatives > 0:
@@ -477,13 +539,14 @@ def mine_hard_negatives_for_testset(
         else:
             base_keys = bm25_negs
 
-        # Conservative filtering
-        filtered_keys: List[Tuple[str, int]] = []
-        seen_files: set = set()
+        # Tiered filtering
+        tier1_keys: List[Tuple[str, int]] = []
+        tier2_keys: List[Tuple[str, int]] = []
+        file_neg_count: Dict[str, int] = {}
         judged = 0
         for key in base_keys:
             f, p = key
-            if f in pos_files or key in pos_pages:
+            if key in exclude_pages:
                 continue
             page_rec = page_by_key.get(key)
             if not page_rec:
@@ -497,25 +560,381 @@ def mine_hard_negatives_for_testset(
                 if max_sim >= near_duplicate_cosine_threshold:
                     continue
 
-            if f in seen_files:
+            if file_neg_count.get(f, 0) >= 2:
                 continue
 
             verdict = llm_is_hard_negative(judge_llm, question=query, passage=cand_text)
             judged += 1
-            if verdict is not True:
-                if judged >= max_judge_calls_per_query:
-                    break
-                continue
+            if verdict == 1:
+                file_neg_count[f] = file_neg_count.get(f, 0) + 1
+                tier1_keys.append(key)
+            elif verdict == 2:
+                file_neg_count[f] = file_neg_count.get(f, 0) + 1
+                tier2_keys.append(key)
 
-            seen_files.add(f)
-            filtered_keys.append(key)
-            if len(filtered_keys) >= desired_count:
+            if len(tier1_keys) + len(tier2_keys) >= desired_count * 2:
                 break
             if judged >= max_judge_calls_per_query:
                 break
+
+        # Select tier 1 first, fill remaining from tier 2
+        filtered_keys = tier1_keys[:desired_count]
+        remaining = desired_count - len(filtered_keys)
+        if remaining > 0:
+            filtered_keys.extend(tier2_keys[:remaining])
 
         hard_negatives_list.append([f"{f} (page {p})" for (f, p) in filtered_keys])
 
     total_negs = sum(len(x) for x in hard_negatives_list)
     print(f"  Mined {total_negs} hard negative(s) for {len(testset_df)} queries")
     return hard_negatives_list, source_mappings
+
+
+# ---------------------------------------------------------------------------
+# Load all pages from SQLite (no KG needed)
+# ---------------------------------------------------------------------------
+def load_all_pages_from_store(
+    conn: sqlite3.Connection,
+    embedding_model_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Load all pages from SQLite as hard-negative candidates.
+
+    Equivalent to ``_extract_pages_from_kg`` but works without a KG by
+    reading directly from the SQLite page store.
+    """
+    emb_select = ""
+    emb_col = None
+    dims_col = None
+    if embedding_model_name:
+        emb_col = _emb_col(embedding_model_name)
+        dims_col = _emb_dims_col(embedding_model_name)
+        try:
+            existing = {
+                str(r[1])
+                for r in conn.execute(
+                    "PRAGMA table_info(pdf_page_store)"
+                ).fetchall()
+            }
+            if emb_col in existing and dims_col in existing:
+                emb_select = f", {emb_col}, {dims_col}"
+            else:
+                emb_col = None
+                dims_col = None
+        except Exception:
+            emb_col = None
+            dims_col = None
+
+    rows = conn.execute(
+        f"""
+        SELECT rel_path, page_number, filename, doc_content{emb_select}
+        FROM pdf_page_store
+        WHERE content_chars >= 100
+        ORDER BY rel_path, page_number
+        """
+    ).fetchall()
+
+    pages: List[Dict[str, Any]] = []
+    for row in rows:
+        filename = str(row[2])
+        page_number = int(row[1])
+        content = str(row[3] or "")
+
+        embedding = None
+        if emb_col and dims_col and len(row) > 5:
+            blob = row[4]
+            dims = row[5]
+            if isinstance(blob, bytes) and isinstance(dims, int) and dims > 0:
+                try:
+                    vec = np.frombuffer(blob, dtype=np.float32)
+                    if len(vec) == dims:
+                        embedding = vec.tolist()
+                except Exception:
+                    pass
+
+        pages.append({
+            "file": filename,
+            "page": page_number,
+            "source": str(row[0]),
+            "page_content": content,
+            "embedding": embedding,
+        })
+
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# Parse positive pages from DataFrame source columns
+# ---------------------------------------------------------------------------
+_PAGE_RE = re.compile(r"^(.+?)\s*\(page\s+(\d+)\)$")
+
+
+def _parse_positive_pages_from_row(row) -> set:
+    """Extract positive (filename, page) pairs from a DataFrame row.
+
+    Works with both single-hop rows (``source_file`` + ``page_number``)
+    and multi-hop rows (``source_files_with_pages`` JSON list).
+    """
+    pos: set = set()
+
+    # Single-hop direct columns
+    sf = row.get("source_file")
+    pn = row.get("page_number")
+    if sf and pn:
+        try:
+            pos.add((str(sf), int(pn)))
+        except (ValueError, TypeError):
+            pass
+
+    # JSON list column (works for both single- and multi-hop)
+    sfwp_raw = row.get("source_files_with_pages")
+    if isinstance(sfwp_raw, str):
+        try:
+            sfwp_list = json.loads(sfwp_raw)
+        except Exception:
+            sfwp_list = None
+    elif isinstance(sfwp_raw, list):
+        sfwp_list = sfwp_raw
+    else:
+        sfwp_list = None
+
+    if isinstance(sfwp_list, list):
+        for entry in sfwp_list:
+            m = _PAGE_RE.match(str(entry or ""))
+            if m:
+                pos.add((m.group(1), int(m.group(2))))
+
+    return pos
+
+
+# ---------------------------------------------------------------------------
+# Mine hard negatives for a combined DataFrame (world-mode pipeline)
+# ---------------------------------------------------------------------------
+def mine_hard_negatives_for_df(
+    df,
+    pages: List[Dict[str, Any]],
+    embedding_model: Any,
+    judge_llm: Any = None,
+    *,
+    num_bm25_negatives: int = 5,
+    num_embedding_negatives: int = 5,
+    max_judge_calls_per_query: int = 12,
+) -> List[List[str]]:
+    """Mine hard negatives for a combined DataFrame using a pre-loaded page list.
+
+    Uses the same strategy as ``mine_hard_negatives_for_testset`` (RRF merge,
+    proximity exclusion, tiered LLM judge) but derives positive pages from the
+    DataFrame's existing source-mapping columns instead of recomputing them.
+
+    Args:
+        df: Combined DataFrame with ``user_input`` and source-mapping columns.
+        pages: Pre-loaded page list (from ``load_all_pages_from_store``).
+        embedding_model: LangChain embedding model for query embedding.
+        judge_llm: LangChain chat model for LLM judge (raw, not RAGAS-wrapped).
+    """
+    print("  Mining hard negatives (combined DataFrame)...")
+    print(f"  Candidate pages: {len(pages)}")
+
+    pages_with_embeddings = sum(
+        1 for p in pages if p.get("embedding") is not None
+    )
+    print(f"  Pages with embeddings: {pages_with_embeddings}/{len(pages)}")
+
+    # Build BM25 index
+    bm25 = None
+    if num_bm25_negatives > 0:
+        try:
+            bm25, _ = build_bm25_index(pages)
+            print("  Built BM25 index")
+        except ImportError as e:
+            print(f"  Warning: {e}")
+
+    # Build page lookup + normalized embeddings
+    page_by_key: Dict[Tuple[str, int], Dict[str, Any]] = {
+        (p.get("file"), int(p.get("page"))): p
+        for p in pages
+        if p.get("file") and p.get("page")
+    }
+    page_emb_norm_by_key: Dict[Tuple[str, int], Optional[np.ndarray]] = {}
+    for k, p in page_by_key.items():
+        emb = p.get("embedding")
+        if emb is None:
+            page_emb_norm_by_key[k] = None
+            continue
+        try:
+            v = np.asarray(emb, dtype=np.float32)
+        except Exception:
+            page_emb_norm_by_key[k] = None
+            continue
+        if v.ndim != 1 or v.size == 0 or not np.all(np.isfinite(v)):
+            page_emb_norm_by_key[k] = None
+            continue
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            n = np.linalg.norm(v)
+        if not np.isfinite(n) or n == 0:
+            page_emb_norm_by_key[k] = None
+            continue
+        page_emb_norm_by_key[k] = v / n
+
+    near_duplicate_cosine_threshold = 0.92
+
+    # Pre-compute query embeddings in batch
+    query_embeddings: Dict[int, Optional[List[float]]] = {}
+    if num_embedding_negatives > 0 and pages_with_embeddings > 0:
+        all_queries = [
+            (idx, row["user_input"]) for idx, row in df.iterrows()
+        ]
+        query_texts = [q for _, q in all_queries]
+        query_indices = [idx for idx, _ in all_queries]
+        try:
+            batch_embs = embedding_model.embed_documents(query_texts)
+            if (
+                isinstance(batch_embs, list)
+                and len(batch_embs) == len(query_texts)
+            ):
+                for qi, emb in zip(query_indices, batch_embs):
+                    query_embeddings[qi] = (
+                        emb if isinstance(emb, list) else None
+                    )
+                print(
+                    f"  Pre-embedded {len(query_texts)} queries (batched)"
+                )
+        except Exception as e:
+            print(
+                f"  Warning: Batch query embedding failed: {str(e)[:120]}"
+            )
+
+    hard_negatives_list: List[List[str]] = []
+
+    for idx, row in df.iterrows():
+        query = row["user_input"]
+        desired_count = max(
+            int(num_bm25_negatives), int(num_embedding_negatives),
+        )
+        if desired_count <= 0:
+            hard_negatives_list.append([])
+            continue
+
+        # Derive positive pages from existing source columns
+        pos_pages = _parse_positive_pages_from_row(row)
+        if not pos_pages:
+            hard_negatives_list.append([])
+            continue
+
+        exclude_pages = expand_pages_with_proximity(pos_pages)
+
+        pos_embs = [
+            page_emb_norm_by_key.get(k)
+            for k in pos_pages
+            if page_emb_norm_by_key.get(k) is not None
+        ]
+        pos_embs = [v for v in pos_embs if v is not None]
+
+        # BM25 candidates
+        bm25_negs: List[Tuple[str, int]] = []
+        if bm25 is not None and num_bm25_negatives > 0:
+            bm25_negs = find_bm25_hard_negative_pages(
+                query, pages, bm25,
+                exclude_pages=exclude_pages,
+                top_k=max(50, num_bm25_negatives * 10),
+            )
+
+        # Embedding candidates
+        emb_negs: List[Tuple[str, int]] = []
+        if num_embedding_negatives > 0 and pages_with_embeddings > 0:
+            try:
+                q_emb = query_embeddings.get(idx)
+                if q_emb is None and embedding_model is not None:
+                    q_emb = embedding_model.embed_query(query)
+                if q_emb is not None:
+                    cand_idxs: Optional[List[int]] = None
+                    if bm25 is not None:
+                        scores = bm25.get_scores(query.lower().split())
+                        cand_idxs = _top_indices_desc(scores, top_n=300)
+                    emb_negs = find_embedding_hard_negative_pages(
+                        q_emb, pages,
+                        candidate_indices=cand_idxs,
+                        exclude_pages=exclude_pages,
+                        top_k=max(50, num_embedding_negatives * 10),
+                    )
+            except Exception as e:
+                print(
+                    f"  Warning: embedding failed for query {idx}: "
+                    f"{str(e)[:120]}"
+                )
+
+        # RRF merge
+        if num_bm25_negatives > 0 and num_embedding_negatives > 0:
+            if bm25 is not None and bm25_negs and emb_negs:
+                base_keys = reciprocal_rank_fusion(bm25_negs, emb_negs)
+            else:
+                base_keys = emb_negs or bm25_negs
+        elif num_embedding_negatives > 0:
+            base_keys = emb_negs
+        else:
+            base_keys = bm25_negs
+
+        # Tiered LLM judge filtering
+        tier1_keys: List[Tuple[str, int]] = []
+        tier2_keys: List[Tuple[str, int]] = []
+        file_neg_count: Dict[str, int] = {}
+        judged = 0
+        for key in base_keys:
+            f, p = key
+            if key in exclude_pages:
+                continue
+            page_rec = page_by_key.get(key)
+            if not page_rec:
+                continue
+
+            cand_text = str(page_rec.get("page_content") or "")
+
+            # Near-duplicate check
+            cand_v = page_emb_norm_by_key.get(key)
+            if cand_v is not None and pos_embs:
+                max_sim = max(
+                    float(np.dot(cand_v, pv)) for pv in pos_embs
+                )
+                if max_sim >= near_duplicate_cosine_threshold:
+                    continue
+
+            if file_neg_count.get(f, 0) >= 2:
+                continue
+
+            verdict = llm_is_hard_negative(
+                judge_llm, question=query, passage=cand_text,
+            )
+            judged += 1
+            if verdict == 1:
+                file_neg_count[f] = file_neg_count.get(f, 0) + 1
+                tier1_keys.append(key)
+            elif verdict == 2:
+                file_neg_count[f] = file_neg_count.get(f, 0) + 1
+                tier2_keys.append(key)
+
+            if len(tier1_keys) + len(tier2_keys) >= desired_count * 2:
+                break
+            if judged >= max_judge_calls_per_query:
+                break
+
+        # Tier 1 first, fill from tier 2
+        filtered_keys = tier1_keys[:desired_count]
+        remaining = desired_count - len(filtered_keys)
+        if remaining > 0:
+            filtered_keys.extend(tier2_keys[:remaining])
+
+        hard_negatives_list.append(
+            [f"{f} (page {p})" for (f, p) in filtered_keys]
+        )
+
+        if (idx + 1) % 10 == 0:
+            total_so_far = sum(len(x) for x in hard_negatives_list)
+            print(
+                f"  Hard neg progress: {idx + 1}/{len(df)} queries, "
+                f"{total_so_far} negatives mined"
+            )
+
+    total_negs = sum(len(x) for x in hard_negatives_list)
+    print(
+        f"  Mined {total_negs} hard negative(s) for {len(df)} queries"
+    )
+    return hard_negatives_list

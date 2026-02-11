@@ -73,9 +73,11 @@ from modules.db import (
 )
 from modules.hard_negatives import (
     build_bm25_index,
+    expand_pages_with_proximity,
     find_bm25_hard_negative_pages,
     find_embedding_hard_negative_pages,
     llm_is_hard_negative,
+    reciprocal_rank_fusion,
     _top_indices_desc,
 )
 from modules.utils import (
@@ -701,10 +703,15 @@ def mine_hard_negatives_no_kg(
             continue
 
         # Positive set: just the one source file + page we know about
-        pos_files = {source_file} if source_file else set()
         pos_pages = set()
         if source_file and page_number:
             pos_pages.add((source_file, int(page_number)))
+
+        if not pos_pages:
+            hard_negatives_list.append([])
+            continue
+
+        exclude_pages = expand_pages_with_proximity(pos_pages)
 
         pos_embs = [
             page_emb_norm_by_key.get(k)
@@ -718,7 +725,7 @@ def mine_hard_negatives_no_kg(
         if bm25 is not None and num_bm25_negatives > 0:
             bm25_negs = find_bm25_hard_negative_pages(
                 query, pages, bm25,
-                exclude_files=pos_files, exclude_pages=pos_pages,
+                exclude_pages=exclude_pages,
                 top_k=max(50, num_bm25_negatives * 10),
             )
 
@@ -739,14 +746,14 @@ def mine_hard_negatives_no_kg(
                 emb_negs = find_embedding_hard_negative_pages(
                     q_emb, pages,
                     candidate_indices=cand_idxs,
-                    exclude_files=pos_files, exclude_pages=pos_pages,
+                    exclude_pages=exclude_pages,
                     top_k=max(50, num_embedding_negatives * 10),
                 )
 
-        # Merge strategies
+        # RRF merge
         if num_bm25_negatives > 0 and num_embedding_negatives > 0:
             if bm25 is not None and bm25_negs and emb_negs:
-                base_keys = sorted(set(bm25_negs).intersection(set(emb_negs)))
+                base_keys = reciprocal_rank_fusion(bm25_negs, emb_negs)
             else:
                 base_keys = emb_negs or bm25_negs
         elif num_embedding_negatives > 0:
@@ -754,13 +761,14 @@ def mine_hard_negatives_no_kg(
         else:
             base_keys = bm25_negs
 
-        # Conservative filtering with LLM judge
-        filtered_keys: List[Tuple[str, int]] = []
-        seen_files: set = set()
+        # Tiered filtering with LLM judge
+        tier1_keys: List[Tuple[str, int]] = []
+        tier2_keys: List[Tuple[str, int]] = []
+        file_neg_count: Dict[str, int] = {}
         judged = 0
         for key in base_keys:
             f, p = key
-            if f in pos_files or key in pos_pages:
+            if key in exclude_pages:
                 continue
             page_rec = page_by_key.get(key)
             if not page_rec:
@@ -775,22 +783,28 @@ def mine_hard_negatives_no_kg(
                 if max_sim >= near_duplicate_cosine_threshold:
                     continue
 
-            if f in seen_files:
+            if file_neg_count.get(f, 0) >= 2:
                 continue
 
             verdict = llm_is_hard_negative(judge_llm, question=query, passage=cand_text)
             judged += 1
-            if verdict is not True:
-                if judged >= max_judge_calls_per_query:
-                    break
-                continue
+            if verdict == 1:
+                file_neg_count[f] = file_neg_count.get(f, 0) + 1
+                tier1_keys.append(key)
+            elif verdict == 2:
+                file_neg_count[f] = file_neg_count.get(f, 0) + 1
+                tier2_keys.append(key)
 
-            seen_files.add(f)
-            filtered_keys.append(key)
-            if len(filtered_keys) >= desired_count:
+            if len(tier1_keys) + len(tier2_keys) >= desired_count * 2:
                 break
             if judged >= max_judge_calls_per_query:
                 break
+
+        # Select tier 1 first, fill remaining from tier 2
+        filtered_keys = tier1_keys[:desired_count]
+        remaining = desired_count - len(filtered_keys)
+        if remaining > 0:
+            filtered_keys.extend(tier2_keys[:remaining])
 
         hard_negatives_list.append([f"{f} (page {p})" for (f, p) in filtered_keys])
 
