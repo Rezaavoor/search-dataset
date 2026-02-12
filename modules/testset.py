@@ -23,6 +23,7 @@ from .config import REFERENTIAL_QUERY_RE, RAGAS_DOC_EXTRACT_CACHE_VERSION
 from .db import pdf_store_persist_ragas_extractions
 from .hard_negatives import find_source_files
 from .transforms import patch_transforms_with_safe_splitter
+from .quality_filter import expand_hard_negatives_columns
 from .utils import parse_reference_contexts, strip_hop_prefix, utc_now_iso
 
 
@@ -595,6 +596,9 @@ def save_testset(
             f"({neg_count / max(len(df), 1):.1f} avg per query)"
         )
 
+    # Expand hard negatives into separate columns (files + pages)
+    expand_hard_negatives_columns(df)
+
     print(f"  Generated {len(df)} test samples")
     print("\n  Sample preview:")
     preview_cols = (
@@ -647,6 +651,9 @@ def save_combined_dataframe(
     )
     available = [c for c in preview_cols if c in df.columns]
     print(df[available].head())
+
+    # Expand hard negatives into separate columns (files + pages)
+    expand_hard_negatives_columns(df)
 
     _save_df_to_formats(df, output_path, formats)
     return df

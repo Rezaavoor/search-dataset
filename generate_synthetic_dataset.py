@@ -57,6 +57,7 @@ from modules.hard_negatives import (
 )
 from modules.llm_setup import setup_llm_and_embeddings
 from modules.profiles import build_pdf_profiles_from_store
+from modules.quality_filter import filter_dataset
 from modules.synthesizers import (
     build_corpus_llm_context,
     build_query_distribution_for_pipeline,
@@ -285,6 +286,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Embedding hard negatives per query (default: 5)",
     )
 
+    # --- Quality filter ---
+    parser.add_argument(
+        "--filter", action=argparse.BooleanOptionalAction, default=True,
+        help="Run LLM quality filter on generated dataset (default: enabled)",
+    )
+
     # --- SQLite store ---
     parser.add_argument(
         "--pdf-store-db", type=str, default=None,
@@ -346,7 +353,7 @@ def main() -> int:
     world_mode = bool(args.multi_hop_worlds)
     if world_mode:
         # collect, setup LLM, sync store, load docs,
-        # [profiles], single-hop, N×(world KG+multihop), save
+        # [profiles], single-hop, N×(world KG+multihop), save, [filter]
         total_steps = 5  # collect, LLM, store, load docs, save
         if args.pdf_profiles:
             total_steps += 1
@@ -360,13 +367,17 @@ def main() -> int:
         total_steps += len(args.multi_hop_worlds)  # one step per world
         if args.hard_negatives:
             total_steps += 1
+        if args.filter:
+            total_steps += 1
     else:
         # collect, setup LLM, sync store, load docs,
-        # [profiles], KG, personas, testset, save
+        # [profiles], KG, personas, testset, save, [filter]
         total_steps = 8
         if args.pdf_profiles:
             total_steps += 1
         if args.hard_negatives:
+            total_steps += 1
+        if args.filter:
             total_steps += 1
     steps = StepTracker(total_steps)
 
@@ -1077,7 +1088,7 @@ def _run_world_pipeline(
         )
 
     # -------------------------------------------------------------------
-    # FINAL STEP: Save combined results to output/
+    # Save combined results to output/
     # -------------------------------------------------------------------
     steps.next("Saving results")
 
@@ -1085,6 +1096,22 @@ def _run_world_pipeline(
     save_combined_dataframe(
         combined_df, output_path, formats=args.output_formats,
     )
+
+    # -------------------------------------------------------------------
+    # Quality filter (optional)
+    # -------------------------------------------------------------------
+    filtered_df = None
+    filter_stats = None
+    if args.filter:
+        steps.next("Quality filtering")
+        raw_llm = getattr(generator_llm, "langchain_llm", generator_llm)
+        filtered_df, filter_stats = filter_dataset(
+            combined_df, raw_llm, pdf_store_conn,
+        )
+        filtered_path = f"{output_path}_filtered"
+        save_combined_dataframe(
+            filtered_df, filtered_path, formats=args.output_formats,
+        )
 
     # Summary
     sh_count = int(
@@ -1106,6 +1133,10 @@ def _run_world_pipeline(
         print(f"    - {w}: {c}")
     if args.hard_negatives:
         print("  Hard negatives: included")
+    if args.filter and filtered_df is not None and filter_stats is not None:
+        print(
+            f"  Filtered samples: {filter_stats['kept']}/{filter_stats['total']}"
+        )
     print(f"  Output directory: {OUTPUT_DIR}")
     print(f"{'=' * 60}")
 
@@ -1294,7 +1325,7 @@ def _run_legacy_pipeline(
         )
 
     # -----------------------------------------------------------------------
-    # FINAL STEP: Save results to output/
+    # Save results to output/
     # -----------------------------------------------------------------------
     steps.next("Saving results")
 
@@ -1308,11 +1339,31 @@ def _run_legacy_pipeline(
         source_mappings=source_mappings,
     )
 
+    # -----------------------------------------------------------------------
+    # Quality filter (optional)
+    # -----------------------------------------------------------------------
+    filtered_df = None
+    filter_stats = None
+    if args.filter:
+        steps.next("Quality filtering")
+        raw_llm = getattr(generator_llm, "langchain_llm", generator_llm)
+        filtered_df, filter_stats = filter_dataset(
+            df, raw_llm, pdf_store_conn,
+        )
+        filtered_path = f"{output_path}_filtered"
+        save_combined_dataframe(
+            filtered_df, filtered_path, formats=args.output_formats,
+        )
+
     print(f"\n{'=' * 60}")
     print("Generation complete!")
     print(f"  Total samples: {len(df)}")
     if args.hard_negatives:
         print("  Hard negatives: included")
+    if args.filter and filtered_df is not None and filter_stats is not None:
+        print(
+            f"  Filtered samples: {filter_stats['kept']}/{filter_stats['total']}"
+        )
     print(f"  Output directory: {OUTPUT_DIR}")
     print(f"{'=' * 60}")
 
