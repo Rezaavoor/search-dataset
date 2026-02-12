@@ -60,7 +60,6 @@ from modules.db import (
 from modules.hard_negatives import (
     load_all_pages_from_store,
     mine_hard_negatives_for_df,
-    mine_hard_negatives_for_testset,
 )
 from modules.llm_setup import setup_llm_and_embeddings
 from modules.profiles import build_pdf_profiles_from_store
@@ -81,7 +80,6 @@ from modules.testset import (
     save_combined_dataframe,
     save_knowledge_graph_cache,
     save_personas_cache,
-    save_testset,
     warn_on_referential_queries,
 )
 from modules.utils import (
@@ -214,12 +212,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- World-based generation (single-hop + per-world multi-hop) ---
     parser.add_argument(
-        "--multi-hop-worlds", type=str, nargs="+", default=None,
+        "--multi-hop-worlds", type=str, nargs="+", default=["."],
         help=(
-            "Enable world-based generation: list of subfolder paths (relative "
-            "to --input-dir) for which per-world KGs are built and multi-hop "
-            "queries are generated.  Single-hop queries are generated from the "
-            "full corpus without a KG.  Supports nested paths.  Example: "
+            "List of world subfolder paths (relative to --input-dir) for "
+            "which per-world KGs are built and multi-hop queries are generated. "
+            "Single-hop queries are generated from the full corpus without a KG. "
+            "Supports nested paths. Example: "
             '--multi-hop-worlds Claires "Law worlds/415"'
         ),
     )
@@ -227,14 +225,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--single-hop-size", type=int, default=None,
         help=(
             "Number of single-hop queries to generate from the full corpus "
-            "(world mode only; default: half of --testset-size)"
+            "(default: half of --testset-size)"
         ),
     )
     parser.add_argument(
         "--multi-hop-size", type=int, default=None,
         help=(
             "Total number of multi-hop queries across all worlds "
-            "(world mode only; default: half of --testset-size)"
+            "(default: half of --testset-size)"
         ),
     )
     parser.add_argument(
@@ -361,35 +359,23 @@ def main() -> int:
         return 1
 
     # --- Compute total steps ---
-    world_mode = bool(args.multi_hop_worlds)
-    if world_mode:
-        # collect, setup LLM, sync store, load docs,
-        # [profiles], single-hop, N×(world KG+multihop), save, [filter]
-        total_steps = 5  # collect, LLM, store, load docs, save
-        if args.pdf_profiles:
-            total_steps += 1
-        single_hop_size = (
-            args.single_hop_size
-            if args.single_hop_size is not None
-            else max(args.testset_size, 1) // 2
-        )
-        if single_hop_size > 0:
-            total_steps += 1  # single-hop step
-        total_steps += len(args.multi_hop_worlds)  # one step per world
-        if args.hard_negatives:
-            total_steps += 1
-        if args.filter:
-            total_steps += 1
-    else:
-        # collect, setup LLM, sync store, load docs,
-        # [profiles], KG, personas, testset, save, [filter]
-        total_steps = 8
-        if args.pdf_profiles:
-            total_steps += 1
-        if args.hard_negatives:
-            total_steps += 1
-        if args.filter:
-            total_steps += 1
+    # collect, setup LLM, sync store, load docs,
+    # [profiles], single-hop, N×(world KG+multihop), save, [filter]
+    total_steps = 5  # collect, LLM, store, load docs, save
+    if args.pdf_profiles:
+        total_steps += 1
+    single_hop_size = (
+        args.single_hop_size
+        if args.single_hop_size is not None
+        else max(args.testset_size, 1) // 2
+    )
+    if single_hop_size > 0:
+        total_steps += 1  # single-hop step
+    total_steps += len(args.multi_hop_worlds)  # one step per world
+    if args.hard_negatives:
+        total_steps += 1
+    if args.filter:
+        total_steps += 1
     steps = StepTracker(total_steps)
 
     print("\n" + "=" * 60)
@@ -620,63 +606,30 @@ def main() -> int:
         extra = str(args.query_llm_context or "").strip()
         llm_context = extra if extra else None
 
-    # ===================================================================
-    # Decide pipeline mode
-    # ===================================================================
-    world_mode = bool(args.multi_hop_worlds)
-
-    if world_mode:
-        # ==============================================================
-        # WORLD MODE: single-hop from full corpus + multi-hop per world
-        # ==============================================================
-        return _run_world_pipeline(
-            args=args,
-            steps=steps,
-            pdf_paths=pdf_paths,
-            pdf_store_conn=pdf_store_conn,
-            pdf_store_db_path=pdf_store_db_path,
-            base_input_dir=base_input_dir,
-            all_docs=all_docs,
-            generator_llm=generator_llm,
-            generator_embeddings=generator_embeddings,
-            provider_used=provider_used,
-            embedding_id=embedding_id,
-            add_content_embeddings=add_content_embeddings,
-            cache_enabled=cache_enabled,
-            kg_cache_dir=kg_cache_dir,
-            meta_dir=meta_dir,
-            progress_dir=processed_dir / "progress",
-            personas_cache_dir=personas_cache_dir,
-            pdf_profiles_by_source=pdf_profiles_by_source,
-            llm_context=llm_context,
-            reuse_cached_store_extractions=reuse_cached_store_extractions,
-            ragas_doc_extraction_model_tag_base=ragas_doc_extraction_model_tag_base,
-        )
-    else:
-        # ==============================================================
-        # LEGACY MODE: single KG for all docs
-        # ==============================================================
-        return _run_legacy_pipeline(
-            args=args,
-            steps=steps,
-            pdf_paths=pdf_paths,
-            pdf_store_conn=pdf_store_conn,
-            base_input_dir=base_input_dir,
-            all_docs=all_docs,
-            generator_llm=generator_llm,
-            generator_embeddings=generator_embeddings,
-            provider_used=provider_used,
-            embedding_id=embedding_id,
-            add_content_embeddings=add_content_embeddings,
-            cache_enabled=cache_enabled,
-            kg_cache_dir=kg_cache_dir,
-            meta_dir=meta_dir,
-            personas_cache_dir=personas_cache_dir,
-            pdf_profiles_by_source=pdf_profiles_by_source,
-            llm_context=llm_context,
-            reuse_cached_store_extractions=reuse_cached_store_extractions,
-            ragas_doc_extraction_model_tag_base=ragas_doc_extraction_model_tag_base,
-        )
+    # World mode is the only supported pipeline.
+    return _run_world_pipeline(
+        args=args,
+        steps=steps,
+        pdf_paths=pdf_paths,
+        pdf_store_conn=pdf_store_conn,
+        pdf_store_db_path=pdf_store_db_path,
+        base_input_dir=base_input_dir,
+        all_docs=all_docs,
+        generator_llm=generator_llm,
+        generator_embeddings=generator_embeddings,
+        provider_used=provider_used,
+        embedding_id=embedding_id,
+        add_content_embeddings=add_content_embeddings,
+        cache_enabled=cache_enabled,
+        kg_cache_dir=kg_cache_dir,
+        meta_dir=meta_dir,
+        progress_dir=processed_dir / "progress",
+        personas_cache_dir=personas_cache_dir,
+        pdf_profiles_by_source=pdf_profiles_by_source,
+        llm_context=llm_context,
+        reuse_cached_store_extractions=reuse_cached_store_extractions,
+        ragas_doc_extraction_model_tag_base=ragas_doc_extraction_model_tag_base,
+    )
 
 
 # ============================================================================
@@ -1250,238 +1203,6 @@ def _run_world_pipeline(
     print(f"  Multi-hop (per-world KGs): {mh_count}")
     for w, c in world_counts.items():
         print(f"    - {w}: {c}")
-    if args.hard_negatives:
-        print("  Hard negatives: included")
-    if args.filter and filtered_df is not None and filter_stats is not None:
-        print(
-            f"  Filtered samples: {filter_stats['kept']}/{filter_stats['total']}"
-        )
-    print(f"  Output directory: {OUTPUT_DIR}")
-    print(f"{'=' * 60}")
-
-    return 0
-
-
-# ============================================================================
-# LEGACY MODE pipeline (original single-KG approach)
-# ============================================================================
-def _run_legacy_pipeline(
-    *,
-    args,
-    steps: StepTracker,
-    pdf_paths: List[Path],
-    pdf_store_conn,
-    base_input_dir: Path,
-    all_docs,
-    generator_llm,
-    generator_embeddings,
-    provider_used: str,
-    embedding_id: str,
-    add_content_embeddings: bool,
-    cache_enabled: bool,
-    kg_cache_dir: Path,
-    meta_dir: Path,
-    personas_cache_dir: Path,
-    pdf_profiles_by_source: Dict[str, Dict[str, Any]],
-    llm_context: Optional[str],
-    reuse_cached_store_extractions: bool,
-    ragas_doc_extraction_model_tag_base: Optional[str],
-) -> int:
-    """Original pipeline: build a single KG from all docs, generate mixed queries."""
-
-    # -----------------------------------------------------------------------
-    # Build or load knowledge graph (file-cached)
-    # -----------------------------------------------------------------------
-    steps.next("Building knowledge graph")
-
-    docs_fp = compute_docs_fingerprint(pdf_paths)
-    kg_id = compute_kg_cache_id(
-        docs_fp,
-        provider=provider_used,
-        llm_id=args.model,
-        embedding_id=embedding_id,
-        add_content_embeddings=add_content_embeddings,
-    )
-
-    if cache_enabled:
-        kg_cache_dir.mkdir(parents=True, exist_ok=True)
-        meta_dir.mkdir(parents=True, exist_ok=True)
-
-    kg_cache_path = kg_cache_dir / f"kg_{kg_id}.json.gz"
-    kg_meta_path = meta_dir / f"kg_{kg_id}.json"
-
-    if cache_enabled and kg_cache_path.exists() and not args.reprocess:
-        print(f"  Loading cached KG: {kg_cache_path.name}")
-        kg = load_knowledge_graph_cache(kg_cache_path)
-        print(
-            f"  Loaded KG: {len(kg.nodes)} nodes, "
-            f"{len(kg.relationships)} relationships"
-        )
-    else:
-        kg = build_knowledge_graph(
-            all_docs,
-            generator_llm,
-            generator_embeddings,
-            add_content_embeddings=add_content_embeddings,
-            pdf_store_conn=pdf_store_conn,
-            base_input_dir=base_input_dir,
-            reuse_cached_store_extractions=reuse_cached_store_extractions,
-            ragas_doc_extraction_model_tag_base=ragas_doc_extraction_model_tag_base,
-        )
-        if cache_enabled:
-            print(f"  Saving KG cache: {kg_cache_path.name}")
-            save_knowledge_graph_cache(kg, kg_cache_path)
-            pipeline_id = PIPELINE_ID_BASE
-            if add_content_embeddings:
-                pipeline_id += "__content_embeddings"
-            with open(kg_meta_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "created_at": utc_now_iso(),
-                        "schema_version": CACHE_SCHEMA_VERSION,
-                        "pipeline_id": pipeline_id,
-                        "ragas_version": getattr(ragas, "__version__", "unknown"),
-                        "docs_fingerprint": docs_fp,
-                        "kg_cache_id": kg_id,
-                        "provider": provider_used,
-                        "llm_id": args.model,
-                        "embedding_id": embedding_id,
-                        "add_content_embeddings": add_content_embeddings,
-                        "num_nodes": len(kg.nodes),
-                        "num_relationships": len(kg.relationships),
-                    },
-                    f, ensure_ascii=False, indent=2,
-                )
-
-    # -----------------------------------------------------------------------
-    # Generate or load personas (file-cached)
-    # -----------------------------------------------------------------------
-    steps.next("Generating personas")
-
-    if cache_enabled:
-        personas_cache_dir.mkdir(parents=True, exist_ok=True)
-
-    personas_cache_path = (
-        personas_cache_dir / f"personas_{kg_id}__n{int(args.num_personas)}.json"
-    )
-
-    personas: Optional[List[Persona]] = None
-    if args.personas_path:
-        personas_path = Path(args.personas_path).expanduser()
-        if not personas_path.is_absolute():
-            personas_path = (Path.cwd() / personas_path).resolve()
-        print(f"  Loading from file: {personas_path}")
-        personas = load_personas_from_file(personas_path)
-        print(f"  Loaded {len(personas)} persona(s)")
-    elif cache_enabled and personas_cache_path.exists() and not args.reprocess:
-        print(f"  Loading cached personas: {personas_cache_path.name}")
-        personas = load_personas_cache(personas_cache_path)
-        print(f"  Loaded {len(personas)} persona(s)")
-    else:
-        print("  Generating personas from knowledge graph...")
-        personas = generate_personas_from_kg(
-            kg=kg, llm=generator_llm, num_personas=int(args.num_personas)
-        )
-        if cache_enabled:
-            save_personas_cache(personas, personas_cache_path)
-            print(f"  Saved personas cache: {personas_cache_path.name}")
-    print(f"  Personas ready: {len(personas) if personas else 0}")
-
-    # -----------------------------------------------------------------------
-    # Generate testset
-    # -----------------------------------------------------------------------
-    steps.next("Generating testset")
-
-    print(
-        "  Standalone queries: "
-        + ("enabled" if args.standalone_queries else "disabled (RAGAS defaults)")
-    )
-
-    query_distribution = build_query_distribution_for_pipeline(
-        generator_llm,
-        kg,
-        standalone_queries=args.standalone_queries,
-        llm_context=llm_context,
-        pdf_profiles_by_source=(
-            pdf_profiles_by_source if args.pdf_profiles else None
-        ),
-        query_mix=args.query_mix,
-    )
-
-    testset = generate_testset(
-        kg,
-        generator_llm,
-        generator_embeddings,
-        testset_size=args.testset_size,
-        personas=personas,
-        llm_context=llm_context,
-        query_distribution=query_distribution,
-    )
-
-    if args.standalone_queries:
-        warn_on_referential_queries(testset)
-
-    # -----------------------------------------------------------------------
-    # Mine hard negatives (optional)
-    # -----------------------------------------------------------------------
-    hard_negatives = None
-    source_mappings = None
-    if args.hard_negatives:
-        steps.next("Mining hard negatives")
-
-        raw_embedding_model = generator_embeddings
-        judge_llm = getattr(generator_llm, "langchain_llm", None)
-
-        testset_df = testset.to_pandas()
-        hard_negatives, source_mappings = mine_hard_negatives_for_testset(
-            testset_df,
-            kg,
-            all_docs,
-            raw_embedding_model,
-            judge_llm=judge_llm,
-            num_bm25_negatives=args.num_bm25_negatives,
-            num_embedding_negatives=args.num_embedding_negatives,
-            max_judge_calls_per_query=DEFAULT_HARD_NEG_MAX_JUDGE_CALLS,
-            bm25_candidate_multiplier=DEFAULT_HARD_NEG_BM25_CANDIDATE_MULTIPLIER,
-            embedding_candidate_multiplier=DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
-            near_duplicate_cosine_threshold=DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
-            embedding_min_similarity=DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
-        )
-
-    # -----------------------------------------------------------------------
-    # Save results to output/
-    # -----------------------------------------------------------------------
-    steps.next("Saving results")
-
-    output_path = str(OUTPUT_DIR / args.output)
-    df = save_testset(
-        testset,
-        output_path,
-        formats=args.output_formats,
-        docs=all_docs,
-        hard_negatives=hard_negatives,
-        source_mappings=source_mappings,
-    )
-
-    # -----------------------------------------------------------------------
-    # Quality filter (optional)
-    # -----------------------------------------------------------------------
-    filtered_df = None
-    filter_stats = None
-    if args.filter:
-        steps.next("Quality filtering")
-        raw_llm = getattr(generator_llm, "langchain_llm", generator_llm)
-        filtered_df, filter_stats = filter_dataset(
-            df, raw_llm, pdf_store_conn,
-        )
-        filtered_path = f"{output_path}_filtered"
-        save_combined_dataframe(
-            filtered_df, filtered_path, formats=args.output_formats,
-        )
-
-    print(f"\n{'=' * 60}")
-    print("Generation complete!")
-    print(f"  Total samples: {len(df)}")
     if args.hard_negatives:
         print("  Hard negatives: included")
     if args.filter and filtered_df is not None and filter_stats is not None:
