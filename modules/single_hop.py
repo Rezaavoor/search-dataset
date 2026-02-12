@@ -12,11 +12,16 @@ import json
 import logging
 import random
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .config import CORPUS_SINGLE_HOP_PROMPT_INSTRUCTION
+from .db import open_pdf_page_store
 from .utils import extract_json_object
 
 log = logging.getLogger(__name__)
@@ -351,7 +356,66 @@ def generate_one_query(
 
 
 # ---------------------------------------------------------------------------
-# Batch generation (full corpus, sequential)
+# Worker for parallel generation
+# ---------------------------------------------------------------------------
+def _worker_generate(
+    *,
+    worker_id: int,
+    llm,
+    tasks: List[Dict[str, Any]],
+    db_path: Path,
+    result_slots: List[Optional[Dict[str, Any]]],
+    result_indices: List[int],
+    stats: Dict[str, int],
+    stats_lock: threading.Lock,
+    seed: Optional[int],
+    personas: Optional[List[Dict[str, str]]],
+    corpus_size_hint: int,
+) -> int:
+    """Process assigned tasks in a worker thread."""
+    conn = open_pdf_page_store(db_path)
+    rng = random.Random(seed + worker_id if seed is not None else None)
+    generated = 0
+
+    for task_idx, task in zip(result_indices, tasks):
+        rel_path = task["rel_path"]
+        filename = task["filename"]
+
+        profile = load_profile(conn, rel_path)
+        entities = get_profile_entities(profile)
+        page = select_best_page(conn, rel_path, profile_entities=entities)
+
+        if not page:
+            with stats_lock:
+                stats["skipped"] += 1
+                stats["processed"] += 1
+            continue
+
+        result = generate_one_query(
+            llm,
+            rel_path=rel_path,
+            page_content=page["content"],
+            page_number=page["page_number"],
+            filename=filename,
+            profile=profile,
+            rng=rng,
+            personas=personas,
+            corpus_size_hint=corpus_size_hint,
+        )
+
+        result_slots[task_idx] = result
+        with stats_lock:
+            stats["processed"] += 1
+            if result:
+                stats["generated"] += 1
+                generated += 1
+
+    conn.close()
+    return generated
+
+
+# ---------------------------------------------------------------------------
+# Batch generation (parallel when multiple LLM clients provided)
 # ---------------------------------------------------------------------------
 def generate_single_hop_queries(
     llm,
@@ -361,6 +425,8 @@ def generate_single_hop_queries(
     seed: Optional[int] = None,
     personas: Optional[List[Dict[str, str]]] = None,
     corpus_size_hint: int = 7000,
+    extra_llms: Optional[List[Any]] = None,
+    db_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """Generate single-hop queries from the full corpus (no KG required).
 
@@ -369,11 +435,17 @@ def generate_single_hop_queries(
 
     Args:
         llm: A LangChain chat model (raw, NOT RAGAS-wrapped).
-        conn: SQLite connection to the PDF page store.
+        conn: SQLite connection to the PDF page store (used for file
+            discovery; each worker opens its own connection).
         num_queries: Number of queries to generate.
         seed: Random seed for reproducibility.
         personas: Custom persona dicts [{name, role_description}, ...].
         corpus_size_hint: Approximate corpus size for prompt context.
+        extra_llms: Additional LLM clients for parallel generation.
+            Each client runs in its own thread.  If None or empty,
+            generation is sequential using *llm* only.
+        db_path: Path to the SQLite DB file.  Required when
+            *extra_llms* is provided (workers open their own connections).
 
     Returns:
         List of result dicts (one per successfully generated query).
@@ -408,35 +480,138 @@ def generate_single_hop_queries(
             f"({len(eligible)}), some files will repeat"
         )
 
-    results: List[Dict[str, Any]] = []
-    for i, file_info in enumerate(selected):
-        rel_path = file_info["rel_path"]
-        filename = file_info["filename"]
+    # Build the full list of LLM clients
+    all_llms = [llm]
+    if extra_llms:
+        all_llms.extend(extra_llms)
+    num_workers = min(len(all_llms), len(selected))
 
-        profile = load_profile(conn, rel_path)
-        entities = get_profile_entities(profile)
-        page = select_best_page(conn, rel_path, profile_entities=entities)
-        if not page:
-            continue
-
-        result = generate_one_query(
-            llm,
-            rel_path=rel_path,
-            page_content=page["content"],
-            page_number=page["page_number"],
-            filename=filename,
-            profile=profile,
-            rng=rng,
-            personas=personas,
-            corpus_size_hint=corpus_size_hint,
-        )
-        if result:
-            results.append(result)
-
-        if (i + 1) % 25 == 0 or (i + 1) == len(selected):
+    # --- Sequential path (single LLM) ---
+    if num_workers <= 1 or db_path is None:
+        if num_workers > 1 and db_path is None:
             print(
-                f"  Single-hop progress: {len(results)}/{num_queries} "
-                f"generated ({i + 1}/{len(selected)} attempted)"
+                "  Warning: parallel generation requires db_path; "
+                "falling back to sequential"
             )
+        print("  Workers: 1 (sequential)")
+        results: List[Dict[str, Any]] = []
+        for i, file_info in enumerate(selected):
+            rel_path = file_info["rel_path"]
+            filename = file_info["filename"]
 
-    return results
+            profile = load_profile(conn, rel_path)
+            entities = get_profile_entities(profile)
+            page = select_best_page(
+                conn, rel_path, profile_entities=entities,
+            )
+            if not page:
+                continue
+
+            result = generate_one_query(
+                llm,
+                rel_path=rel_path,
+                page_content=page["content"],
+                page_number=page["page_number"],
+                filename=filename,
+                profile=profile,
+                rng=rng,
+                personas=personas,
+                corpus_size_hint=corpus_size_hint,
+            )
+            if result:
+                results.append(result)
+
+            if (i + 1) % 25 == 0 or (i + 1) == len(selected):
+                print(
+                    f"  Single-hop progress: {len(results)}/{num_queries} "
+                    f"generated ({i + 1}/{len(selected)} attempted)"
+                )
+        return results
+
+    # --- Parallel path (multiple LLM clients) ---
+    print(f"  Workers: {num_workers} (parallel)")
+
+    result_slots: List[Optional[Dict[str, Any]]] = [None] * len(selected)
+    worker_tasks: List[List[Dict[str, Any]]] = [
+        [] for _ in range(num_workers)
+    ]
+    worker_indices: List[List[int]] = [[] for _ in range(num_workers)]
+    for idx, task in enumerate(selected):
+        w = idx % num_workers
+        worker_tasks[w].append(task)
+        worker_indices[w].append(idx)
+
+    stats: Dict[str, int] = {
+        "processed": 0, "generated": 0, "skipped": 0,
+    }
+    stats_lock = threading.Lock()
+    t0 = time.monotonic()
+
+    # Progress reporter
+    stop_event = threading.Event()
+
+    def _progress():
+        while not stop_event.is_set():
+            stop_event.wait(15)
+            with stats_lock:
+                processed = stats["processed"]
+                generated = stats["generated"]
+            elapsed = time.monotonic() - t0
+            rate = processed / elapsed if elapsed > 0 else 0
+            remaining = (
+                (len(selected) - processed) / rate if rate > 0 else 0
+            )
+            pct = processed / len(selected) * 100 if selected else 0
+            print(
+                f"  Single-hop progress: {generated}/{num_queries} "
+                f"generated ({processed}/{len(selected)} attempted, "
+                f"{pct:.0f}%, {rate:.1f}/s, "
+                f"ETA {remaining:.0f}s)"
+            )
+            if processed >= len(selected):
+                break
+
+    progress_thread = threading.Thread(target=_progress, daemon=True)
+    progress_thread.start()
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {}
+        for i in range(num_workers):
+            future = executor.submit(
+                _worker_generate,
+                worker_id=i + 1,
+                llm=all_llms[i],
+                tasks=worker_tasks[i],
+                db_path=db_path,
+                result_slots=result_slots,
+                result_indices=worker_indices[i],
+                stats=stats,
+                stats_lock=stats_lock,
+                seed=seed,
+                personas=personas,
+                corpus_size_hint=corpus_size_hint,
+            )
+            futures[future] = i + 1
+
+        total_generated = 0
+        for future in as_completed(futures):
+            wid = futures[future]
+            try:
+                count = future.result()
+                total_generated += count
+                log.info(
+                    "Worker %d finished: %d queries", wid, count,
+                )
+            except Exception as exc:
+                log.error("Worker %d failed: %s", wid, exc)
+
+    stop_event.set()
+    progress_thread.join(timeout=5)
+
+    elapsed = time.monotonic() - t0
+    valid = [r for r in result_slots if r is not None]
+    print(
+        f"  Single-hop complete: {len(valid)}/{num_queries} generated "
+        f"in {elapsed:.0f}s ({len(valid)/elapsed:.1f}/s)"
+    )
+    return valid

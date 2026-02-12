@@ -612,6 +612,7 @@ def main() -> int:
             steps=steps,
             pdf_paths=pdf_paths,
             pdf_store_conn=pdf_store_conn,
+            pdf_store_db_path=pdf_store_db_path,
             base_input_dir=base_input_dir,
             all_docs=all_docs,
             generator_llm=generator_llm,
@@ -656,6 +657,45 @@ def main() -> int:
 
 
 # ============================================================================
+# Helper: discover extra Azure OpenAI endpoints for parallel single-hop
+# ============================================================================
+def _discover_extra_azure_clients(model: str) -> List:
+    """Return additional AzureChatOpenAI clients from env vars _2, _3, …
+
+    The *primary* endpoint (AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT)
+    is already used by the RAGAS-wrapped LLM.  This function discovers
+    any *additional* endpoints (suffixed _2 through _9) so the single-hop
+    generator can parallelise across them.
+    """
+    try:
+        from langchain_openai import AzureChatOpenAI
+    except ImportError:
+        return []
+
+    api_version = os.environ.get(
+        "AZURE_OPENAI_API_VERSION", "2024-02-15-preview",
+    )
+    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME", model)
+    clients = []
+    for i in range(2, 10):
+        key = os.environ.get(f"AZURE_OPENAI_API_KEY_{i}", "").strip()
+        endpoint = os.environ.get(f"AZURE_OPENAI_ENDPOINT_{i}", "").strip()
+        if key and endpoint:
+            clients.append(
+                AzureChatOpenAI(
+                    azure_endpoint=endpoint,
+                    api_key=key,
+                    api_version=api_version,
+                    azure_deployment=deployment,
+                    temperature=0.4,
+                    request_timeout=90,
+                    max_retries=0,
+                )
+            )
+    return clients
+
+
+# ============================================================================
 # Helper: check if a path is under a directory
 # ============================================================================
 def _is_under_dir(path: Path, directory: Path) -> bool:
@@ -676,6 +716,7 @@ def _run_world_pipeline(
     steps: StepTracker,
     pdf_paths: List[Path],
     pdf_store_conn,
+    pdf_store_db_path: Path,
     base_input_dir: Path,
     all_docs,
     generator_llm,
@@ -725,12 +766,19 @@ def _run_world_pipeline(
         # Use the raw LangChain LLM (not the RAGAS wrapper)
         raw_llm = getattr(generator_llm, "langchain_llm", generator_llm)
 
+        # Discover additional Azure endpoints for parallel generation
+        extra_llms = _discover_extra_azure_clients(args.model)
+        if extra_llms:
+            print(f"  Discovered {len(extra_llms)} extra Azure endpoint(s)")
+
         single_hop_results = generate_single_hop_queries(
             raw_llm,
             pdf_store_conn,
             num_queries=single_hop_size,
             seed=args.seed,
             corpus_size_hint=args.corpus_size_hint,
+            extra_llms=extra_llms if extra_llms else None,
+            db_path=pdf_store_db_path,
         )
         print(f"  Generated {len(single_hop_results)} single-hop queries")
 
@@ -739,13 +787,44 @@ def _run_world_pipeline(
     # -------------------------------------------------------------------
     multi_hop_dfs: List[pd.DataFrame] = []
     if multi_hop_size > 0 and worlds:
-        queries_per_world = max(1, multi_hop_size // len(worlds))
-        remainder = multi_hop_size - queries_per_world * len(worlds)
-
         if cache_enabled:
             kg_cache_dir.mkdir(parents=True, exist_ok=True)
             meta_dir.mkdir(parents=True, exist_ok=True)
             personas_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Pre-compute PDF counts per world for proportional allocation ---
+        world_pdf_counts: Dict[str, int] = {}
+        world_pdf_path_map: Dict[str, List[Path]] = {}
+        for world_name in worlds:
+            world_dir = base_input_dir / world_name
+            wpaths = sorted([
+                p for p in pdf_paths if _is_under_dir(p, world_dir)
+            ])
+            world_pdf_counts[world_name] = len(wpaths)
+            world_pdf_path_map[world_name] = wpaths
+
+        total_pdfs_in_worlds = sum(world_pdf_counts.values()) or 1
+        world_query_alloc: Dict[str, int] = {}
+        allocated = 0
+        for world_name in worlds:
+            n = world_pdf_counts[world_name]
+            share = max(1, round(multi_hop_size * n / total_pdfs_in_worlds))
+            world_query_alloc[world_name] = share
+            allocated += share
+        # Adjust for rounding: add/subtract from the largest world
+        diff = multi_hop_size - allocated
+        if diff != 0:
+            largest = max(worlds, key=lambda w: world_pdf_counts[w])
+            world_query_alloc[largest] = max(
+                1, world_query_alloc[largest] + diff,
+            )
+
+        print("\n  Multi-hop allocation (proportional to world size):")
+        for w in worlds:
+            print(
+                f"    {w}: {world_pdf_counts[w]} PDFs "
+                f"-> {world_query_alloc[w]} queries"
+            )
 
         for world_idx, world_name in enumerate(worlds):
             steps.next(
@@ -754,10 +833,7 @@ def _run_world_pipeline(
             )
 
             # --- Filter PDFs for this world ---
-            world_dir = base_input_dir / world_name
-            world_pdf_paths = sorted([
-                p for p in pdf_paths if _is_under_dir(p, world_dir)
-            ])
+            world_pdf_paths = world_pdf_path_map[world_name]
             if not world_pdf_paths:
                 print(f"  No PDFs found in world '{world_name}', skipping")
                 continue
@@ -906,10 +982,7 @@ def _run_world_pipeline(
                 continue
 
             # --- Generate multi-hop testset ---
-            # Give the first world any remainder queries
-            world_size = queries_per_world
-            if world_idx == 0 and remainder > 0:
-                world_size += remainder
+            world_size = world_query_alloc[world_name]
 
             print(f"  Generating {world_size} multi-hop queries...")
             world_testset = generate_testset(
