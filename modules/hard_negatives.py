@@ -11,6 +11,13 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from ragas.testset.graph import NodeType
 
+from .config import (
+    DEFAULT_HARD_NEG_BM25_CANDIDATE_MULTIPLIER,
+    DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
+    DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
+    DEFAULT_HARD_NEG_MAX_JUDGE_CALLS,
+    DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
+)
 from .db import _emb_col, _emb_dims_col
 from .utils import (
     extract_json_object,
@@ -394,7 +401,11 @@ def mine_hard_negatives_for_testset(
     judge_llm: Any = None,
     num_bm25_negatives: int = 5,
     num_embedding_negatives: int = 5,
-    max_judge_calls_per_query: int = 12,
+    max_judge_calls_per_query: int = DEFAULT_HARD_NEG_MAX_JUDGE_CALLS,
+    bm25_candidate_multiplier: int = DEFAULT_HARD_NEG_BM25_CANDIDATE_MULTIPLIER,
+    embedding_candidate_multiplier: int = DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
+    near_duplicate_cosine_threshold: float = DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
+    embedding_min_similarity: float = DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
 ) -> Tuple[List[List[str]], List[Dict[str, Any]]]:
     """Mine hard negatives for all queries in the testset.
 
@@ -444,7 +455,6 @@ def mine_hard_negatives_for_testset(
             continue
         page_emb_norm_by_key[k] = v / n
 
-    near_duplicate_cosine_threshold = 0.92
     hard_negatives_list: List[List[str]] = []
     source_mappings: List[Dict[str, Any]] = []
 
@@ -505,7 +515,7 @@ def mine_hard_negatives_for_testset(
             bm25_negs = find_bm25_hard_negative_pages(
                 query, pages, bm25,
                 exclude_pages=exclude_pages,
-                top_k=max(50, num_bm25_negatives * 10),
+                top_k=max(50, num_bm25_negatives * bm25_candidate_multiplier),
             )
 
         emb_negs: List[Tuple[str, int]] = []
@@ -523,7 +533,10 @@ def mine_hard_negatives_for_testset(
                     q_emb, pages,
                     candidate_indices=cand_idxs,
                     exclude_pages=exclude_pages,
-                    top_k=max(50, num_embedding_negatives * 10),
+                    top_k=max(
+                        50, num_embedding_negatives * embedding_candidate_multiplier,
+                    ),
+                    min_similarity=embedding_min_similarity,
                 )
             except Exception as e:
                 print(f"  Warning: Failed to embed query {idx}: {e}")
@@ -717,7 +730,11 @@ def mine_hard_negatives_for_df(
     *,
     num_bm25_negatives: int = 5,
     num_embedding_negatives: int = 5,
-    max_judge_calls_per_query: int = 12,
+    max_judge_calls_per_query: int = DEFAULT_HARD_NEG_MAX_JUDGE_CALLS,
+    bm25_candidate_multiplier: int = DEFAULT_HARD_NEG_BM25_CANDIDATE_MULTIPLIER,
+    embedding_candidate_multiplier: int = DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
+    near_duplicate_cosine_threshold: float = DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
+    embedding_min_similarity: float = DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
 ) -> List[List[str]]:
     """Mine hard negatives for a combined DataFrame using a pre-loaded page list.
 
@@ -774,8 +791,6 @@ def mine_hard_negatives_for_df(
             page_emb_norm_by_key[k] = None
             continue
         page_emb_norm_by_key[k] = v / n
-
-    near_duplicate_cosine_threshold = 0.92
 
     # Pre-compute query embeddings in batch
     query_embeddings: Dict[int, Optional[List[float]]] = {}
@@ -835,7 +850,7 @@ def mine_hard_negatives_for_df(
             bm25_negs = find_bm25_hard_negative_pages(
                 query, pages, bm25,
                 exclude_pages=exclude_pages,
-                top_k=max(50, num_bm25_negatives * 10),
+                top_k=max(50, num_bm25_negatives * bm25_candidate_multiplier),
             )
 
         # Embedding candidates
@@ -854,7 +869,10 @@ def mine_hard_negatives_for_df(
                         q_emb, pages,
                         candidate_indices=cand_idxs,
                         exclude_pages=exclude_pages,
-                        top_k=max(50, num_embedding_negatives * 10),
+                        top_k=max(
+                            50, num_embedding_negatives * embedding_candidate_multiplier,
+                        ),
+                        min_similarity=embedding_min_similarity,
                     )
             except Exception as e:
                 print(

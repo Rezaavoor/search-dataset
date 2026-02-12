@@ -30,6 +30,17 @@ EXTRACTIVE_SUMMARY_MODEL = "extractive_v1"
 DEFAULT_CORPUS_SIZE_HINT = 7000
 
 # ---------------------------------------------------------------------------
+# Hard negative mining defaults
+# ---------------------------------------------------------------------------
+DEFAULT_NUM_BM25_NEGATIVES = 10
+DEFAULT_NUM_EMBEDDING_NEGATIVES = 10
+DEFAULT_HARD_NEG_MAX_JUDGE_CALLS = 20
+DEFAULT_HARD_NEG_BM25_CANDIDATE_MULTIPLIER = 15
+DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER = 15
+DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD = 0.90
+DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY = 0.25
+
+# ---------------------------------------------------------------------------
 # PDF profile LLM context rules (injected into query-generation prompts)
 # ---------------------------------------------------------------------------
 PDF_PROFILE_LLM_CONTEXT_RULES = (

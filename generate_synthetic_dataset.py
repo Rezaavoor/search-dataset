@@ -34,6 +34,13 @@ from ragas.testset.persona import Persona, generate_personas_from_kg
 from modules.config import (
     CACHE_SCHEMA_VERSION,
     DEFAULT_CORPUS_SIZE_HINT,
+    DEFAULT_HARD_NEG_BM25_CANDIDATE_MULTIPLIER,
+    DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
+    DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
+    DEFAULT_HARD_NEG_MAX_JUDGE_CALLS,
+    DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
+    DEFAULT_NUM_BM25_NEGATIVES,
+    DEFAULT_NUM_EMBEDDING_NEGATIVES,
     DEFAULT_PDF_PROFILE_MAX_CHARS_PER_PAGE,
     DEFAULT_PDF_PROFILE_MAX_PAGES,
     DEFAULT_PDF_STORE_DB_NAME,
@@ -278,12 +285,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable hard negative mining for IR evaluation",
     )
     parser.add_argument(
-        "--num-bm25-negatives", type=int, default=5,
-        help="BM25 hard negatives per query (default: 5)",
+        "--num-bm25-negatives", type=int, default=DEFAULT_NUM_BM25_NEGATIVES,
+        help=f"BM25 hard negatives per query (default: {DEFAULT_NUM_BM25_NEGATIVES})",
     )
     parser.add_argument(
-        "--num-embedding-negatives", type=int, default=5,
-        help="Embedding hard negatives per query (default: 5)",
+        "--num-embedding-negatives", type=int,
+        default=DEFAULT_NUM_EMBEDDING_NEGATIVES,
+        help=(
+            "Embedding hard negatives per query "
+            f"(default: {DEFAULT_NUM_EMBEDDING_NEGATIVES})"
+        ),
     )
 
     # --- Quality filter ---
@@ -1075,6 +1086,11 @@ def _run_world_pipeline(
             judge_llm=judge_llm,
             num_bm25_negatives=args.num_bm25_negatives,
             num_embedding_negatives=args.num_embedding_negatives,
+            max_judge_calls_per_query=DEFAULT_HARD_NEG_MAX_JUDGE_CALLS,
+            bm25_candidate_multiplier=DEFAULT_HARD_NEG_BM25_CANDIDATE_MULTIPLIER,
+            embedding_candidate_multiplier=DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
+            near_duplicate_cosine_threshold=DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
+            embedding_min_similarity=DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
         )
 
         import json as _json
@@ -1322,6 +1338,11 @@ def _run_legacy_pipeline(
             judge_llm=judge_llm,
             num_bm25_negatives=args.num_bm25_negatives,
             num_embedding_negatives=args.num_embedding_negatives,
+            max_judge_calls_per_query=DEFAULT_HARD_NEG_MAX_JUDGE_CALLS,
+            bm25_candidate_multiplier=DEFAULT_HARD_NEG_BM25_CANDIDATE_MULTIPLIER,
+            embedding_candidate_multiplier=DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
+            near_duplicate_cosine_threshold=DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
+            embedding_min_similarity=DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
         )
 
     # -----------------------------------------------------------------------
