@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Compute embeddings for all pages in the SQLite page store.
 
-Supports multiple OpenAI API keys for parallel throughput and AWS Bedrock
-Cohere models.  Resume-safe: only processes pages that are missing
-embeddings for the target model.  Commits after every batch so progress
-is never lost.
+Supports multiple OpenAI API keys for parallel throughput, AWS Bedrock
+Cohere models, and open-source SentenceTransformer/HuggingFace models.
+Resume-safe: only processes pages that are missing embeddings for the
+target model. Commits after every batch so progress is never lost.
 
 Features:
   - Multi-key parallelism for OpenAI (up to N concurrent workers).
@@ -40,6 +40,15 @@ Usage:
 
     # Cohere embed-v4 via Bedrock
     python embed_corpus.py --provider bedrock --model cohere.embed-v4
+
+    # Open-source model (single)
+    python embed_corpus.py --provider hf --model bge-large-en-v1.5
+
+    # All 6 open-source models sequentially (for multi-embedding hard-negative mining)
+    python embed_corpus.py --provider hf --models all-hf
+
+    # Specific subset of models
+    python embed_corpus.py --provider hf --models bge-large-en-v1.5,LaBSE,all-mpnet-base-v2
 
     # Dry run — show how many pages need embedding
     python embed_corpus.py --dry-run
@@ -78,6 +87,74 @@ from modules.db import (
     store_page_embedding,
 )
 from modules.utils import utc_now_iso
+
+# ---------------------------------------------------------------------------
+# Open-source (HuggingFace / SentenceTransformer) model registry
+# ---------------------------------------------------------------------------
+# Each entry maps a short alias to its config.
+#   hf_id              – full HuggingFace model ID
+#   trust_remote_code  – needed by models with custom code (jina-v3, stella)
+#   device             – force a specific device (None = auto, "cpu" = force CPU)
+#                        Models with Flash Attention / xformers crash on MPS;
+#                        forcing CPU is slower but reliable on Apple Silicon.
+#   doc_prompt_name    – prompt_name kwarg for encode() on documents (None = no prompt)
+#   query_prompt_name  – prompt_name kwarg for encode() on queries   (None = no prompt)
+#   query_prefix       – plain-text prefix prepended to query text   (None = no prefix)
+#
+# prompt_name takes priority over query_prefix when both are set.
+
+_HF_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "stella_en_400m_v5": {
+        "hf_id": "dunzhang/stella_en_400M_v5",
+        "trust_remote_code": True,
+        "device": "cpu",   # custom attention requires xformers; crashes on MPS
+        "model_kwargs": {"attn_implementation": "eager"},       # use eager attention class
+        "config_kwargs": {"use_memory_efficient_attention": False, "unpad_inputs": False},  # disable xformers
+        "doc_prompt_name": None,
+        "query_prompt_name": "s2p_query",   # built-in retrieval prompt
+        "query_prefix": None,
+    },
+    "jina-embeddings-v3": {
+        "hf_id": "jinaai/jina-embeddings-v3",
+        "trust_remote_code": True,
+        "device": "cpu",   # Flash Attention in custom code segfaults on MPS
+        "doc_prompt_name": "retrieval.passage",
+        "query_prompt_name": "retrieval.query",
+        "query_prefix": None,
+    },
+    "snowflake-arctic-embed-m-v2.0": {
+        "hf_id": "Snowflake/snowflake-arctic-embed-m-v2.0",
+        "trust_remote_code": True,
+        "device": "cpu",   # GTE-based custom attention requires xformers; force CPU
+        "model_kwargs": {"attn_implementation": "eager"},
+        "config_kwargs": {"use_memory_efficient_attention": False, "unpad_inputs": False},
+        "doc_prompt_name": None,
+        "query_prompt_name": "query",  # built-in query prompt
+        "query_prefix": None,
+    },
+    "bge-m3": {
+        "hf_id": "BAAI/bge-m3",
+        "trust_remote_code": False,
+        "device": None,   # standard XLM-RoBERTa, works on MPS
+        "doc_prompt_name": None,
+        "query_prompt_name": None,
+        "query_prefix": None,
+    },
+}
+
+# Convenience: build a flat alias->hf_id map (includes lowercase variants)
+_HF_MODEL_ALIASES: Dict[str, str] = {}
+for _alias, _cfg in _HF_MODEL_REGISTRY.items():
+    _HF_MODEL_ALIASES[_alias] = _cfg["hf_id"]
+    _HF_MODEL_ALIASES[_alias.lower()] = _cfg["hf_id"]
+
+# Ordered list of the four ensemble models (for --models all-hf)
+HF_ALL_MODELS: List[str] = [
+    "stella_en_400m_v5",
+    "jina-embeddings-v3",
+    "snowflake-arctic-embed-m-v2.0",
+    "bge-m3",
+]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -248,6 +325,124 @@ def _create_bedrock_client(model: str):
     """Create a direct Bedrock Cohere embedder (bypasses langchain_aws)."""
     region = os.environ.get("AWS_BEDROCK_REGION", "eu-central-1")
     return _DirectBedrockCohereEmbedder(model_id=model, region=region)
+
+
+def _resolve_hf_model_name(model: str) -> str:
+    """Resolve short aliases to full HuggingFace model IDs."""
+    key = str(model or "").strip()
+    return _HF_MODEL_ALIASES.get(key, _HF_MODEL_ALIASES.get(key.lower(), key))
+
+
+def _get_model_config(model: str) -> Dict[str, Any]:
+    """Return the registry config for *model*, falling back to safe defaults."""
+    key = str(model or "").strip()
+    cfg = _HF_MODEL_REGISTRY.get(key) or _HF_MODEL_REGISTRY.get(key.lower())
+    if cfg:
+        return cfg
+    # Not in registry — return safe defaults (works for any SentenceTransformer)
+    return {
+        "hf_id": _resolve_hf_model_name(key),
+        "trust_remote_code": False,
+        "device": None,
+        "doc_prompt_name": None,
+        "query_prompt_name": None,
+        "query_prefix": None,
+    }
+
+
+class _SentenceTransformerEmbedder:
+    """Thin wrapper exposing embed_documents/embed_query for local HF models.
+
+    Handles model-specific requirements:
+      - trust_remote_code for jina-v3, stella, etc.
+      - prompt_name for models with built-in task prompts
+      - query_prefix for models that need a retrieval instruction
+    """
+
+    def __init__(self, model_name: str, batch_size: int = 64):
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(
+                "sentence-transformers is required for --provider hf. "
+                "Install with: pip install sentence-transformers"
+            ) from exc
+
+        self.alias = str(model_name or "").strip()
+        self.cfg = _get_model_config(self.alias)
+        self.model_id = self.cfg["hf_id"]
+        self.batch_size = max(1, int(batch_size))
+
+        # Build kwargs for SentenceTransformer constructor
+        st_kwargs: Dict[str, Any] = dict(
+            trust_remote_code=self.cfg.get("trust_remote_code", False),
+        )
+        forced_device = self.cfg.get("device")
+        if forced_device:
+            st_kwargs["device"] = forced_device
+        model_kwargs = self.cfg.get("model_kwargs")
+        if model_kwargs:
+            st_kwargs["model_kwargs"] = model_kwargs
+        config_kwargs = self.cfg.get("config_kwargs")
+        if config_kwargs:
+            st_kwargs["config_kwargs"] = config_kwargs
+
+        extras = []
+        if forced_device:
+            extras.append(f"device={forced_device}")
+        if model_kwargs:
+            extras.append(f"model_kwargs={model_kwargs}")
+        if config_kwargs:
+            extras.append(f"config_kwargs={config_kwargs}")
+        suffix = f" ({', '.join(extras)})" if extras else ""
+        log.info("Loading SentenceTransformer model: %s%s ...", self.model_id, suffix)
+
+        self.model = SentenceTransformer(self.model_id, **st_kwargs)
+        log.info("Model loaded — embedding dim: %d", self.model.get_sentence_embedding_dimension())
+
+    # ----- helpers -----
+
+    @staticmethod
+    def _normalize_input(texts: List[str]) -> List[str]:
+        return [str(t or "").strip() for t in texts]
+
+    # ----- document embedding (used by embed_corpus) -----
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        docs = self._normalize_input(texts)
+        kwargs: Dict[str, Any] = dict(
+            batch_size=self.batch_size,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        if self.cfg.get("doc_prompt_name"):
+            kwargs["prompt_name"] = self.cfg["doc_prompt_name"]
+        vecs = self.model.encode(docs, **kwargs)
+        if getattr(vecs, "ndim", 1) == 1:
+            vecs = np.expand_dims(vecs, axis=0)
+        return vecs.astype(np.float32).tolist()
+
+    # ----- query embedding (used by hard-negative miner at search time) -----
+
+    def embed_query(self, text: str) -> List[float]:
+        q = str(text or "").strip()
+        kwargs: Dict[str, Any] = dict(
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        if self.cfg.get("query_prompt_name"):
+            kwargs["prompt_name"] = self.cfg["query_prompt_name"]
+        elif self.cfg.get("query_prefix"):
+            q = f"{self.cfg['query_prefix']}{q}"
+        vec = self.model.encode(q, **kwargs)
+        return np.asarray(vec, dtype=np.float32).tolist()
+
+
+def _create_hf_client(model: str, *, batch_size: int = 64):
+    """Create a local SentenceTransformer embedder."""
+    return _SentenceTransformerEmbedder(model_name=model, batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -486,16 +681,32 @@ def embed_corpus(
 
     # --- Auto-detect provider ---
     if provider == "auto":
-        if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
+        resolved_model = _resolve_hf_model_name(model_name)
+        if (
+            model_name in _HF_MODEL_ALIASES
+            or model_name.lower() in _HF_MODEL_ALIASES
+            or resolved_model in _HF_MODEL_ALIASES.values()
+            or model_name in _HF_MODEL_REGISTRY
+        ):
+            # Model is a known open-source alias — use local HF inference
+            provider = "hf"
+            log.info("Auto-detected provider: hf (local open-source model)")
+        elif os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
             provider = "azure"
+            log.info("Auto-detected provider: azure")
         elif os.environ.get("OPENAI_API_KEY"):
             provider = "openai"
+            log.info("Auto-detected provider: openai")
         elif os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_BEDROCK_REGION"):
             provider = "bedrock"
+            log.info("Auto-detected provider: bedrock")
+        elif "/" in str(model_name):
+            # Looks like a HuggingFace model ID (org/model)
+            provider = "hf"
+            log.info("Auto-detected provider: hf (HuggingFace model ID)")
         else:
             log.error("Cannot auto-detect provider. Set Azure/OpenAI/AWS env vars or use --provider.")
             sys.exit(1)
-        log.info("Auto-detected provider: %s", provider)
 
     # --- Create embedding clients ---
     clients = []
@@ -529,12 +740,20 @@ def embed_corpus(
         c = _create_bedrock_client(model_name)
         clients.append(c)
         log.info("  Bedrock client: model=%s", model_name)
+    elif provider == "hf":
+        resolved_model = _resolve_hf_model_name(model_name)
+        c = _create_hf_client(model_name, batch_size=batch_size)
+        clients.append(c)
+        log.info("  HF client: model=%s", resolved_model)
     else:
         log.error("Unknown provider: %s", provider)
         sys.exit(1)
 
     num_workers = max_workers if max_workers else len(clients)
     num_workers = min(num_workers, len(clients))  # Can't have more workers than clients
+    if provider == "hf" and num_workers > 1:
+        log.warning("HF provider uses one local model instance; capping workers to 1.")
+        num_workers = 1
     log.info("Workers: %d  |  Batch size: %d  |  Total batches: ~%d",
              num_workers, batch_size, (len(rows) + batch_size - 1) // batch_size)
 
@@ -560,11 +779,14 @@ def embed_corpus(
     db_lock = threading.Lock()
 
     # --- Progress reporter thread ---
+    # Use a local event so we can stop the progress thread without touching
+    # the global _shutdown_event (which must remain clean for multi-model runs).
+    _progress_stop = threading.Event()
     t0 = time.monotonic()
 
     def _progress_reporter():
-        while not _shutdown_event.is_set():
-            _shutdown_event.wait(15)  # Report every 15 seconds
+        while not _progress_stop.is_set() and not _shutdown_event.is_set():
+            _progress_stop.wait(15)  # Report every 15 seconds
             with stats_lock:
                 processed = stats["processed"]
                 stored = stats["stored"]
@@ -613,8 +835,8 @@ def embed_corpus(
             except Exception as exc:
                 log.error("Worker %d failed: %s", worker_id, exc)
 
-    # Signal progress reporter to stop
-    _shutdown_event.set()
+    # Signal progress reporter to stop (local event, not the global shutdown)
+    _progress_stop.set()
     progress_thread.join(timeout=5)
 
     elapsed = time.monotonic() - t0
@@ -663,7 +885,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--provider",
         type=str,
-        choices=["auto", "azure", "openai", "bedrock"],
+        choices=["auto", "azure", "openai", "bedrock", "hf"],
         default="auto",
         help="Embedding provider (default: auto-detect from env vars)",
     )
@@ -696,6 +918,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Count pages needing embedding without computing anything.",
     )
+    p.add_argument(
+        "--models",
+        type=str,
+        default=None,
+        help=(
+            "Embed with multiple models sequentially (comma-separated aliases). "
+            "Use 'all-hf' to run all 6 open-source models. "
+            "Overrides --model when provided. "
+            "Example: --models bge-large-en-v1.5,LaBSE,all-mpnet-base-v2"
+        ),
+    )
     return p.parse_args()
 
 
@@ -707,18 +940,47 @@ def main() -> None:
     else:
         db_path = (SCRIPT_DIR / "processed" / DEFAULT_PDF_STORE_DB_NAME).resolve()
 
-    log.info("Model:    %s", args.model)
+    # --- Resolve model list ---
+    if args.models:
+        raw = str(args.models).strip()
+        if raw.lower() == "all-hf":
+            model_list = list(HF_ALL_MODELS)
+        else:
+            model_list = [m.strip() for m in raw.split(",") if m.strip()]
+        if not model_list:
+            log.error("--models produced an empty list.")
+            sys.exit(1)
+    else:
+        model_list = [args.model]
+
     log.info("Provider: %s", args.provider)
     log.info("DB:       %s", db_path)
+    log.info("Models:   %s", ", ".join(model_list))
 
-    embed_corpus(
-        db_path=db_path,
-        model_name=args.model,
-        provider=args.provider,
-        batch_size=args.batch_size,
-        max_workers=args.workers,
-        dry_run=args.dry_run,
-    )
+    for idx, model_name in enumerate(model_list, 1):
+        if len(model_list) > 1:
+            log.info("=" * 80)
+            log.info("MODEL %d/%d: %s", idx, len(model_list), model_name)
+            log.info("=" * 80)
+            # Reset shutdown event between runs so Ctrl+C works per-model
+            _shutdown_event.clear()
+
+        embed_corpus(
+            db_path=db_path,
+            model_name=model_name,
+            provider=args.provider,
+            batch_size=args.batch_size,
+            max_workers=args.workers,
+            dry_run=args.dry_run,
+        )
+
+        if _shutdown_event.is_set():
+            log.info("Stopping model loop due to Ctrl+C")
+            break
+
+    if len(model_list) > 1:
+        log.info("=" * 80)
+        log.info("ALL MODELS COMPLETE (%d models)", len(model_list))
 
 
 if __name__ == "__main__":
