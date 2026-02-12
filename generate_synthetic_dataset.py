@@ -645,6 +645,7 @@ def main() -> int:
             cache_enabled=cache_enabled,
             kg_cache_dir=kg_cache_dir,
             meta_dir=meta_dir,
+            progress_dir=processed_dir / "progress",
             personas_cache_dir=personas_cache_dir,
             pdf_profiles_by_source=pdf_profiles_by_source,
             llm_context=llm_context,
@@ -749,6 +750,7 @@ def _run_world_pipeline(
     cache_enabled: bool,
     kg_cache_dir: Path,
     meta_dir: Path,
+    progress_dir: Path,
     personas_cache_dir: Path,
     pdf_profiles_by_source: Dict[str, Dict[str, Any]],
     llm_context: Optional[str],
@@ -757,6 +759,33 @@ def _run_world_pipeline(
 ) -> int:
     """Single-hop from full corpus + multi-hop from per-world KGs."""
     worlds: List[str] = args.multi_hop_worlds
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    single_hop_ckpt_path = (
+        progress_dir / f"{args.output}__single_hop_progress.json"
+    )
+    hard_neg_ckpt_path = (
+        progress_dir / f"{args.output}__hard_negatives_progress.json"
+    )
+    multi_hop_ckpt_path = (
+        progress_dir / f"{args.output}__multi_hop_progress.json"
+    )
+
+    def _load_json(path: Path) -> Optional[Dict[str, Any]]:
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _save_json(path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
 
     # --- Determine sizes ---
     total = max(args.testset_size, 1)
@@ -801,6 +830,7 @@ def _run_world_pipeline(
             corpus_size_hint=args.corpus_size_hint,
             extra_llms=extra_llms if extra_llms else None,
             db_path=pdf_store_db_path,
+            checkpoint_path=single_hop_ckpt_path,
         )
         print(f"  Generated {len(single_hop_results)} single-hop queries")
 
@@ -841,6 +871,40 @@ def _run_world_pipeline(
                 1, world_query_alloc[largest] + diff,
             )
 
+        # --- Resume support for completed multi-hop worlds ---
+        resumed_world_paths: Dict[str, str] = {}
+        mh_ckpt = _load_json(multi_hop_ckpt_path)
+        if isinstance(mh_ckpt, dict):
+            saved_worlds = mh_ckpt.get("completed_worlds") or {}
+            if isinstance(saved_worlds, dict):
+                for w in worlds:
+                    rec = saved_worlds.get(w)
+                    if not isinstance(rec, dict):
+                        continue
+                    world_size_match = int(rec.get("world_size", -1)) == int(
+                        world_query_alloc.get(w, -2)
+                    )
+                    world_file = rec.get("path")
+                    if world_size_match and isinstance(world_file, str):
+                        p = Path(world_file)
+                        if p.exists():
+                            resumed_world_paths[w] = str(p)
+
+        if resumed_world_paths:
+            print("\n  Resuming multi-hop worlds from checkpoint:")
+            for w in worlds:
+                if w in resumed_world_paths:
+                    try:
+                        resumed_df = pd.read_json(resumed_world_paths[w], orient="records")
+                        multi_hop_dfs.append(resumed_df)
+                        print(f"    {w}: loaded {len(resumed_df)} cached queries")
+                    except Exception as e:
+                        print(f"    {w}: failed to load cached world result ({e})")
+
+        completed_worlds_ckpt: Dict[str, Dict[str, Any]] = {}
+        if isinstance(mh_ckpt, dict) and isinstance(mh_ckpt.get("completed_worlds"), dict):
+            completed_worlds_ckpt = dict(mh_ckpt["completed_worlds"])
+
         print("\n  Multi-hop allocation (proportional to world size):")
         for w in worlds:
             print(
@@ -849,6 +913,13 @@ def _run_world_pipeline(
             )
 
         for world_idx, world_name in enumerate(worlds):
+            if world_name in resumed_world_paths:
+                print(
+                    f"\n  Skipping world '{world_name}' "
+                    f"(already completed in checkpoint)"
+                )
+                continue
+
             steps.next(
                 f"Multi-hop for world: {world_name} "
                 f"({world_idx + 1}/{len(worlds)})"
@@ -1049,6 +1120,37 @@ def _run_world_pipeline(
                 f"for world '{world_name}'"
             )
 
+            # Persist per-world output for resumable multi-hop
+            world_safe = world_name.replace("/", "__").replace("\\", "__")
+            world_out_path = progress_dir / (
+                f"{args.output}__multi_hop_world__{world_safe}.json"
+            )
+            try:
+                world_df.to_json(
+                    world_out_path,
+                    orient="records",
+                    force_ascii=False,
+                    indent=2,
+                )
+                completed_worlds_ckpt[world_name] = {
+                    "path": str(world_out_path),
+                    "world_size": int(world_query_alloc[world_name]),
+                    "rows": int(len(world_df)),
+                }
+                _save_json(
+                    multi_hop_ckpt_path,
+                    {
+                        "version": 1,
+                        "output": args.output,
+                        "completed_worlds": completed_worlds_ckpt,
+                    },
+                )
+            except Exception as e:
+                print(
+                    f"  Warning: failed to persist multi-hop checkpoint "
+                    f"for '{world_name}': {e}"
+                )
+
     # -------------------------------------------------------------------
     # Combine all results
     # -------------------------------------------------------------------
@@ -1091,6 +1193,7 @@ def _run_world_pipeline(
             embedding_candidate_multiplier=DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
             near_duplicate_cosine_threshold=DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
             embedding_min_similarity=DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
+            checkpoint_path=hard_neg_ckpt_path,
         )
 
         import json as _json

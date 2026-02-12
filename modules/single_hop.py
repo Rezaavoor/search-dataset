@@ -78,6 +78,27 @@ QUERY_STYLES = ["Perfect grammar", "Web search like", "Poor grammar"]
 QUERY_LENGTHS = ["short", "medium", "long"]
 
 
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Atomically write JSON data to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp_path.replace(path)
+
+
+def _load_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
+    """Load a checkpoint file, returning None on parse/read failure."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Page selection
 # ---------------------------------------------------------------------------
@@ -371,6 +392,7 @@ def _worker_generate(
     seed: Optional[int],
     personas: Optional[List[Dict[str, str]]],
     corpus_size_hint: int,
+    record_result=None,
 ) -> int:
     """Process assigned tasks in a worker thread."""
     conn = open_pdf_page_store(db_path)
@@ -386,6 +408,8 @@ def _worker_generate(
         page = select_best_page(conn, rel_path, profile_entities=entities)
 
         if not page:
+            if record_result is not None:
+                record_result(task_idx, None, "skipped")
             with stats_lock:
                 stats["skipped"] += 1
                 stats["processed"] += 1
@@ -404,6 +428,8 @@ def _worker_generate(
         )
 
         result_slots[task_idx] = result
+        if record_result is not None:
+            record_result(task_idx, result, "generated" if result else "failed")
         with stats_lock:
             stats["processed"] += 1
             if result:
@@ -427,6 +453,8 @@ def generate_single_hop_queries(
     corpus_size_hint: int = 7000,
     extra_llms: Optional[List[Any]] = None,
     db_path: Optional[Path] = None,
+    checkpoint_path: Optional[Path] = None,
+    checkpoint_every: int = 10,
 ) -> List[Dict[str, Any]]:
     """Generate single-hop queries from the full corpus (no KG required).
 
@@ -470,21 +498,93 @@ def generate_single_hop_queries(
 
     print(f"  Eligible files for single-hop: {len(eligible)}")
 
-    # Sample files
-    if num_queries <= len(eligible):
-        selected = rng.sample(eligible, num_queries)
+    selected: List[Dict[str, Any]]
+    records_by_index: Dict[int, Dict[str, Any]] = {}
+
+    if checkpoint_path is not None:
+        ckpt = _load_checkpoint(checkpoint_path)
     else:
-        selected = rng.choices(eligible, k=num_queries)
-        print(
-            f"  Note: num_queries ({num_queries}) > eligible files "
-            f"({len(eligible)}), some files will repeat"
-        )
+        ckpt = None
+
+    if (
+        isinstance(ckpt, dict)
+        and int(ckpt.get("num_queries", -1)) == int(num_queries)
+        and isinstance(ckpt.get("selected"), list)
+    ):
+        selected = [
+            x for x in ckpt.get("selected", [])
+            if isinstance(x, dict) and "rel_path" in x and "filename" in x
+        ]
+        if len(selected) != num_queries:
+            selected = []
+        else:
+            for rec in ckpt.get("records", []) or []:
+                if not isinstance(rec, dict):
+                    continue
+                idx = rec.get("index")
+                if not isinstance(idx, int) or idx < 0 or idx >= num_queries:
+                    continue
+                records_by_index[idx] = rec
+            if records_by_index:
+                print(
+                    f"  Resuming single-hop from checkpoint: "
+                    f"{len(records_by_index)}/{num_queries} attempted"
+                )
+    else:
+        selected = []
+
+    # Sample files (fresh run if no valid checkpoint selection)
+    if not selected:
+        if num_queries <= len(eligible):
+            selected = rng.sample(eligible, num_queries)
+        else:
+            selected = rng.choices(eligible, k=num_queries)
+            print(
+                f"  Note: num_queries ({num_queries}) > eligible files "
+                f"({len(eligible)}), some files will repeat"
+            )
+
+    ckpt_lock = threading.Lock()
+    completed_since_save = {"count": 0}
+
+    def _save_checkpoint(force: bool = False) -> None:
+        if checkpoint_path is None:
+            return
+        with ckpt_lock:
+            if not force and completed_since_save["count"] < max(1, checkpoint_every):
+                return
+            payload = {
+                "version": 1,
+                "num_queries": int(num_queries),
+                "selected": selected,
+                "records": [
+                    records_by_index[i]
+                    for i in sorted(records_by_index.keys())
+                ],
+            }
+            _atomic_write_json(checkpoint_path, payload)
+            completed_since_save["count"] = 0
+
+    def _record_result(index: int, result: Optional[Dict[str, Any]], status: str) -> None:
+        with ckpt_lock:
+            records_by_index[index] = {
+                "index": int(index),
+                "status": status,
+                "result": result,
+            }
+            completed_since_save["count"] += 1
+        _save_checkpoint(force=False)
+
+    # Persist initialized checkpoint with task selection
+    if checkpoint_path is not None and not ckpt:
+        _save_checkpoint(force=True)
 
     # Build the full list of LLM clients
     all_llms = [llm]
     if extra_llms:
         all_llms.extend(extra_llms)
-    num_workers = min(len(all_llms), len(selected))
+    pending_indices = [i for i in range(len(selected)) if i not in records_by_index]
+    num_workers = min(len(all_llms), len(pending_indices))
 
     # --- Sequential path (single LLM) ---
     if num_workers <= 1 or db_path is None:
@@ -495,7 +595,12 @@ def generate_single_hop_queries(
             )
         print("  Workers: 1 (sequential)")
         results: List[Dict[str, Any]] = []
-        for i, file_info in enumerate(selected):
+        for rec in records_by_index.values():
+            if rec.get("status") == "generated" and isinstance(rec.get("result"), dict):
+                results.append(rec["result"])
+
+        for i in pending_indices:
+            file_info = selected[i]
             rel_path = file_info["rel_path"]
             filename = file_info["filename"]
 
@@ -505,6 +610,7 @@ def generate_single_hop_queries(
                 conn, rel_path, profile_entities=entities,
             )
             if not page:
+                _record_result(i, None, "skipped")
                 continue
 
             result = generate_one_query(
@@ -520,29 +626,46 @@ def generate_single_hop_queries(
             )
             if result:
                 results.append(result)
+                _record_result(i, result, "generated")
+            else:
+                _record_result(i, None, "failed")
 
-            if (i + 1) % 25 == 0 or (i + 1) == len(selected):
+            attempted = len(records_by_index)
+            if attempted % 25 == 0 or attempted == len(selected):
                 print(
                     f"  Single-hop progress: {len(results)}/{num_queries} "
-                    f"generated ({i + 1}/{len(selected)} attempted)"
+                    f"generated ({attempted}/{len(selected)} attempted)"
                 )
+        _save_checkpoint(force=True)
         return results
 
     # --- Parallel path (multiple LLM clients) ---
     print(f"  Workers: {num_workers} (parallel)")
 
     result_slots: List[Optional[Dict[str, Any]]] = [None] * len(selected)
+    for idx, rec in records_by_index.items():
+        if rec.get("status") == "generated" and isinstance(rec.get("result"), dict):
+            result_slots[idx] = rec["result"]
     worker_tasks: List[List[Dict[str, Any]]] = [
         [] for _ in range(num_workers)
     ]
     worker_indices: List[List[int]] = [[] for _ in range(num_workers)]
-    for idx, task in enumerate(selected):
-        w = idx % num_workers
+    for offset, idx in enumerate(pending_indices):
+        task = selected[idx]
+        w = offset % num_workers
         worker_tasks[w].append(task)
         worker_indices[w].append(idx)
 
     stats: Dict[str, int] = {
-        "processed": 0, "generated": 0, "skipped": 0,
+        "processed": len(records_by_index),
+        "generated": sum(
+            1
+            for rec in records_by_index.values()
+            if rec.get("status") == "generated" and isinstance(rec.get("result"), dict)
+        ),
+        "skipped": sum(
+            1 for rec in records_by_index.values() if rec.get("status") == "skipped"
+        ),
     }
     stats_lock = threading.Lock()
     t0 = time.monotonic()
@@ -590,6 +713,7 @@ def generate_single_hop_queries(
                 seed=seed,
                 personas=personas,
                 corpus_size_hint=corpus_size_hint,
+                record_result=_record_result,
             )
             futures[future] = i + 1
 
@@ -607,6 +731,7 @@ def generate_single_hop_queries(
 
     stop_event.set()
     progress_thread.join(timeout=5)
+    _save_checkpoint(force=True)
 
     elapsed = time.monotonic() - t0
     valid = [r for r in result_slots if r is not None]

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -681,6 +682,25 @@ def load_all_pages_from_store(
 _PAGE_RE = re.compile(r"^(.+?)\s*\(page\s+(\d+)\)$")
 
 
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp_path.replace(path)
+
+
+def _load_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _parse_positive_pages_from_row(row) -> set:
     """Extract positive (filename, page) pairs from a DataFrame row.
 
@@ -735,6 +755,8 @@ def mine_hard_negatives_for_df(
     embedding_candidate_multiplier: int = DEFAULT_HARD_NEG_EMBED_CANDIDATE_MULTIPLIER,
     near_duplicate_cosine_threshold: float = DEFAULT_HARD_NEG_NEAR_DUP_COSINE_THRESHOLD,
     embedding_min_similarity: float = DEFAULT_HARD_NEG_EMBED_MIN_SIMILARITY,
+    checkpoint_path: Optional[Path] = None,
+    checkpoint_every: int = 10,
 ) -> List[List[str]]:
     """Mine hard negatives for a combined DataFrame using a pre-loaded page list.
 
@@ -819,8 +841,46 @@ def mine_hard_negatives_for_df(
             )
 
     hard_negatives_list: List[List[str]] = []
+    resumed_count = 0
+    if checkpoint_path is not None:
+        ckpt = _load_checkpoint(checkpoint_path)
+        if (
+            isinstance(ckpt, dict)
+            and int(ckpt.get("num_queries", -1)) == int(len(df))
+            and isinstance(ckpt.get("hard_negatives"), list)
+        ):
+            loaded = ckpt["hard_negatives"]
+            if len(loaded) <= len(df):
+                hard_negatives_list = [
+                    x if isinstance(x, list) else [] for x in loaded
+                ]
+                resumed_count = len(hard_negatives_list)
+                if resumed_count > 0:
+                    print(
+                        f"  Resuming hard negatives from checkpoint: "
+                        f"{resumed_count}/{len(df)} queries"
+                    )
+
+    def _save_checkpoint(force: bool = False) -> None:
+        if checkpoint_path is None:
+            return
+        if not force and (
+            len(hard_negatives_list) == 0
+            or (len(hard_negatives_list) % max(1, checkpoint_every) != 0)
+        ):
+            return
+        _atomic_write_json(
+            checkpoint_path,
+            {
+                "version": 1,
+                "num_queries": int(len(df)),
+                "hard_negatives": hard_negatives_list,
+            },
+        )
 
     for idx, row in df.iterrows():
+        if idx < resumed_count:
+            continue
         query = row["user_input"]
         desired_count = max(
             int(num_bm25_negatives), int(num_embedding_negatives),
@@ -950,8 +1010,10 @@ def mine_hard_negatives_for_df(
                 f"  Hard neg progress: {idx + 1}/{len(df)} queries, "
                 f"{total_so_far} negatives mined"
             )
+        _save_checkpoint(force=False)
 
     total_negs = sum(len(x) for x in hard_negatives_list)
+    _save_checkpoint(force=True)
     print(
         f"  Mined {total_negs} hard negative(s) for {len(df)} queries"
     )
