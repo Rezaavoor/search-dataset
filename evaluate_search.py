@@ -428,7 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output", type=str, default=None,
-        help="Output JSON path (default: output/eval_{model}.json)",
+        help="Output JSON path (default: output/eval_{dataset_stem}_{model}.json)",
     )
     return parser
 
@@ -731,12 +731,13 @@ def main() -> int:
         "per_query": per_query_results,
     }
 
-    # Save JSON
+    # Save JSON (default name: eval_{dataset_stem}_{model}.json)
     if args.output:
         output_path = Path(args.output)
     else:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        output_path = OUTPUT_DIR / f"eval_{sanitize_model_name(model_name)}.json"
+        dataset_stem = dataset_path.stem
+        output_path = OUTPUT_DIR / f"eval_{dataset_stem}_{sanitize_model_name(model_name)}.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
