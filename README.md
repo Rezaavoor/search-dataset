@@ -2,7 +2,7 @@
 
 This project builds **synthetic Q&A evaluation datasets** from a corpus of legal documents (PDF, DOCX, XLSX, and more). It is designed end-to-end for evaluating retrieval/search/RAG pipelines: each row includes a **question** (`user_input`), a **grounded answer** (`reference`), the **supporting context** (`reference_contexts`), and optionally **hard negatives** for IR evaluation.
 
-The toolkit covers the full lifecycle: **corpus ingestion** → **embedding** → **profiling** → **dataset generation** (single-hop + multi-hop) → **hard negative mining** → **search evaluation** → **dataset validation**.
+The toolkit covers the full lifecycle: **corpus ingestion** → **embedding** → **profiling** → **dataset generation** (single-hop + multi-hop) → **quality filtering** → **hard negative mining** → **search evaluation** → **dataset validation**.
 
 ---
 
@@ -11,11 +11,11 @@ The toolkit covers the full lifecycle: **corpus ingestion** → **embedding** �
 ```
 # --- Corpus preparation ---
 ingest_corpus.py                # Ingest documents into SQLite page store (PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON)
-embed_corpus.py                 # Compute page embeddings (multi-key parallelism, resume-safe)
+embed_corpus.py                 # Compute page embeddings (multi-key parallelism, resume-safe, cloud + open-source models)
 profile_corpus.py               # Generate per-file LLM profiles (multi-endpoint parallelism)
 
 # --- Dataset generation ---
-generate_synthetic_dataset.py   # Main pipeline: single-hop + multi-hop Q&A generation (world mode or legacy)
+generate_synthetic_dataset.py   # Main pipeline: single-hop + multi-hop Q&A generation (world mode)
 generate_single_hop.py          # Standalone parallel single-hop generator (no KG, multi-endpoint)
 
 # --- Evaluation & validation ---
@@ -33,13 +33,14 @@ modules/
   llm_setup.py                  # LLM/embedding setup (OpenAI / Azure OpenAI)
   profiles.py                   # PDF profile generation & formatting
   synthesizers.py               # Query synthesizers + distribution building
-  single_hop.py                 # Reusable single-hop generation (no KG needed)
+  single_hop.py                 # Reusable single-hop generation (no KG needed, parallel + checkpointed)
   hard_negatives.py             # Hard negative mining (BM25 + embedding + RRF + tiered LLM judge + SQLite loader)
+  quality_filter.py             # LLM-as-a-judge quality filter (drops low-quality rows during generation)
   testset.py                    # KG building, testset gen/save, persona management, source mapping
 
 # --- Data ---
 output/                         # Generated datasets + evaluation results
-processed/                      # Cached artifacts (KG, personas, SQLite store, profiles)
+processed/                      # Cached artifacts (KG, personas, SQLite store, profiles, checkpoints)
 ```
 
 ---
@@ -54,11 +55,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Dependencies include `sentence-transformers`, `transformers`, and `mteb` for open-source embedding model support.
+
 ### Configure credentials
 
 - Copy `.env.example` → `.env`
 - Configure **either** OpenAI **or** Azure OpenAI (auto-detected from env vars).
-- For multi-endpoint Azure parallelism (used by `profile_corpus.py`, `generate_single_hop.py`, `embed_corpus.py`), add `AZURE_OPENAI_API_KEY_2` + `AZURE_OPENAI_ENDPOINT_2`, etc.
+- For multi-endpoint Azure parallelism (used by `profile_corpus.py`, `generate_single_hop.py`, `generate_synthetic_dataset.py`, `embed_corpus.py`), add `AZURE_OPENAI_API_KEY_2` + `AZURE_OPENAI_ENDPOINT_2`, etc. (up to `_9`).
 
 ---
 
@@ -82,6 +85,32 @@ python embed_corpus.py --embedding-model text-embedding-3-large
 
 Computes and stores page embeddings for the specified model. Multi-key parallelism and resume-safe (picks up where it left off if interrupted).
 
+#### Open-source / HuggingFace models
+
+`embed_corpus.py` also supports local SentenceTransformer models via the `hf` provider:
+
+```bash
+# Single open-source model
+python embed_corpus.py --provider hf --model bge-m3
+
+# All registered open-source models sequentially
+python embed_corpus.py --models all-hf
+
+# Comma-separated list of models
+python embed_corpus.py --models bge-m3,stella_en_400m_v5,jina-embeddings-v3
+```
+
+Built-in HuggingFace model aliases:
+
+| Alias | HuggingFace ID |
+|-------|----------------|
+| `stella_en_400m_v5` | `dunzhang/stella_en_400M_v5` |
+| `jina-embeddings-v3` | `jinaai/jina-embeddings-v3` |
+| `snowflake-arctic-embed-m-v2.0` | `Snowflake/snowflake-arctic-embed-m-v2.0` |
+| `bge-m3` | `BAAI/bge-m3` |
+
+Any SentenceTransformer-compatible model can also be used by passing its HuggingFace ID directly (e.g., `--model BAAI/bge-large-en-v1.5`). Provider is auto-detected when the model name contains `/` or matches a known alias.
+
 ### 3. Generate per-file profiles
 
 ```bash
@@ -94,12 +123,9 @@ Generates LLM-based metadata per file (title, doc type, summary, topics, key ent
 
 ## Dataset generation
 
-The main entrypoint is `generate_synthetic_dataset.py`, which supports two modes:
+The main entrypoint is `generate_synthetic_dataset.py`. It uses **world mode**, which generates:
 
-### World mode (recommended for large corpora)
-
-When the corpus is too large to build a single Knowledge Graph, use **world mode**:
-1. **Single-hop queries** from the **full corpus** (no KG needed — fast)
+1. **Single-hop queries** from the **full corpus** (no KG needed — fast, parallelised across Azure endpoints)
 2. **Multi-hop queries** from **per-world KGs** (one KG per subfolder)
 
 ```bash
@@ -114,30 +140,23 @@ python generate_synthetic_dataset.py \
 ```
 
 How it works:
-- **Single-hop**: randomly samples PDFs from the full SQLite store, picks the best page per file, generates a Q&A pair using the LLM. No KG needed.
+- **Single-hop**: randomly samples PDFs from the full SQLite store, picks the best page per file, generates a Q&A pair using the LLM. No KG needed. When multiple Azure endpoints are configured, generation runs in parallel (one LLM per thread).
 - **Multi-hop**: for each world subfolder, collects its PDFs, builds (or loads cached) a per-world KG, generates multi-hop queries using only multi-hop RAGAS synthesizers.
+- **Quality filtering**: by default (`--filter`), an LLM-as-a-judge pass drops queries that fail query quality or source answerability checks (see [Quality filtering](#quality-filtering) below).
 - **Hard negatives**: mines from the full corpus via SQLite (BM25 + embedding retrieval, RRF merge, tiered LLM judge).
 - **Output**: a combined CSV/JSON with `synthesizer_name` (`single_hop_direct` or `multi_hop_ragas`) and `world` column for multi-hop rows.
 
-World-mode flags:
-- `--multi-hop-worlds world1 world2 ...` — activates world mode; paths relative to `--input-dir`, supports nested paths like `"Law worlds/415"`
-- `--single-hop-size N` — single-hop queries from full corpus (default: `testset-size / 2`)
-- `--multi-hop-size N` — total multi-hop queries split across worlds (default: `testset-size / 2`)
-- `--seed N` — random seed for single-hop file sampling
-- `--hard-negatives` — enable hard negative mining on combined output
+When `--multi-hop-worlds` is omitted, it defaults to `["."]` (the entire input directory as a single world).
 
-### Legacy mode (single KG)
+### Incremental / resumable generation
 
-Without `--multi-hop-worlds`, the script builds **one KG from all loaded documents** and generates a mixed single-hop + multi-hop testset via RAGAS. This is the original approach, suitable for smaller corpora.
+All major pipeline stages are **checkpointed** and resume-safe:
 
-```bash
-python generate_synthetic_dataset.py \
-  --input-dir search-dataset \
-  --specific-folders Claires \
-  --testset-size 50 \
-  --hard-negatives \
-  --output synthetic_dataset
-```
+- **Single-hop**: progress saved to `processed/progress/{output}__single_hop_progress.json` — completed queries are preserved and generation resumes from where it left off.
+- **Multi-hop**: per-world checkpoints at `processed/progress/{output}__multi_hop_world__{world}.json` — completed worlds are skipped on restart.
+- **Hard negatives**: checkpoint at `processed/progress/{output}__hard_negatives_progress.json`.
+
+If a run is interrupted (Ctrl+C, crash, rate-limit exhaustion), simply re-run the same command — it picks up from the last checkpoint.
 
 ### Standalone single-hop generator
 
@@ -169,27 +188,60 @@ LLM/provider:
 
 Query generation:
 - `--testset-size N` — number of samples (default: 50)
+- `--single-hop-size N` — single-hop queries from full corpus (default: `testset-size / 2`)
+- `--multi-hop-size N` — total multi-hop queries split across worlds (default: `testset-size / 2`)
+- `--multi-hop-worlds world1 world2 ...` — world subfolder paths relative to `--input-dir`; supports nested paths like `"Law worlds/415"` (default: `["."]`)
+- `--seed N` — random seed for single-hop file sampling
 - `--standalone-queries` / `--no-standalone-queries` — corpus-level standalone queries (default: enabled)
 - `--corpus-size-hint N` — approximate corpus size for prompt context (default: 7000)
 - `--query-llm-context "..."` — extra LLM guidance for query generation
 - `--query-mix ...` — override synthesizer distribution (e.g., `single_hop_entities=0.5`)
 - `--list-query-synthesizers` — print available synthesizer names
+- `--num-personas N` — number of personas to generate from KG (default: 3)
+- `--personas-path PATH` — path to a JSON/JSONL file with pre-defined personas
 
 PDF profiles:
 - `--pdf-profiles` / `--no-pdf-profiles` — per-PDF LLM profiles (default: enabled)
 - `--pdf-profile-max-pages N` (default: 3)
 - `--pdf-profile-max-chars-per-page N` (default: 2500)
 
+Quality filtering:
+- `--filter` / `--no-filter` — LLM quality filter (default: **enabled**)
+
 Hard negatives:
 - `--hard-negatives` — enable hard negative mining
-- `--num-bm25-negatives N` (default: 5)
-- `--num-embedding-negatives N` (default: 5)
+- `--num-bm25-negatives N` (default: 10)
+- `--num-embedding-negatives N` (default: 10)
+
+Store/embedding:
+- `--pdf-store-db PATH` — override SQLite store location
+- `--pdf-store-embeddings` / `--no-pdf-store-embeddings` — compute and store page embeddings during sync (default: disabled)
+- `--no-content-embeddings` — skip page_content embeddings in KG (summary only)
 
 Caching:
 - `--processed-dir processed` — where intermediate caches are stored
-- `--pdf-store-db PATH` — override SQLite store location
 - `--no-cache` — disable cache reuse for KG/personas
 - `--reprocess` — ignore caches and rebuild everything
+
+---
+
+## Quality filtering
+
+When `--filter` is enabled (the default), the pipeline runs an **LLM-as-a-judge quality filter** after generation and before hard negative mining. This is handled by `modules/quality_filter.py`.
+
+### What it checks
+
+1. **Source validity** — rows referencing `"unknown"` sources are dropped immediately.
+2. **Query Quality (QC)** — is the query standalone, specific, and suitable for an IR dataset? Queries that are vague, referential ("this case"), or unanswerable from a search perspective are removed.
+3. **Source Answerability (SA)** — does the labeled positive page actually answer the query? The filter fetches the real page content from SQLite (not just `reference_contexts`) and checks faithfulness.
+
+Rows that fail any check are dropped from the output. This is an integrated filter (removes rows) — in contrast, `validate_dataset.py` is a post-hoc report that does not modify the dataset.
+
+### Output
+
+When filtering is enabled:
+- The filtered dataset is saved as `{output}_filtered.csv` (and other requested formats)
+- Console logs report how many rows were dropped and why
 
 ---
 
@@ -197,33 +249,20 @@ Caching:
 
 Step counts adjust dynamically based on enabled features and number of worlds.
 
-**World mode** (`--multi-hop-worlds Claires "Law worlds/415"` with `--hard-negatives`):
+**Typical run** (`--multi-hop-worlds Claires "Law worlds/415"` with `--hard-negatives` and `--filter`):
 
 ```
-[Step  1/10] Collecting PDF paths
-[Step  2/10] Setting up LLM & embeddings
-[Step  3/10] Syncing SQLite PDF store
-[Step  4/10] Loading documents from SQLite store
-[Step  5/10] Generating single-hop queries (full corpus)
-[Step  6/10] Multi-hop for world: Claires (1/2)
-[Step  7/10] Multi-hop for world: Law worlds/415 (2/2)
-[Step  8/10] Mining hard negatives
-[Step  9/10] Saving results
-[Step 10/10] Done
-```
-
-**Legacy mode** (no `--multi-hop-worlds`):
-
-```
-[Step 1/9] Collecting PDF paths
-[Step 2/9] Setting up LLM & embeddings
-[Step 3/9] Syncing SQLite PDF store
-[Step 4/9] Loading documents from SQLite store
-[Step 5/9] Building PDF profiles
-[Step 6/9] Building knowledge graph
-[Step 7/9] Generating personas
-[Step 8/9] Generating testset
-[Step 9/9] Saving results
+[Step  1/11] Collecting PDF paths
+[Step  2/11] Setting up LLM & embeddings
+[Step  3/11] Syncing SQLite PDF store
+[Step  4/11] Loading documents from SQLite store
+[Step  5/11] Generating single-hop queries (full corpus)
+[Step  6/11] Multi-hop for world: Claires (1/2)
+[Step  7/11] Multi-hop for world: Law worlds/415 (2/2)
+[Step  8/11] Quality filtering
+[Step  9/11] Mining hard negatives
+[Step 10/11] Saving results
+[Step 11/11] Done
 ```
 
 ---
@@ -237,7 +276,7 @@ When `--hard-negatives` is enabled, the pipeline mines challenging negative exam
 1. **Candidate retrieval**: BM25 (lexical) + embedding (semantic) retrieval from the full corpus via SQLite (no KG needed)
 2. **RRF merge**: Reciprocal Rank Fusion (`score = Σ 1/(k+rank)`) combines both ranked lists into a single ordering — candidates appearing in only one list still participate
 3. **Proximity exclusion**: positive pages ± 2 adjacent pages are excluded (replaces the old whole-file exclusion, so other pages from the same document can still be selected)
-4. **Near-duplicate filtering**: candidates with cosine similarity ≥ 0.92 to any positive page are dropped
+4. **Near-duplicate filtering**: candidates with cosine similarity ≥ 0.90 to any positive page are dropped
 5. **Tiered LLM judge**: each candidate is evaluated for relevance, answerability, and **topical similarity**:
    - **Tier 1** (ideal): relevant=yes, answerable=no, topical_similarity=high
    - **Tier 2** (acceptable): answerable=no, relevant=yes|uncertain, topical_similarity=high|medium
@@ -245,9 +284,21 @@ When `--hard-negatives` is enabled, the pipeline mines challenging negative exam
 6. **Per-file cap**: max 2 negatives per source file (up from the previous 1)
 7. **Selection**: tier 1 negatives are preferred; remaining slots filled from tier 2
 
-Hard negative mining now works in **both** world mode and legacy mode. In world mode it loads all pages directly from the SQLite store (via `load_all_pages_from_store`), so no KG is required.
-
 Because the miner prioritizes correctness, some queries may produce **no** hard negatives (`[]`).
+
+### Tunable parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `num_bm25_negatives` | 10 | BM25 hard negatives per query (CLI: `--num-bm25-negatives`) |
+| `num_embedding_negatives` | 10 | Embedding hard negatives per query (CLI: `--num-embedding-negatives`) |
+| `max_judge_calls_per_query` | 20 | Max LLM judge calls per query |
+| `bm25_candidate_multiplier` | 15 | Multiplier for BM25 candidate pool size |
+| `embedding_candidate_multiplier` | 15 | Multiplier for embedding candidate pool size |
+| `near_duplicate_cosine_threshold` | 0.90 | Cosine similarity threshold for near-duplicate exclusion |
+| `embedding_min_similarity` | 0.25 | Minimum similarity for embedding candidates |
+
+The first two are exposed as CLI flags; the rest use config defaults from `modules/config.py`.
 
 ### Output
 
@@ -277,7 +328,7 @@ emb__text_embedding_3_large       BLOB
 emb_dims__text_embedding_3_large  INTEGER
 ```
 
-Model names are sanitized (e.g., `text-embedding-3-large` → `text_embedding_3_large`). Columns are added dynamically via `ALTER TABLE`.
+Model names are sanitized (e.g., `text-embedding-3-large` → `text_embedding_3_large`). Columns are added dynamically via `ALTER TABLE`. Both cloud models (OpenAI, Azure, Bedrock) and open-source models (SentenceTransformer/HuggingFace) are stored in the same schema.
 
 ### Caching
 
@@ -285,6 +336,7 @@ Intermediate artifacts under `processed/`:
 - `processed/kg/` — RAGAS Knowledge Graphs (gzipped JSON, keyed by document fingerprint + model config)
 - `processed/personas/` — generated personas
 - `processed/meta/` — metadata JSON per cached artifact
+- `processed/progress/` — incremental generation checkpoints (single-hop, multi-hop, hard negatives)
 - `processed/pdf_page_store.sqlite` — the main page store
 
 KG caches use stable keys derived from absolute paths + file sizes + modification times. Use `--reprocess` to force a rebuild.
@@ -301,6 +353,8 @@ python evaluate_search.py \
   --embedding-model text-embedding-3-large \
   --top-k 1 5 10 20
 ```
+
+Output is written to `output/eval_{dataset_stem}_{model}.json` by default (e.g., `eval_combined_dataset_text_embedding_3_large.json`). Override with `--output`.
 
 ### Metrics
 
@@ -326,6 +380,8 @@ Bedrock uses a direct API wrapper (`_DirectBedrockCohereEmbedder`) that bypasses
 
 If a model doesn't have embeddings in SQLite yet, the script auto-embeds all corpus pages (one-time, resume-safe).
 
+> **Note**: open-source models can be embedded with `embed_corpus.py --provider hf` and stored in SQLite. However, `evaluate_search.py` currently only supports cloud providers (`openai`, `azure`, `bedrock`) for query-time embedding. To evaluate an open-source model, pre-embed the corpus with `embed_corpus.py` and use the stored embeddings.
+
 ---
 
 ## Validating datasets
@@ -339,6 +395,8 @@ If a model doesn't have embeddings in SQLite yet, the script auto-embeds all cor
 The validator handles both single-hop and multi-hop rows transparently:
 - Strips `<N-hop>` prefixes from reference contexts before sending to the LLM judge
 - Resolves source display from `source_file_with_page`, `source_files_with_pages_readable`, or `source_files_with_pages` (JSON) — whichever is populated
+
+This is a **post-hoc reporting tool** — it does not modify the dataset. For integrated filtering that drops rows during generation, see [Quality filtering](#quality-filtering).
 
 ### Output
 
@@ -365,7 +423,7 @@ Output files are saved to `output/` in the formats you request (`--output-format
 | `user_input` | The generated question |
 | `reference` | The grounded answer |
 | `reference_contexts` | Context strings used to ground the answer |
-| `synthesizer_name` | `single_hop_direct` or `multi_hop_ragas` (world mode) |
+| `synthesizer_name` | `single_hop_direct` or `multi_hop_ragas` |
 | `world` | World subfolder name (multi-hop rows only) |
 
 ### Source mapping columns
@@ -416,7 +474,7 @@ RAGAS generates the dataset in two phases:
 3. **Scenarios**: sample nodes, themes, personas from the KG
 4. **Generation**: LLM produces (question, answer) faithful to the selected context(s)
 
-In **world mode**, Phase A runs once per world (building a smaller, tractable KG), and only multi-hop synthesizers are used. Single-hop queries are generated separately from the full corpus without any KG.
+Phase A runs once per world (building a smaller, tractable KG), and only multi-hop synthesizers are used. Single-hop queries are generated separately from the full corpus without any KG.
 
 ---
 
@@ -436,15 +494,16 @@ Install with `pip install rank_bm25`, or set `--num-bm25-negatives 0` to skip BM
 
 ### Slow or expensive runs
 
-Cost drivers: LLM calls during KG transforms, persona generation, Q/A generation, page embedding.
+Cost drivers: LLM calls during KG transforms, persona generation, Q/A generation, quality filtering, page embedding.
 
 Ways to reduce:
-- Use world mode (`--multi-hop-worlds`) to avoid building one giant KG
 - Lower `--testset-size`, `--single-hop-size`, `--multi-hop-size`
 - Use `--max-pdfs` or narrower `--specific-folders`
 - Use a smaller/cheaper model
 - Use `--no-pdf-profiles` if profiles are already computed via `profile_corpus.py`
 - Use `--no-content-embeddings` to skip page_content embeddings (not recommended)
+- Use `--no-filter` to skip the LLM quality filter (faster but lower dataset quality)
+- Configure multiple Azure endpoints (`AZURE_OPENAI_API_KEY_2`, etc.) for parallel single-hop generation
 
 ### KG cache misses
 
