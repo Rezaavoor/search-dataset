@@ -53,8 +53,18 @@ def file_type_from_path(path: Path) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
-def load_file_pages(path: Path) -> Tuple[str, List[PageTuple]]:
+def load_file_pages(
+    path: Path,
+    *,
+    use_ocr: bool = False,
+) -> Tuple[str, List[PageTuple]]:
     """Route to format-specific loader.
+
+    Args:
+        path: File to extract pages from.
+        use_ocr: If True and the file is a PDF, use Azure Document Intelligence
+                 OCR instead of pypdf text extraction.  Non-PDF formats always
+                 use their standard extractors (for A/B test isolation).
 
     Returns (file_type, list_of_page_tuples).
     Raises ValueError for unsupported extensions.
@@ -64,10 +74,14 @@ def load_file_pages(path: Path) -> Tuple[str, List[PageTuple]]:
     if ft is None:
         raise ValueError(f"Unsupported file extension: {ext!r} ({path.name})")
 
-    loader = _LOADERS.get(ft)
-    if loader is None:
-        raise ValueError(f"No loader registered for file_type={ft!r}")
-    pages = loader(path)
+    if use_ocr and ft == "pdf":
+        pages = _load_pdf_ocr(path)
+    else:
+        loader = _LOADERS.get(ft)
+        if loader is None:
+            raise ValueError(f"No loader registered for file_type={ft!r}")
+        pages = loader(path)
+
     # Sanity: ensure page_numbers are 1-indexed and sequential
     for i, (pn, _txt, _md) in enumerate(pages):
         if pn != i + 1:
@@ -140,6 +154,20 @@ def _load_pdf(path: Path) -> List[PageTuple]:
         md["page"] = page_number - 1  # keep 0-indexed in metadata (LangChain convention)
         pages.append((page_number, content, md))
     return pages
+
+
+# ---------------------------------------------------------------------------
+# PDF loader (OCR via Azure Document Intelligence)
+# ---------------------------------------------------------------------------
+def _load_pdf_ocr(path: Path) -> List[PageTuple]:
+    """Extract pages from a PDF using Azure Document Intelligence OCR.
+
+    Returns the same ``(page_number, text, metadata)`` tuples as
+    ``_load_pdf()`` so the rest of the pipeline is unaffected.
+    """
+    from modules.azure_doc_intel import extract_pages_ocr
+
+    return extract_pages_ocr(path)
 
 
 # ---------------------------------------------------------------------------

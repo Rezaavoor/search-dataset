@@ -17,3 +17,4 @@ boto3>=1.35.0
 mteb>=1.20.0
 sentence-transformers>=3.0.0
 transformers>=4.41.0,<5.0.0
+azure-ai-documentintelligence>=1.0.0

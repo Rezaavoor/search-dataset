@@ -905,12 +905,18 @@ def upsert_file_into_store(
     file_path: Path,
     base_input_dir: Path,
     reprocess: bool = False,
+    use_ocr: bool = False,
 ) -> int:
     """Extract pages from *file_path* (any supported format) and upsert into the store.
 
     Uses ``modules.loaders.load_file_pages`` for format-specific extraction.
     Does NOT compute embeddings — that is handled separately by the embedding
     pipeline for better resume safety.
+
+    Args:
+        use_ocr: If True and the file is a PDF, use Azure Document Intelligence
+                 OCR instead of pypdf.  Non-PDF formats always use their
+                 standard extractors.
 
     Returns the number of pages stored.
     """
@@ -925,7 +931,7 @@ def upsert_file_into_store(
         conn.execute("DELETE FROM pdf_page_store WHERE rel_path = ?", (rel_path,))
 
     file_sha256 = sha256_file(resolved)
-    file_type, pages = load_file_pages(resolved)
+    file_type, pages = load_file_pages(resolved, use_ocr=use_ocr)
 
     now = utc_now_iso()
     stored = 0

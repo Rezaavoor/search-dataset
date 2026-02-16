@@ -25,6 +25,13 @@ Usage examples:
 
     # Force re-process all files (delete + re-insert)
     python ingest_corpus.py --input-dir search-dataset/ --reprocess
+
+    # Use Azure Document Intelligence OCR for PDF extraction
+    python ingest_corpus.py --input-dir search-dataset/ --ocr
+
+    # OCR into a separate DB for A/B comparison
+    python ingest_corpus.py --input-dir search-dataset/ \\
+        --db-path processed/pdf_page_store_ocr.sqlite --ocr --reprocess
 """
 
 import argparse
@@ -152,8 +159,14 @@ def ingest(
     dry_run: bool = False,
     reprocess: bool = False,
     log_every: int = 50,
+    use_ocr: bool = False,
 ) -> Dict[str, int]:
     """Ingest all supported files from *input_dir* into the SQLite store.
+
+    Args:
+        use_ocr: If True, use Azure Document Intelligence OCR for PDF
+                 extraction instead of pypdf.  Non-PDF formats always use
+                 their standard extractors (unchanged for A/B test isolation).
 
     Returns a stats dict with keys: total, ingested, skipped, errors, pages.
     """
@@ -178,6 +191,9 @@ def ingest(
     breakdown = ", ".join(f"{ft}: {n}" for ft, n in sorted(type_counts.items()))
     log.info("Breakdown: %s", breakdown)
 
+    if use_ocr:
+        log.info("OCR MODE: PDFs will use Azure Document Intelligence instead of pypdf")
+
     if dry_run:
         log.info("DRY RUN — no files will be ingested")
         return {"total": len(files), "ingested": 0, "skipped": 0, "errors": 0, "pages": 0}
@@ -195,21 +211,11 @@ def ingest(
     stats = {"total": len(files), "ingested": 0, "skipped": 0, "errors": 0, "pages": 0}
     error_files: List[Tuple[str, str]] = []  # (rel_path, error_msg)
     t0 = time.monotonic()
+    last_log_time = t0       # for time-based progress in OCR mode
+    files_since_log = 0      # processed (ingested+error) since last progress log
 
     for idx, fpath in enumerate(files):
         rel_path = compute_rel_path_for_store(fpath, input_dir)
-
-        # --- Progress logging ---
-        if idx > 0 and idx % log_every == 0:
-            elapsed = time.monotonic() - t0
-            rate = idx / elapsed if elapsed > 0 else 0
-            remaining = (len(files) - idx) / rate if rate > 0 else 0
-            log.info(
-                "[%d/%d] %s  (%.1f files/s, ETA %s)  ingested=%d skipped=%d errors=%d pages=%d",
-                idx, len(files), rel_path[:60],
-                rate, _fmt_duration(remaining),
-                stats["ingested"], stats["skipped"], stats["errors"], stats["pages"],
-            )
 
         # --- Freshness check (skip if unchanged) ---
         if not reprocess:
@@ -228,20 +234,59 @@ def ingest(
                 pass  # If stat fails, try to ingest anyway
 
         # --- Ingest file ---
+        file_t0 = time.monotonic()
         try:
             pages_stored = upsert_file_into_store(
                 conn,
                 file_path=fpath,
                 base_input_dir=input_dir,
                 reprocess=reprocess,
+                use_ocr=use_ocr,
             )
             stats["ingested"] += 1
             stats["pages"] += pages_stored
+            files_since_log += 1
+
+            # Per-file log for OCR mode (each file takes seconds)
+            if use_ocr:
+                file_elapsed = time.monotonic() - file_t0
+                log.info(
+                    "  OK  %s — %d pages in %.1fs",
+                    fpath.name[:70], pages_stored, file_elapsed,
+                )
         except Exception as exc:
             stats["errors"] += 1
+            files_since_log += 1
             err_msg = f"{type(exc).__name__}: {exc}"
             error_files.append((rel_path, err_msg))
-            log.warning("FAILED [%s]: %s", rel_path[:80], err_msg)
+            log.warning("  ERR %s — %s", fpath.name[:70], err_msg)
+
+        # --- Progress logging ---
+        # In OCR mode: log every 30 seconds (files are slow).
+        # In normal mode: log every log_every files.
+        now = time.monotonic()
+        elapsed = now - t0
+        processed = stats["ingested"] + stats["errors"]
+        should_log = False
+        if use_ocr:
+            should_log = (now - last_log_time) >= 30 and files_since_log > 0
+        else:
+            should_log = processed > 0 and processed % log_every == 0
+
+        if should_log:
+            rate = processed / elapsed if elapsed > 0 else 0
+            todo = len(files) - idx - 1
+            remaining = todo / rate if rate > 0 else 0
+            pct = (idx + 1) / len(files) * 100
+            log.info(
+                "━━ Progress: %d/%d (%.1f%%) — ingested=%d  skipped=%d  errors=%d  "
+                "pages=%d — %.2f files/s, ETA %s",
+                idx + 1, len(files), pct,
+                stats["ingested"], stats["skipped"], stats["errors"],
+                stats["pages"], rate, _fmt_duration(remaining),
+            )
+            last_log_time = now
+            files_since_log = 0
 
     elapsed = time.monotonic() - t0
     conn.close()
@@ -334,6 +379,16 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Log progress every N files (default: 50).",
     )
+    p.add_argument(
+        "--ocr",
+        action="store_true",
+        help=(
+            "Use Azure Document Intelligence OCR for PDF extraction instead of "
+            "pypdf text-layer extraction. Requires AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT "
+            "and AZURE_DOCUMENT_INTELLIGENCE_KEY env vars. "
+            "Non-PDF formats always use their standard extractors."
+        ),
+    )
     return p.parse_args()
 
 
@@ -352,6 +407,11 @@ def main() -> None:
         file_types = {ft.strip().lower() for ft in args.file_types.split(",")}
         log.info("Filtering to file types: %s", file_types)
 
+    if args.ocr:
+        from dotenv import load_dotenv
+        load_dotenv()
+        log.info("Loading .env for Azure Document Intelligence credentials")
+
     ingest(
         input_dir=input_dir,
         db_path=db_path,
@@ -359,6 +419,7 @@ def main() -> None:
         dry_run=args.dry_run,
         reprocess=args.reprocess,
         log_every=args.log_every,
+        use_ocr=args.ocr,
     )
 
 
