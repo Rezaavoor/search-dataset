@@ -29,6 +29,7 @@ modules/
   utils.py                      # Shared helpers (hashing, JSON, paths, text)
   db.py                         # SQLite page store operations + multi-model embedding storage
   loaders.py                    # Format-specific page extractors (PDF, DOCX, XLSX, etc.)
+  azure_doc_intel.py            # Azure Document Intelligence OCR client (batch, retry, per-page spans)
   transforms.py                 # RAGAS transform patches (SafeHeadlineSplitter, etc.)
   llm_setup.py                  # LLM/embedding setup (OpenAI / Azure OpenAI)
   profiles.py                   # PDF profile generation & formatting
@@ -55,13 +56,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Dependencies include `sentence-transformers`, `transformers`, and `mteb` for open-source embedding model support.
+Dependencies include `sentence-transformers`, `transformers`, and `mteb` for open-source embedding model support. OCR mode additionally requires `azure-ai-documentintelligence`.
 
 ### Configure credentials
 
 - Copy `.env.example` → `.env`
 - Configure **either** OpenAI **or** Azure OpenAI (auto-detected from env vars).
 - For multi-endpoint Azure parallelism (used by `profile_corpus.py`, `generate_single_hop.py`, `generate_synthetic_dataset.py`, `embed_corpus.py`), add `AZURE_OPENAI_API_KEY_2` + `AZURE_OPENAI_ENDPOINT_2`, etc. (up to `_9`).
+- For OCR-based PDF extraction (`--ocr`), set `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `AZURE_DOCUMENT_INTELLIGENCE_KEY`.
 
 ---
 
@@ -76,6 +78,30 @@ python ingest_corpus.py --input-dir search-dataset
 ```
 
 Extracts all documents (PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON) into the SQLite page store (`processed/pdf_page_store.sqlite`). Each page becomes one row with `doc_content`, `rel_path`, `filename`, `page_number`, and metadata.
+
+#### OCR mode (Azure Document Intelligence)
+
+For scanned PDFs, image-heavy documents, or complex table layouts, use OCR-based extraction instead of pypdf's text-layer extraction:
+
+```bash
+# OCR all PDFs using Azure Document Intelligence
+python ingest_corpus.py --input-dir search-dataset/ --ocr
+
+# OCR into a separate DB for A/B comparison
+python ingest_corpus.py --input-dir search-dataset/ \
+    --db-path processed/pdf_page_store_ocr.sqlite --ocr --reprocess
+```
+
+The `--ocr` flag routes PDF extraction through Azure Document Intelligence's `prebuilt-layout` model, which returns per-page markdown. Non-PDF formats always use their standard extractors (unchanged).
+
+How it works (`modules/azure_doc_intel.py`):
+- **Batching**: PDFs larger than 30 pages are split into sub-PDFs using pypdf, processed in parallel (up to 6 concurrent Azure requests), then merged
+- **Retry**: exponential backoff on HTTP 429 / transient errors (up to 5 retries)
+- **Per-page span mapping**: the full markdown response is sliced back to per-page text using the page-span offsets returned by the API
+
+Requires `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `AZURE_DOCUMENT_INTELLIGENCE_KEY` env vars (see `.env.example`). Pricing is ~$1.50 per 1,000 pages.
+
+> **OCR vs pypdf benchmark**: On a corpus of ~128k PDF pages (primarily text-layer PDFs), OCR showed small but consistent improvements: recall@1 +2.4%, MAP +1.4%, MRR +1.0%, nDCG@10 +1.0%. Gains would likely be larger on scanned/image-heavy documents. Full results in `output/verified/OCR_vs_no_OCR_comparison_analysis.md`.
 
 ### 2. Compute page embeddings
 
