@@ -438,6 +438,91 @@ python validate_dataset.py \
 
 ---
 
+## Dataset validation and sanity checking
+
+The generated dataset is validated through a **multi-layered strategy** — checks happen during generation, as an integrated pipeline filter, as a post-hoc evaluation, and as a standalone validation script.
+
+### Layer 1: Generation-time prompt constraints
+
+The LLM prompts in `modules/config.py` enforce strict query rules:
+- Queries must be standalone (no deictic references like "this case", "the above")
+- Queries must include at least one concrete identifier (case name, statute number, party name, etc.)
+- Queries must not reference filenames, page numbers, or internal document metadata
+- Answers must be grounded entirely in the provided context
+
+After generation, a regex (`REFERENTIAL_QUERY_RE`) scans all queries for deictic phrases and emits warnings if any are detected.
+
+### Layer 2: Integrated quality filter (`modules/quality_filter.py`)
+
+When `--filter` is enabled (the default), an **LLM-as-a-judge quality filter** runs after generation. It performs three sequential phases:
+
+1. **Phase 0 — Unknown source removal**: drops rows where `source_files` or `source_files_with_pages` contains `"unknown"` (source page couldn't be mapped).
+2. **Phase 1 — Query Quality (QC)**: an LLM judge evaluates whether each query is standalone, specific, contains concrete identifiers, and is plausible as a real search query. Verdict != `"pass"` → **row dropped**.
+3. **Phase 2 — Source Answerability (SA)**: an LLM judge checks whether the labeled positive page(s) actually answer the query and whether the generated answer is faithful. The filter fetches real page content from SQLite (not just `reference_contexts`). Verdict != `"pass"` → **row dropped**.
+
+### Layer 3: Hard negative quality gates (`modules/hard_negatives.py`)
+
+Hard negative mining includes multiple built-in quality filters:
+
+- **Proximity exclusion**: pages within ±2 of any positive page are excluded
+- **Near-duplicate cosine filtering**: candidates with cosine similarity ≥ 0.90 to any positive page are excluded
+- **Tiered LLM judge**: each candidate is evaluated for relevance, answerability, and topical similarity. Tier 1 (ideal) = relevant but not answerable with high topical similarity; Tier 2 (acceptable) = not answerable with medium+ topical similarity. Candidates that actually answer the query (with verbatim evidence) or are completely irrelevant are rejected.
+- **Per-file diversity cap**: max 2 negatives per source file
+
+### Layer 4: Post-hoc LLM validation (`validate_dataset.py`)
+
+A standalone validation script evaluates every row on three axes:
+
+1. **Query Quality** — legal-domain-specific checks (standalone, legal relevance, concrete identifiers)
+2. **Source Answerability** — fetches actual positive page content from SQLite and checks if the source answers the query and whether the answer is faithful
+3. **Hard Negative Quality** — fetches each hard negative's page content and evaluates whether it is topically similar but not answerable; flags **false negatives** (hard negatives that actually answer the query)
+
+Produces a JSON report, CSV summary, and aggregate statistics (pass rates, per-synthesizer breakdown, fully-passing percentage). This is a **reporting tool** — it does not modify the dataset.
+
+### Layer 5: Retrieval evaluation sanity check (`evaluate_search.py`, `run_mleb.py`)
+
+`evaluate_search.py` acts as a **functional sanity check** on dataset quality by measuring how well an embedding model retrieves the ground truth pages. It computes Recall@K, MRR, MAP, nDCG@K, and hard negative analysis. Built-in diagnostics warn about:
+- Small query sets (n < 50)
+- Queries with >50 positive pages (possible boilerplate contamination)
+- Queries with >100 positive pages (likely header/footer inflation)
+
+As an additional sanity check, retrieval results for `text-embedding-3-large` on this dataset were compared against publicly available scores for the same model on the **MTEB** (Massive Text Embedding Benchmark) and **MLEB** (Massive Legal Embedding Benchmark, https://isaacus.com/mleb). The project includes `run_mleb.py`, which evaluates embedding models on 10 expert-annotated legal retrieval datasets using the official MTEB evaluation framework. The nDCG@10 scores produced by `text-embedding-3-large` on these external benchmarks were broadly consistent with the retrieval quality observed on the generated dataset, confirming that the dataset's difficulty and ground truth labels are realistic and not artificially easy or inflated.
+
+### Layer 6: Manual curation
+
+Starting from ~2,000 generated queries, the final verified dataset (464 queries) underwent additional curation:
+
+1. **Rank > 100 removal** — 114 queries where the positive page ranked too low (vague queries or mislabeled ground truth)
+2. **Exact duplicate removal** — 3 duplicate pairs with conflicting positives
+3. **Severe general query removal** — 24 queries with recall@20=0 where top-20 results were dominated by sibling documents
+4. **Moderate general query removal** — 28 queries at rank > 5 where 10+ top-20 results came from the same file family
+
+### Layer 7: A/B comparison
+
+The dataset was further validated by comparing pypdf vs OCR text extraction, running full evaluations on both corpora to ensure metrics were sound. A flawed earlier analysis (cross-comparing hard negatives between corpora) was identified and corrected — the final comparison uses independently mined hard negatives for each corpus. Full results in `output/verified/OCR_vs_no_OCR_comparison_analysis.md`.
+
+### Summary
+
+| Layer | When | Mechanism | Action |
+|-------|------|-----------|--------|
+| Prompt constraints | Generation | Strict LLM instructions | Preventive |
+| Referential query regex | Post-generation | `REFERENTIAL_QUERY_RE` | Warning |
+| Unknown source filter | Pipeline filter | String check | **Drops rows** |
+| Query Quality (QC) | Pipeline filter | LLM-as-a-judge | **Drops rows** |
+| Source Answerability (SA) | Pipeline filter | LLM-as-a-judge | **Drops rows** |
+| HN proximity exclusion | Hard neg mining | ±2 page buffer | Excludes candidates |
+| HN near-duplicate cosine | Hard neg mining | Cosine ≥ 0.90 | Excludes candidates |
+| HN tiered LLM judge | Hard neg mining | LLM relevance/answerability | Tiered accept/reject |
+| HN per-file cap | Hard neg mining | Max 2 per file | Diversity enforcement |
+| Post-hoc validation | Standalone script | 3-axis LLM-as-a-judge | Report + analysis |
+| Retrieval evaluation | Standalone script | IR metrics + MTEB comparison | Quality warnings |
+| Manual curation | Post-evaluation | Rank analysis + dedup | **Drops rows** |
+| A/B comparison | Analysis | Cross-corpus evaluation | Methodology validation |
+
+> **Note**: there are no automated unit tests (`pytest`/`unittest`) for the pipeline code itself. Validation is focused entirely on data quality.
+
+---
+
 ## Outputs and schema
 
 Output files are saved to `output/` in the formats you request (`--output-formats csv json parquet`).
