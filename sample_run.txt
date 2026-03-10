@@ -1,11 +1,83 @@
-python generate_synthetic_dataset.py \
-  --specific-folders "Claires" \
-  --max-pdfs 100 \
-  --testset-size 5 \
+
+
+python evaluate_search.py \
+  --dataset output/dataset_with_negatives_v11_refined.csv \
+  --embedding-model eu.cohere.embed-v4:0 \
+  --provider bedrock \
+  --top-k 1 5 10 20
+
+
+python evaluate_search.py \
+  --dataset output/combined_dataset_law_worlds_filtered.csv \
+  --embedding-model text-embedding-3-large \
+  --top-k 1 5 10 20
+
+
+
+  python generate_synthetic_dataset.py \
+  --input-dir search-dataset \
+  --multi-hop-worlds \
+    "Law worlds/415" \
+    "Law worlds/416" \
+    "Law worlds/417" \
+    "Law worlds/418" \
+    "Law worlds/419" \
+    "Law worlds/423" \
+    "Law worlds/425" \
+    "Law worlds/433" \
+    "Claires" \
+  --single-hop-size 0 \
+  --multi-hop-size 400 \
   --hard-negatives \
-  --num-bm25-negatives 10 \
-  --num-embedding-negatives 10 \
-  --output dataset_with_negatives_v11 \
-  --output-formats csv \
-  --pdf-store-embeddings \
-  --num-personas 5
+  --no-pdf-profiles \
+  --output combined_dataset_law_worlds
+
+
+python generate_synthetic_dataset.py \
+  --input-dir search-dataset \
+  --multi-hop-worlds \
+    "Law worlds/415" \
+    "Law worlds/416" \
+    "Law worlds/417" \
+    "Law worlds/418" \
+    "Law worlds/419" \
+    "Law worlds/423" \
+    "Law worlds/425" \
+    "Law worlds/433" \
+    "Claires" \
+  --single-hop-size 1500 \
+  --multi-hop-size 500 \
+  --hard-negatives \
+  --no-pdf-profiles \
+  --seed 42 \
+  --output full_2000
+
+
+
+
+  Done: 415, 416, 417, 418, 425. 419, 433, 423
+  Error: 431
+  Running: 
+  Remaining (skipped): 421, 434
+
+
+
+
+python generate_synthetic_dataset.py \
+  --input-dir search-dataset \
+  --multi-hop-worlds \
+    "Law worlds/415" \
+    "Law worlds/416" \
+    "Law worlds/417" \
+    "Law worlds/418" \
+    "Law worlds/419" \
+    "Law worlds/423" \
+    "Law worlds/425" \
+    "Law worlds/433" \
+    "Claires" \
+  --single-hop-size 5000 \
+  --multi-hop-size 5000 \
+  --hard-negatives \
+  --no-pdf-profiles \
+  --seed 42 \
+  --output full_10_000
