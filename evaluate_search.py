@@ -51,8 +51,12 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 # Dataset loading
 # ============================================================================
 def load_dataset(path: Path) -> pd.DataFrame:
-    """Load the generated dataset CSV."""
-    df = pd.read_csv(path)
+    """Load the generated dataset (CSV or JSON array)."""
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        df = pd.read_json(path)
+    else:
+        df = pd.read_csv(path)
     required = ["user_input", "source_files_with_pages"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -430,6 +434,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", type=str, default=None,
         help="Output JSON path (default: output/eval_{dataset_stem}_{model}.json)",
     )
+    parser.add_argument(
+        "--adapter", type=str, default=None,
+        help="Path to a trained adapter checkpoint (.pt). When set, the adapter "
+             "is applied to every query embedding before search. Omit for baseline.",
+    )
     return parser
 
 
@@ -440,10 +449,31 @@ def main() -> int:
     model_name = args.embedding_model
     top_k_values = sorted(set(args.top_k))
 
+    # --- Load adapter (optional) ---
+    adapter = None
+    adapter_label = ""
+    if args.adapter:
+        adapter_path = Path(args.adapter)
+        if not adapter_path.exists():
+            print(f"\nError: Adapter checkpoint not found: {adapter_path}")
+            return 1
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent / "adapter"))
+        from model import load_adapter as _load_adapter
+        import torch as _torch
+        adapter = _load_adapter(adapter_path)
+        adapter.eval()
+        ckpt_meta = _torch.load(adapter_path, map_location="cpu", weights_only=True)
+        atype = ckpt_meta.get("adapter_type", "adapter")
+        adim  = ckpt_meta.get("low_rank_dim")
+        adapter_label = f"_adapted_{atype}" + (f"_r{adim}" if adim else "")
+
     print("=" * 60)
     print("Embedding Search Evaluation")
     print("=" * 60)
     print(f"  Model: {model_name}")
+    if adapter is not None:
+        print(f"  Adapter: {args.adapter}")
     print(f"  Top-K: {top_k_values}")
 
     # --- Load dataset ---
@@ -572,6 +602,12 @@ def main() -> int:
             continue
 
         q_vec = np.asarray(q_emb, dtype=np.float32)
+
+        # Apply adapter if provided (cosine_similarity_search normalises the result)
+        if adapter is not None:
+            with _torch.no_grad():
+                q_t   = _torch.from_numpy(q_vec).unsqueeze(0)
+                q_vec = adapter(q_t).numpy().squeeze(0)
 
         # Parse ground truth positives
         raw_positives = parse_json_col(row.get("source_files_with_pages"))
@@ -755,7 +791,7 @@ def main() -> int:
     else:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         dataset_stem = dataset_path.stem
-        output_path = OUTPUT_DIR / f"eval_{dataset_stem}_{sanitize_model_name(model_name)}.json"
+        output_path = OUTPUT_DIR / f"eval_{dataset_stem}_{sanitize_model_name(model_name)}{adapter_label}.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
