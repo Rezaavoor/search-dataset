@@ -40,6 +40,13 @@ run_mleb.py                     # Run Massive Legal Embedding Benchmark (MLEB) w
   quality_filter.py             # Legacy text-only LLM quality filter (superseded by vision_validate_dataset.py)
   testset.py                    # KG building, testset gen/save, persona management, source mapping
 
+# --- Adapter training ---
+  adapter/                      # Query-only embedding adapter (see adapter/README.md)
+  adapter/config.py             # All hyperparameters in one place
+  adapter/preprocess.py         # Build triplets + cache query embeddings
+  adapter/train.py              # Train adapter + evaluate on full corpus
+  adapter/model.py              # FullRankAdapter / LowRankAdapter + checkpoint utilities
+
 # --- Data ---
 output/                         # Generated datasets + evaluation results
 processed/                      # Cached artifacts (KG, personas, SQLite store, profiles, checkpoints)
@@ -434,6 +441,23 @@ Bedrock uses a direct API wrapper (`_DirectBedrockCohereEmbedder`) that bypasses
 If a model doesn't have embeddings in SQLite yet, the script auto-embeds all corpus pages (one-time, resume-safe).
 
 > **Note**: open-source models can be embedded with `embed_corpus.py --provider hf` and stored in SQLite. However, `evaluate_search.py` currently only supports cloud providers (`openai`, `azure`, `bedrock`) for query-time embedding. To evaluate an open-source model, pre-embed the corpus with `embed_corpus.py` and use the stored embeddings.
+
+---
+
+## Adapter training
+
+Once you have a corpus with pre-computed embeddings and a validated dataset, you can train a **query-only linear embedding adapter** that improves retrieval quality without re-embedding the ~165K-page corpus.
+
+The adapter applies a learned linear transformation to query embeddings at search time. Document embeddings are never changed. Following the [Chroma Research methodology](https://research.trychroma.com/embedding-adapters), a low-rank variant (~789K parameters) trained on the generated triplets is the recommended starting point.
+
+```bash
+python adapter/preprocess.py   # build triplets + cache query embeddings (~$0.10 API cost)
+python adapter/train.py        # train + evaluate; prints baseline vs. adapted comparison table
+```
+
+All hyperparameters (architecture, learning rate, margin, split ratios, etc.) are centralised in `adapter/config.py`.
+
+**Full documentation:** [`adapter/README.md`](adapter/README.md)
 
 ---
 
