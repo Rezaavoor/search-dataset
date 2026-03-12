@@ -12,8 +12,10 @@ Usage:
 """
 
 import json
+import shutil
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -396,6 +398,115 @@ def _evaluate_retrieval(
 
 
 # ---------------------------------------------------------------------------
+# Leaderboard — tracks the best result per (adapter_type, low_rank_dim)
+# ---------------------------------------------------------------------------
+
+def _config_key() -> str:
+    """Stable string key for the current adapter config, used as leaderboard key."""
+    if cfg.ADAPTER_TYPE == "full_rank":
+        return "full_rank"
+    return f"{cfg.ADAPTER_TYPE}_r{cfg.LOW_RANK_DIM}"
+
+
+def _update_leaderboard(
+    adapted_metrics: Dict[str, float],
+    baseline_metrics: Dict[str, float],
+    model_path: Path,
+    n_train_queries: int,
+    n_test_queries: int,
+) -> None:
+    """Compare this run against the stored best for its config key.
+
+    If it's a new best (by cfg.BEST_METRIC), saves a dedicated checkpoint
+    alongside the leaderboard entry so the best model for each config is
+    always preserved even when best_model.pt is overwritten by the next run.
+    """
+    key        = _config_key()
+    lb_path    = cfg.LEADERBOARD_PATH
+    leaderboard: dict = json.loads(lb_path.read_text()) if lb_path.exists() else {}
+
+    current_value = adapted_metrics.get(cfg.BEST_METRIC, 0.0)
+    existing      = leaderboard.get(key)
+    is_new_best   = existing is None or current_value > existing["best_value"]
+
+    print(f"\n{'─' * 60}")
+    if is_new_best:
+        # Save a stable copy of the best checkpoint for this config
+        dedicated_path = cfg.DATA_DIR / f"best_{key}.pt"
+        shutil.copy2(model_path, dedicated_path)
+
+        leaderboard[key] = {
+            "adapter_type":      cfg.ADAPTER_TYPE,
+            "low_rank_dim":      cfg.LOW_RANK_DIM if cfg.ADAPTER_TYPE == "low_rank" else None,
+            "comparison_metric": cfg.BEST_METRIC,
+            "best_value":        round(current_value, 6),
+            "config": {
+                "LEARNING_RATE":           cfg.LEARNING_RATE,
+                "MARGIN":                  cfg.MARGIN,
+                "BATCH_SIZE":              cfg.BATCH_SIZE,
+                "NUM_EPOCHS":              cfg.NUM_EPOCHS,
+                "WEIGHT_DECAY":            cfg.WEIGHT_DECAY,
+                "GRAD_CLIP_NORM":          cfg.GRAD_CLIP_NORM,
+                "N_SOFT_NEGS":             cfg.N_SOFT_NEGS,
+                "RANDOM_SEED":             cfg.RANDOM_SEED,
+            },
+            "test_metrics":     {k: round(v, 6) for k, v in adapted_metrics.items()},
+            "baseline_metrics": {k: round(v, 6) for k, v in baseline_metrics.items()},
+            "delta":            {k: round(adapted_metrics.get(k, 0.0) - baseline_metrics[k], 6)
+                                 for k in baseline_metrics},
+            "n_train_queries":  n_train_queries,
+            "n_test_queries":   n_test_queries,
+            "model_path":       str(dedicated_path),
+            "updated_at":       datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        lb_path.write_text(json.dumps(leaderboard, indent=2))
+
+        prev_str = f"  prev={existing['best_value']:.4f}" if existing else "  (first run)"
+        print(f"  ★ New best for [{key}]  "
+              f"{cfg.BEST_METRIC}={current_value:.4f}{prev_str}")
+        print(f"    Checkpoint : {dedicated_path.name}")
+        print(f"    Leaderboard: {lb_path}")
+    else:
+        prev = existing["best_value"]
+        print(f"  No improvement for [{key}]  "
+              f"{cfg.BEST_METRIC}={current_value:.4f}  (best={prev:.4f})")
+
+
+def _print_leaderboard() -> None:
+    """Print a summary table of all configs in the leaderboard."""
+    lb_path = cfg.LEADERBOARD_PATH
+    if not lb_path.exists():
+        return
+    leaderboard: dict = json.loads(lb_path.read_text())
+    if not leaderboard:
+        return
+
+    # Sort by comparison metric descending
+    entries = sorted(
+        leaderboard.items(),
+        key=lambda kv: kv[1].get("best_value", 0.0),
+        reverse=True,
+    )
+
+    metric = entries[0][1].get("comparison_metric", cfg.BEST_METRIC)
+    print(f"\n{'─' * 60}")
+    print(f"  Leaderboard  (sorted by {metric})")
+    print(f"  {'Config':<20} {metric:>8}  {'recall@1':>8}  {'mrr':>6}  {'LR':>8}  {'Epochs':>6}")
+    print(f"  {'─'*20} {'─'*8}  {'─'*8}  {'─'*6}  {'─'*8}  {'─'*6}")
+    for rank, (key, entry) in enumerate(entries, 1):
+        m  = entry["test_metrics"]
+        c  = entry["config"]
+        lr = c.get("LEARNING_RATE", "?")
+        ep = c.get("NUM_EPOCHS", "?")
+        print(
+            f"  {key:<20} {m.get(metric, 0):>8.4f}  "
+            f"{m.get('recall@1', 0):>8.4f}  "
+            f"{m.get('mrr', 0):>6.4f}  "
+            f"{lr:>8}  {ep:>6}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -536,6 +647,15 @@ def main() -> None:
             "adapted_metrics":  adapted,
             "delta":            {k: round(adapted.get(k, 0.0) - baseline[k], 6) for k in baseline},
         }) + "\n")
+
+    _update_leaderboard(
+        adapted_metrics  = adapted,
+        baseline_metrics = baseline,
+        model_path       = model_path,
+        n_train_queries  = train_df["query_idx"].nunique(),
+        n_test_queries   = n_test_queries,
+    )
+    _print_leaderboard()
 
     print(f"\n{'=' * 60}")
     print(f"Done")
