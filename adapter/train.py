@@ -431,6 +431,9 @@ def main() -> None:
 
     query_embeddings: np.ndarray = np.load(emb_path)   # (N_queries, D)
     triplets_df = pd.read_csv(triplets_path)
+    # Empty source_file values are written as blank CSV cells and read back as NaN;
+    # normalise to empty string so sorted() and set operations work correctly.
+    triplets_df["source_file"] = triplets_df["source_file"].fillna("").astype(str)
     print(f"  Query embeddings : {query_embeddings.shape}")
     print(f"  Triplets         : {len(triplets_df):,}")
 
@@ -484,11 +487,13 @@ def main() -> None:
 
     best_adapter = load_adapter(model_path).to(device)
 
-    # Normalise corpus matrix in-place for retrieval (training is complete)
+    # Normalise corpus matrix in-place for retrieval (training is complete).
+    # Guard against zero-norm and NaN/inf rows from degenerate page embeddings.
     print(f"  Normalising corpus matrix for retrieval...")
     norms = np.linalg.norm(corpus_matrix, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    corpus_matrix /= norms   # in-place — saves ~2 GB vs creating a new array
+    norms = np.where(np.isfinite(norms) & (norms > 0), norms, 1.0)
+    corpus_matrix /= norms
+    np.nan_to_num(corpus_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     n_test_queries = test_df["query_idx"].nunique()
     print(f"  Test queries: {n_test_queries:,}")

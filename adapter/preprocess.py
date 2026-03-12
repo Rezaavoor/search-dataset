@@ -114,7 +114,15 @@ def _build_triplets(df: pd.DataFrame, corpus_pool: List[Tuple[str, int]], rng: r
         hard_neg_refs = [parse_page_ref(r) for r in _parse_json_col(row.get("hard_negatives", ""))]
         hard_neg_refs = [p for p in hard_neg_refs if p is not None]
 
-        source_file = str(row.get("source_file", "")) if pd.notna(row.get("source_file")) else ""
+        # Use source_file if available; multi-hop queries may have NaN here
+        # because they span multiple files. Fall back to the first positive
+        # page's filename so these queries are distributed across real file
+        # buckets rather than all collapsing into a single "" split bucket.
+        sf = row.get("source_file")
+        if pd.notna(sf) and str(sf).strip():
+            source_file = str(sf).strip()
+        else:
+            source_file = pos_refs[0][0] if pos_refs else ""
 
         # Base exclusion set shared across all positives: the pos pages + hard negs
         base_excluded = set(pos_refs) | set(hard_neg_refs)
@@ -294,6 +302,7 @@ def main(recompute: bool = False) -> None:
     else:
         rng         = random.Random(cfg.RANDOM_SEED)
         triplets_df = _build_triplets(df, corpus_pool, rng)
+        triplets_df = triplets_df.sample(frac=1, random_state=cfg.RANDOM_SEED).reset_index(drop=True)
         triplets_df.to_csv(triplets_path, index=False)
         print(f"  Saved: {triplets_path}")
 
