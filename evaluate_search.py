@@ -497,9 +497,11 @@ def main() -> int:
         print(f"  All {existing_count} pages have embeddings (cached)")
         emb_model = None  # Not needed if all cached
 
-    # Load all embeddings into memory
+    # Load all embeddings into memory — can take several minutes for large corpora
+    print(f"  Loading {existing_count:,} page embeddings from SQLite (this may take a few minutes)...")
+    t_load = time.monotonic()
     all_embeddings = load_page_embeddings(conn, model_name)
-    print(f"  Loaded {len(all_embeddings)} page embeddings into memory")
+    print(f"  Loaded {len(all_embeddings):,} page embeddings in {time.monotonic() - t_load:.1f}s")
 
     if not all_embeddings:
         print("\nError: No embeddings available. Cannot evaluate.")
@@ -527,24 +529,40 @@ def main() -> int:
     # (e.g., Cohere) receive the correct input_type="search_query".
     query_emb_model = setup_query_embedding_model(model_name, args.provider)
 
-    try:
-        query_embeddings = query_emb_model.embed_documents(queries)
-        print(f"  Embedded {len(queries)} queries (batched)")
-    except Exception as e:
-        print(f"  Batch embedding failed ({e}), falling back to per-query...")
-        query_embeddings = []
-        for q in queries:
-            try:
-                query_embeddings.append(query_emb_model.embed_query(q))
-            except Exception:
-                query_embeddings.append(None)
+    EMBED_BATCH = 200
+    query_embeddings: List[Optional[List[float]]] = []
+    t_embed = time.monotonic()
+    for batch_start in range(0, len(queries), EMBED_BATCH):
+        batch = queries[batch_start: batch_start + EMBED_BATCH]
+        try:
+            vecs = query_emb_model.embed_documents(batch)
+            query_embeddings.extend(vecs)
+        except Exception as e:
+            print(f"  Batch failed at {batch_start} ({str(e)[:80]}), falling back per-query...")
+            for q in batch:
+                try:
+                    query_embeddings.append(query_emb_model.embed_query(q))
+                except Exception:
+                    query_embeddings.append(None)
+        done = min(batch_start + EMBED_BATCH, len(queries))
+        elapsed = time.monotonic() - t_embed
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (len(queries) - done) / rate if rate > 0 else 0
+        print(f"  Embedded {done}/{len(queries)} queries  [{rate:.0f}/s  ETA {eta:.0f}s]")
 
     # --- Search and score ---
     print(f"\n[4/5] Searching and scoring")
     per_query_results: List[Dict[str, Any]] = []
     max_k = max(top_k_values)
 
+    t_search = time.monotonic()
+    PROGRESS_EVERY = 500
     for row_idx, (_, row) in enumerate(df.iterrows()):
+        if row_idx > 0 and row_idx % PROGRESS_EVERY == 0:
+            elapsed = time.monotonic() - t_search
+            rate = row_idx / elapsed if elapsed > 0 else 0
+            eta = (len(df) - row_idx) / rate if rate > 0 else 0
+            print(f"  Scored {row_idx}/{len(df)} queries  [{rate:.0f}/s  ETA {eta:.0f}s]")
         query = row["user_input"]
         q_emb = query_embeddings[row_idx]
         if q_emb is None:
