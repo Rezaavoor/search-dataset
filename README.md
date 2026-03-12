@@ -44,8 +44,9 @@ run_mleb.py                     # Run Massive Legal Embedding Benchmark (MLEB) w
   adapter/                      # Query-only embedding adapter (see adapter/README.md)
   adapter/config.py             # All hyperparameters in one place
   adapter/preprocess.py         # Build triplets + cache query embeddings
-  adapter/train.py              # Train adapter + evaluate on full corpus
+  adapter/train.py              # Train adapter + evaluate on full corpus + update leaderboard
   adapter/model.py              # FullRankAdapter / LowRankAdapter + checkpoint utilities
+  adapter/leaderboard.json      # Best result per adapter config (auto-managed by train.py)
 
 # --- Data ---
 output/                         # Generated datasets + evaluation results
@@ -416,6 +417,18 @@ python evaluate_search.py \
 
 Output is written to `output/eval_{dataset_stem}_{model}.json` by default (e.g., `eval_combined_dataset_text_embedding_3_large.json`). Override with `--output`.
 
+To evaluate with a trained adapter applied to query embeddings at search time:
+
+```bash
+python evaluate_search.py \
+  --dataset output/combined_dataset.csv \
+  --embedding-model text-embedding-3-large \
+  --adapter adapter/data/best_full_rank.pt \
+  --top-k 1 5 10 20
+```
+
+When `--adapter` is set, the output filename includes an adapter suffix (e.g., `eval_..._adapted_full_rank.json`). Document embeddings are never modified.
+
 ### Metrics
 
 | Metric | Description |
@@ -448,14 +461,14 @@ If a model doesn't have embeddings in SQLite yet, the script auto-embeds all cor
 
 Once you have a corpus with pre-computed embeddings and a validated dataset, you can train a **query-only linear embedding adapter** that improves retrieval quality without re-embedding the ~165K-page corpus.
 
-The adapter applies a learned linear transformation to query embeddings at search time. Document embeddings are never changed. Following the [Chroma Research methodology](https://research.trychroma.com/embedding-adapters), a low-rank variant (~789K parameters) trained on the generated triplets is the recommended starting point.
+The adapter applies a learned linear transformation to query embeddings at search time. Document embeddings are never changed. Following the [Chroma Research methodology](https://research.trychroma.com/embedding-adapters), the current best configuration is a `full_rank` adapter (~9.4M parameters) which achieves **+11.3% nDCG@10** over the baseline on held-out test queries.
 
 ```bash
 python adapter/preprocess.py   # build triplets + cache query embeddings (~$0.10 API cost)
 python adapter/train.py        # train + evaluate; prints baseline vs. adapted comparison table
 ```
 
-All hyperparameters (architecture, learning rate, margin, split ratios, etc.) are centralised in `adapter/config.py`.
+All hyperparameters (architecture, learning rate, margin, split ratios, etc.) are centralised in `adapter/config.py`. After each run, `train.py` automatically updates `adapter/leaderboard.json` with the best result per adapter configuration and saves a dedicated checkpoint (`best_full_rank.pt`, `best_low_rank_r256.pt`, etc.) so sweep results are never overwritten.
 
 **Full documentation:** [`adapter/README.md`](adapter/README.md)
 
