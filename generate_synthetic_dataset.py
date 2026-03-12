@@ -63,7 +63,6 @@ from modules.hard_negatives import (
 )
 from modules.llm_setup import setup_llm_and_embeddings
 from modules.profiles import build_pdf_profiles_from_store
-from modules.quality_filter import filter_dataset
 from modules.synthesizers import (
     build_corpus_llm_context,
     build_query_distribution_for_pipeline,
@@ -298,7 +297,17 @@ def build_parser() -> argparse.ArgumentParser:
     # --- Quality filter ---
     parser.add_argument(
         "--filter", action=argparse.BooleanOptionalAction, default=True,
-        help="Run LLM quality filter on generated dataset (default: enabled)",
+        help="Run vision quality filter on generated dataset (default: enabled)",
+    )
+    parser.add_argument(
+        "--vision-model", type=str, default="gemini-2.5-flash",
+        help="Gemini model for vision filtering (default: gemini-2.5-flash)",
+    )
+    parser.add_argument(
+        "--leya-env",
+        type=str,
+        default=str(Path.home() / "Documents" / "GitHub" / "leya" / ".local.env"),
+        help="Path to leya .local.env containing GCP credentials for vision filter",
     )
 
     # --- SQLite store ---
@@ -1170,20 +1179,34 @@ def _run_world_pipeline(
     )
 
     # -------------------------------------------------------------------
-    # Quality filter (optional)
+    # Vision quality filter (optional)
     # -------------------------------------------------------------------
-    filtered_df = None
+    strict_df = None
+    relaxed_df = None
     filter_stats = None
     if args.filter:
-        steps.next("Quality filtering")
-        raw_llm = getattr(generator_llm, "langchain_llm", generator_llm)
-        filtered_df, filter_stats = filter_dataset(
-            combined_df, raw_llm, pdf_store_conn,
+        steps.next("Vision quality filtering")
+        from vision_validate_dataset import vision_filter_dataset  # lazy import — only when filter is active
+        leya_env = Path(args.leya_env).expanduser().resolve()
+        vision_checkpoint = (
+            Path(args.processed_dir) / "progress"
+            / f"{Path(args.output).stem}__vision_filter_progress.jsonl"
         )
-        filtered_path = f"{output_path}_filtered"
-        save_combined_dataframe(
-            filtered_df, filtered_path, formats=args.output_formats,
+        strict_df, relaxed_df, filter_stats = vision_filter_dataset(
+            combined_df,
+            leya_env_path=leya_env,
+            db_path=pdf_store_db_path,
+            pdf_root=Path(args.input_dir).expanduser().resolve(),
+            model=args.vision_model,
+            concurrency=5,
+            checkpoint_path=vision_checkpoint,
         )
+        # Save strict output as the primary filtered dataset (replaces old _filtered)
+        strict_path = f"{output_path}_filtered"
+        save_combined_dataframe(strict_df, strict_path, formats=args.output_formats)
+        # Also save the relaxed variant
+        relaxed_path = f"{output_path}_filtered_relaxed"
+        save_combined_dataframe(relaxed_df, relaxed_path, formats=args.output_formats)
 
     # Summary
     sh_count = int(
@@ -1205,10 +1228,12 @@ def _run_world_pipeline(
         print(f"    - {w}: {c}")
     if args.hard_negatives:
         print("  Hard negatives: included")
-    if args.filter and filtered_df is not None and filter_stats is not None:
-        print(
-            f"  Filtered samples: {filter_stats['kept']}/{filter_stats['total']}"
-        )
+    if args.filter and filter_stats is not None:
+        total = filter_stats.get("total", len(combined_df))
+        strict_kept = filter_stats.get("strict_kept", 0)
+        relaxed_kept = filter_stats.get("relaxed_kept", 0)
+        print(f"  Vision filter (strict):  {strict_kept}/{total}")
+        print(f"  Vision filter (relaxed): {relaxed_kept}/{total}")
     print(f"  Output directory: {OUTPUT_DIR}")
     print(f"{'=' * 60}")
 

@@ -874,6 +874,20 @@ def main() -> int:
         help="Skip the hard negative mining step entirely",
     )
     parser.add_argument(
+        "--filter", action=argparse.BooleanOptionalAction, default=True,
+        help="Run vision quality filter after generation (default: enabled)",
+    )
+    parser.add_argument(
+        "--vision-model", type=str, default="gemini-2.5-flash",
+        help="Gemini model for vision filtering (default: gemini-2.5-flash)",
+    )
+    parser.add_argument(
+        "--leya-env",
+        type=str,
+        default=str(Path.home() / "Documents" / "GitHub" / "leya" / ".local.env"),
+        help="Path to leya .local.env containing GCP credentials for vision filter",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Show selected files without generating queries",
     )
@@ -1121,6 +1135,34 @@ def main() -> int:
     json_path = f"{output_base}.json"
     df.to_json(json_path, orient="records", indent=2)
     log.info("  Saved: %s", json_path)
+
+    # --- Vision quality filter (optional) ---
+    if args.filter:
+        log.info("=" * 60)
+        log.info("Running vision quality filter")
+        log.info("=" * 60)
+        from vision_validate_dataset import vision_filter_dataset
+        leya_env = Path(args.leya_env).expanduser().resolve()
+        db_path = SCRIPT_DIR / "processed" / "pdf_page_store.sqlite"
+        pdf_root = Path(args.input_dir).expanduser().resolve()
+        vision_checkpoint = SCRIPT_DIR / "processed" / "progress" / f"{args.output}__vision_filter_progress.jsonl"
+        strict_df, relaxed_df, filter_stats = vision_filter_dataset(
+            df,
+            leya_env_path=leya_env,
+            db_path=db_path,
+            pdf_root=pdf_root,
+            model=args.vision_model,
+            concurrency=5,
+            checkpoint_path=vision_checkpoint,
+        )
+        strict_df.to_csv(f"{output_base}_filtered.csv", index=False)
+        strict_df.to_json(f"{output_base}_filtered.json", orient="records", indent=2)
+        relaxed_df.to_csv(f"{output_base}_filtered_relaxed.csv", index=False)
+        relaxed_df.to_json(f"{output_base}_filtered_relaxed.json", orient="records", indent=2)
+        log.info("  Strict filtered:  %d/%d → %s_filtered.csv",
+                 filter_stats["strict_kept"], filter_stats["total"], output_base)
+        log.info("  Relaxed filtered: %d/%d → %s_filtered_relaxed.csv",
+                 filter_stats["relaxed_kept"], filter_stats["total"], output_base)
 
     # --- Preview ---
     log.info("\nSample preview:")

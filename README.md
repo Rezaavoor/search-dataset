@@ -2,7 +2,7 @@
 
 This project builds **synthetic Q&A evaluation datasets** from a corpus of legal documents (PDF, DOCX, XLSX, and more). It is designed end-to-end for evaluating retrieval/search/RAG pipelines: each row includes a **question** (`user_input`), a **grounded answer** (`reference`), the **supporting context** (`reference_contexts`), and optionally **hard negatives** for IR evaluation.
 
-The toolkit covers the full lifecycle: **corpus ingestion** → **embedding** → **profiling** → **dataset generation** (single-hop + multi-hop) → **quality filtering** → **hard negative mining** → **search evaluation** → **dataset validation**.
+The toolkit covers the full lifecycle: **corpus ingestion** → **embedding** → **profiling** → **dataset generation** (single-hop + multi-hop) → **vision quality filtering** → **hard negative mining** → **search evaluation** → **dataset validation**.
 
 ---
 
@@ -19,12 +19,13 @@ generate_synthetic_dataset.py   # Main pipeline: single-hop + multi-hop Q&A gene
 generate_single_hop.py          # Standalone parallel single-hop generator (no KG, multi-endpoint)
 
 # --- Evaluation & validation ---
+vision_validate_dataset.py      # Vision-based post-hoc validation + standalone quality filter (Gemini via Vertex AI)
 evaluate_search.py              # Evaluate embedding model retrieval quality (Recall@K, MRR, MRR@K, nDCG@K, MAP)
-validate_dataset.py             # LLM-as-a-judge validation of generated datasets
+validate_dataset.py             # Text-only LLM-as-a-judge validation (legacy reporting tool)
 run_mleb.py                     # Run Massive Legal Embedding Benchmark (MLEB) with MTEB
 
 # --- Modules ---
-modules/
+  modules/
   config.py                     # Constants and defaults
   utils.py                      # Shared helpers (hashing, JSON, paths, text)
   db.py                         # SQLite page store operations + multi-model embedding storage
@@ -36,7 +37,7 @@ modules/
   synthesizers.py               # Query synthesizers + distribution building
   single_hop.py                 # Reusable single-hop generation (no KG needed, parallel + checkpointed)
   hard_negatives.py             # Hard negative mining (BM25 + embedding + RRF + tiered LLM judge + SQLite loader)
-  quality_filter.py             # LLM-as-a-judge quality filter (drops low-quality rows during generation)
+  quality_filter.py             # Legacy text-only LLM quality filter (superseded by vision_validate_dataset.py)
   testset.py                    # KG building, testset gen/save, persona management, source mapping
 
 # --- Data ---
@@ -64,6 +65,7 @@ Dependencies include `sentence-transformers`, `transformers`, and `mteb` for ope
 - Configure **either** OpenAI **or** Azure OpenAI (auto-detected from env vars).
 - For multi-endpoint Azure parallelism (used by `profile_corpus.py`, `generate_single_hop.py`, `generate_synthetic_dataset.py`, `embed_corpus.py`), add `AZURE_OPENAI_API_KEY_2` + `AZURE_OPENAI_ENDPOINT_2`, etc. (up to `_9`).
 - For OCR-based PDF extraction (`--ocr`), set `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `AZURE_DOCUMENT_INTELLIGENCE_KEY`.
+- **Vision quality filter**: requires Google Cloud (Vertex AI) credentials. The filter reads GCP credentials from the `AI_REGIONS_V3` variable in a `.local.env` file. By default it looks for `~/Documents/GitHub/leya/.local.env`. Override with `--leya-env PATH`.
 
 ---
 
@@ -168,7 +170,7 @@ python generate_synthetic_dataset.py \
 How it works:
 - **Single-hop**: randomly samples PDFs from the full SQLite store, picks the best page per file, generates a Q&A pair using the LLM. No KG needed. When multiple Azure endpoints are configured, generation runs in parallel (one LLM per thread).
 - **Multi-hop**: for each world subfolder, collects its PDFs, builds (or loads cached) a per-world KG, generates multi-hop queries using only multi-hop RAGAS synthesizers.
-- **Quality filtering**: by default (`--filter`), an LLM-as-a-judge pass drops queries that fail query quality or source answerability checks (see [Quality filtering](#quality-filtering) below).
+- **Vision quality filtering**: by default (`--filter`), a vision-based pass sends each query's source PDF page(s) to Gemini 2.5 Flash and drops rows that fail query quality or source answerability checks (see [Quality filtering](#quality-filtering) below).
 - **Hard negatives**: mines from the full corpus via SQLite (BM25 + embedding retrieval, RRF merge, tiered LLM judge).
 - **Output**: a combined CSV/JSON with `synthesizer_name` (`single_hop_direct` or `multi_hop_ragas`) and `world` column for multi-hop rows.
 
@@ -232,7 +234,9 @@ PDF profiles:
 - `--pdf-profile-max-chars-per-page N` (default: 2500)
 
 Quality filtering:
-- `--filter` / `--no-filter` — LLM quality filter (default: **enabled**)
+- `--filter` / `--no-filter` — vision quality filter (default: **enabled**)
+- `--vision-model MODEL` — Gemini model for filtering (default: `gemini-2.5-flash`)
+- `--leya-env PATH` — path to `.local.env` with GCP credentials (default: `~/Documents/GitHub/leya/.local.env`)
 
 Hard negatives:
 - `--hard-negatives` — enable hard negative mining
@@ -253,21 +257,44 @@ Caching:
 
 ## Quality filtering
 
-When `--filter` is enabled (the default), the pipeline runs an **LLM-as-a-judge quality filter** after generation and before hard negative mining. This is handled by `modules/quality_filter.py`.
+When `--filter` is enabled (the default), the pipeline runs a **vision-based quality filter** after generation. This is handled by `vision_validate_dataset.py`, which sends each query's source PDF page(s) as actual PDF bytes to Gemini 2.5 Flash via Google Vertex AI and rates two dimensions:
 
 ### What it checks
 
-1. **Source validity** — rows referencing `"unknown"` sources are dropped immediately.
-2. **Query Quality (QC)** — is the query standalone, specific, and suitable for an IR dataset? Queries that are vague, referential ("this case"), or unanswerable from a search perspective are removed.
-3. **Source Answerability (SA)** — does the labeled positive page actually answer the query? The filter fetches the real page content from SQLite (not just `reference_contexts`) and checks faithfulness.
+1. **Query Quality (QC)** — is the query standalone and specific enough to uniquely retrieve the correct page among ~7,000 documents? Rated `good` / `mediocre` / `bad`.
+2. **Source Answerability (SA)** — does the labeled positive PDF page actually contain enough information to answer the query? The model sees the real rendered page, not extracted text. Rated `answerable` / `partial` / `not_answerable`.
 
-Rows that fail any check are dropped from the output. This is an integrated filter (removes rows) — in contrast, `validate_dataset.py` is a post-hoc report that does not modify the dataset.
+The vision approach is significantly more accurate than the previous text-only LLM filter: empirical testing showed the old filter incorrectly dropped ~70% of what it rejected, whereas the vision filter correctly identifies pages that contain tables, charts, or scanned content that text extraction cannot represent.
 
 ### Output
 
-When filtering is enabled:
-- The filtered dataset is saved as `{output}_filtered.csv` (and other requested formats)
-- Console logs report how many rows were dropped and why
+When filtering is enabled, two filtered outputs are saved:
+- `{output}_filtered.csv` — **strict**: `query_quality="good"` AND `source_answerability="answerable"`
+- `{output}_filtered_relaxed.csv` — **relaxed**: `query_quality` in `{good, mediocre}` AND `source_answerability` in `{answerable, partial}`
+
+Both outputs include all original columns plus `vision_query_quality`, `vision_query_quality_reasoning`, `vision_source_answerability`, `vision_source_answerability_reasoning`, `vision_confidence`, and `vision_page_count` columns appended.
+
+The filter is **resume-safe**: progress is checkpointed to `processed/progress/{output}__vision_filter_progress.jsonl` and resumes from where it left off if interrupted.
+
+### Standalone post-hoc filter
+
+`vision_validate_dataset.py` can also be used as a standalone tool to (re-)filter any existing dataset CSV:
+
+```bash
+python vision_validate_dataset.py \
+    --dataset output/full_10_000.csv \
+    --model gemini-2.5-flash \
+    --checkpoint processed/vision_validation_cache.jsonl \
+    --output output/vision_validated
+```
+
+### Credentials
+
+Requires a Google Cloud service account with Vertex AI access. Credentials are read from `AI_REGIONS_V3` in `~/Documents/GitHub/leya/.local.env` (override with `--leya-env PATH`).
+
+### Cost and runtime
+
+Using Gemini 2.5 Flash on a ~7,800-row dataset: approximately **$20 and 45 minutes** at concurrency 5. Gemini 2.5 Pro is also supported (`--vision-model gemini-2.5-pro`) at ~$94 / 1.7h.
 
 ---
 
@@ -285,7 +312,7 @@ Step counts adjust dynamically based on enabled features and number of worlds.
 [Step  5/11] Generating single-hop queries (full corpus)
 [Step  6/11] Multi-hop for world: Claires (1/2)
 [Step  7/11] Multi-hop for world: Law worlds/415 (2/2)
-[Step  8/11] Quality filtering
+[Step  8/11] Vision quality filtering
 [Step  9/11] Mining hard negatives
 [Step 10/11] Saving results
 [Step 11/11] Done
@@ -452,13 +479,16 @@ The LLM prompts in `modules/config.py` enforce strict query rules:
 
 After generation, a regex (`REFERENTIAL_QUERY_RE`) scans all queries for deictic phrases and emits warnings if any are detected.
 
-### Layer 2: Integrated quality filter (`modules/quality_filter.py`)
+### Layer 2: Vision quality filter (`vision_validate_dataset.py`)
 
-When `--filter` is enabled (the default), an **LLM-as-a-judge quality filter** runs after generation. It performs three sequential phases:
+When `--filter` is enabled (the default), a **vision-based quality filter** runs after generation. For each row it:
 
-1. **Phase 0 — Unknown source removal**: drops rows where `source_files` or `source_files_with_pages` contains `"unknown"` (source page couldn't be mapped).
-2. **Phase 1 — Query Quality (QC)**: an LLM judge evaluates whether each query is standalone, specific, contains concrete identifiers, and is plausible as a real search query. Verdict != `"pass"` → **row dropped**.
-3. **Phase 2 — Source Answerability (SA)**: an LLM judge checks whether the labeled positive page(s) actually answer the query and whether the generated answer is faithful. The filter fetches real page content from SQLite (not just `reference_contexts`). Verdict != `"pass"` → **row dropped**.
+1. Resolves all source PDF page(s) via SQLite lookup and extracts each page as a single-page PDF buffer.
+2. Sends the PDF page(s) + query + expected answer to Gemini 2.5 Flash (via Vertex AI) as a multimodal request.
+3. Receives ratings for **Query Quality** (`good` / `mediocre` / `bad`) and **Source Answerability** (`answerable` / `partial` / `not_answerable`).
+4. Rows failing the strict threshold (`good` + `answerable`) are excluded from the primary filtered output; rows meeting the relaxed threshold (`good`/`mediocre` + `answerable`/`partial`) are included in the relaxed output.
+
+This replaces the previous text-only `modules/quality_filter.py` filter, which was found to over-drop approximately 70% of the rows it rejected — primarily because it could not see tables, charts, scanned pages, or multi-column layouts that are fully readable on the actual PDF page.
 
 ### Layer 3: Hard negative quality gates (`modules/hard_negatives.py`)
 
@@ -469,15 +499,16 @@ Hard negative mining includes multiple built-in quality filters:
 - **Tiered LLM judge**: each candidate is evaluated for relevance, answerability, and topical similarity. Tier 1 (ideal) = relevant but not answerable with high topical similarity; Tier 2 (acceptable) = not answerable with medium+ topical similarity. Candidates that actually answer the query (with verbatim evidence) or are completely irrelevant are rejected.
 - **Per-file diversity cap**: max 2 negatives per source file
 
-### Layer 4: Post-hoc LLM validation (`validate_dataset.py`)
+### Layer 4: Post-hoc vision validation (`vision_validate_dataset.py`)
 
-A standalone validation script evaluates every row on three axes:
+A standalone validation and filtering tool that evaluates every row using the vision model:
 
-1. **Query Quality** — legal-domain-specific checks (standalone, legal relevance, concrete identifiers)
-2. **Source Answerability** — fetches actual positive page content from SQLite and checks if the source answers the query and whether the answer is faithful
-3. **Hard Negative Quality** — fetches each hard negative's page content and evaluates whether it is topically similar but not answerable; flags **false negatives** (hard negatives that actually answer the query)
+1. **Query Quality** — is the query standalone, specific, and realistic for search over 7,000 documents?
+2. **Source Answerability** — does the actual rendered PDF page contain the answer?
 
-Produces a JSON report, CSV summary, and aggregate statistics (pass rates, per-synthesizer breakdown, fully-passing percentage). This is a **reporting tool** — it does not modify the dataset.
+Can be run independently on any generated CSV to produce filtered outputs without re-running generation. Also supports `--dry-run` to verify PDF resolution before committing to a full run.
+
+The legacy text-only `validate_dataset.py` is retained as a reference tool for evaluating hard negative quality (not covered by the vision filter).
 
 ### Layer 5: Retrieval evaluation sanity check (`evaluate_search.py`, `run_mleb.py`)
 
@@ -507,14 +538,13 @@ The dataset was further validated by comparing pypdf vs OCR text extraction, run
 |-------|------|-----------|--------|
 | Prompt constraints | Generation | Strict LLM instructions | Preventive |
 | Referential query regex | Post-generation | `REFERENTIAL_QUERY_RE` | Warning |
-| Unknown source filter | Pipeline filter | String check | **Drops rows** |
-| Query Quality (QC) | Pipeline filter | LLM-as-a-judge | **Drops rows** |
-| Source Answerability (SA) | Pipeline filter | LLM-as-a-judge | **Drops rows** |
+| Vision QC + SA (strict) | Pipeline filter | Gemini vision model | **Drops rows** (keeps good+answerable) |
+| Vision QC + SA (relaxed) | Pipeline filter | Gemini vision model | Saved as `_filtered_relaxed.csv` |
 | HN proximity exclusion | Hard neg mining | ±2 page buffer | Excludes candidates |
 | HN near-duplicate cosine | Hard neg mining | Cosine ≥ 0.90 | Excludes candidates |
 | HN tiered LLM judge | Hard neg mining | LLM relevance/answerability | Tiered accept/reject |
 | HN per-file cap | Hard neg mining | Max 2 per file | Diversity enforcement |
-| Post-hoc validation | Standalone script | 3-axis LLM-as-a-judge | Report + analysis |
+| Post-hoc vision validation | Standalone script | Gemini vision model | Filtered CSVs + report |
 | Retrieval evaluation | Standalone script | IR metrics + MTEB comparison | Quality warnings |
 | Manual curation | Post-evaluation | Rank analysis + dedup | **Drops rows** |
 | A/B comparison | Analysis | Cross-corpus evaluation | Methodology validation |
@@ -613,7 +643,7 @@ Ways to reduce:
 - Use a smaller/cheaper model
 - Use `--no-pdf-profiles` if profiles are already computed via `profile_corpus.py`
 - Use `--no-content-embeddings` to skip page_content embeddings (not recommended)
-- Use `--no-filter` to skip the LLM quality filter (faster but lower dataset quality)
+- Use `--no-filter` to skip the vision quality filter (faster but lower dataset quality)
 - Configure multiple Azure endpoints (`AZURE_OPENAI_API_KEY_2`, etc.) for parallel single-hop generation
 
 ### KG cache misses
