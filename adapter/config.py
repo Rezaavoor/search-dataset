@@ -40,8 +40,8 @@ TEST_RATIO  = 0.15   # must sum to 1.0 with TRAIN_RATIO + VAL_RATIO
 # ---------------------------------------------------------------------------
 # Adapter architecture
 # ---------------------------------------------------------------------------
-ADAPTER_TYPE = "low_rank"   # "low_rank" | "full_rank"
-LOW_RANK_DIM = 128           # r for low_rank; ignored for full_rank
+ADAPTER_TYPE = "full_rank"   # "low_rank" | "full_rank"
+LOW_RANK_DIM = 256          # r for low_rank; ignored for full_rank
 #                            # Parameter counts at EMB_DIM=3072:
 #                            #   full_rank           -> ~9.4M params
 #                            #   low_rank  r=256     -> ~1.57M params
@@ -51,10 +51,10 @@ LOW_RANK_DIM = 128           # r for low_rank; ignored for full_rank
 # ---------------------------------------------------------------------------
 # Training hyperparameters  (from Chroma Research + thesis Notion guide)
 # ---------------------------------------------------------------------------
-LEARNING_RATE           = 3e-5   # Chroma's most frequently best LR; sweep: {1e-4, 3e-4, 1e-3, 3e-3, 1e-2}
+LEARNING_RATE           = 3e-6   # Chroma's most frequently best LR; sweep: {1e-4, 3e-4, 1e-3, 3e-3, 1e-2}
 MARGIN                  = 0.3    # Triplet loss margin alpha; sweep: {0.3, 1.0, 3.0}
 BATCH_SIZE              = 256
-NUM_EPOCHS              = 40
+NUM_EPOCHS              = 80
 WEIGHT_DECAY            = 1e-4
 EARLY_STOPPING_PATIENCE = 3      # Stop after this many epochs without val loss improvement
 GRAD_CLIP_NORM          = 1.0    # Max gradient norm; set to None to disable
@@ -68,3 +68,11 @@ TOP_K_EVAL = [1, 5, 10, 20]   # Recall@K values to compute during test evaluatio
 # Device  ("auto" -> CUDA > MPS > CPU)
 # ---------------------------------------------------------------------------
 DEVICE = "auto"
+
+# ---------------------------------------------------------------------------
+# Leaderboard
+# The metric used to decide whether a new training run is "best" for its
+# (adapter_type, low_rank_dim) configuration.
+# ---------------------------------------------------------------------------
+BEST_METRIC      = "ndcg@10"   # primary comparison metric; any key from TOP_K_EVAL or mrr/map/ndcg@10
+LEADERBOARD_PATH = Path(__file__).resolve().parent / "leaderboard.json"
