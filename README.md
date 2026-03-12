@@ -519,14 +519,14 @@ The legacy text-only `validate_dataset.py` is retained as a reference tool for e
 
 As an additional sanity check, retrieval results for `text-embedding-3-large` on this dataset were compared against publicly available scores for the same model on the **MTEB** (Massive Text Embedding Benchmark) and **MLEB** (Massive Legal Embedding Benchmark, https://isaacus.com/mleb). The project includes `run_mleb.py`, which evaluates embedding models on 10 expert-annotated legal retrieval datasets using the official MTEB evaluation framework. The nDCG@10 scores produced by `text-embedding-3-large` on these external benchmarks were broadly consistent with the retrieval quality observed on the generated dataset, confirming that the dataset's difficulty and ground truth labels are realistic and not artificially easy or inflated.
 
-### Layer 6: Manual curation
+### Layer 6: Retrieval-based curation
 
-Starting from ~2,000 generated queries, the final verified dataset (464 queries) underwent additional curation:
+After running `evaluate_search.py`, queries where the correct source page ranked beyond position 1,000 are removed. Two failure modes drive these removals:
 
-1. **Rank > 100 removal** — 114 queries where the positive page ranked too low (vague queries or mislabeled ground truth)
-2. **Exact duplicate removal** — 3 duplicate pairs with conflicting positives
-3. **Severe general query removal** — 24 queries with recall@20=0 where top-20 results were dominated by sibling documents
-4. **Moderate general query removal** — 28 queries at rank > 5 where 10+ top-20 results came from the same file family
+1. **Generic/boilerplate source pages** — valid content but the page is too similar to hundreds of sibling pages in the corpus (court filing headers, creditor matrices, etc.) for the embedding model to distinguish
+2. **Corrupt text extraction** — some PDFs have garbled `doc_content` in SQLite (malformed character sequences), producing meaningless embeddings; these files should be re-ingested via OCR
+
+Run 3 removed **628 queries** via this step, bringing the dataset from 6,697 → **6,069 rows**.
 
 ### Layer 7: A/B comparison
 
@@ -546,7 +546,7 @@ The dataset was further validated by comparing pypdf vs OCR text extraction, run
 | HN per-file cap | Hard neg mining | Max 2 per file | Diversity enforcement |
 | Post-hoc vision validation | Standalone script | Gemini vision model | Filtered CSVs + report |
 | Retrieval evaluation | Standalone script | IR metrics + MTEB comparison | Quality warnings |
-| Manual curation | Post-evaluation | Rank analysis + dedup | **Drops rows** |
+| Retrieval-based curation | Post-evaluation | Rank > 1,000 removal | **Drops rows** (boilerplate + corrupt) |
 | A/B comparison | Analysis | Cross-corpus evaluation | Methodology validation |
 
 > **Note**: there are no automated unit tests (`pytest`/`unittest`) for the pipeline code itself. Validation is focused entirely on data quality.
