@@ -78,11 +78,14 @@ The triplet CSV is shuffled before saving so that file-level splits are not bias
 
 Loads the preprocessed data, splits it, trains the adapter, and evaluates on the held-out test set.
 
-### File-level train / val / test split
+### Train / val / test split (no query or document leakage)
 
-Triplets are split **70 / 15 / 15 at the source-file level**: all queries whose positive page comes from the same source file are placed entirely in one split. This prevents leakage from same-document queries appearing in both train and test.
+Triplets are split **70 / 15 / 15** so that:
 
-Multi-hop queries whose `source_file` is blank (they span multiple files) are bucketed by the first positive page's filename rather than all collapsing into a single anonymous bucket.
+1. **No query in multiple splits** — each query appears in exactly one of train / val / test.
+2. **No document leakage** — no document (positive page) appears as a positive in more than one split.
+
+Queries that share any positive document are grouped into the same *component*; each component is assigned entirely to one split. This is done by building a graph where two queries are connected if they share a positive, taking connected components, then assigning components to train/val/test (shuffled, then greedily by target ratios). Multi-hop queries thus stay in one split with all other queries that touch the same documents.
 
 ### Training objective
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Train a query-only embedding adapter using cosine-based triplet loss.
 
-Loads preprocessed data from adapter/data/, performs a file-level 70/15/15
-train/val/test split, trains the adapter with early stopping on val loss,
+Loads preprocessed data from adapter/data/, performs a 70/15/15 train/val/test
+split by connected components (no query or document leakage), trains the adapter
+with early stopping on val loss,
 then evaluates against the full corpus reporting Recall@K, MRR, MAP, nDCG@10.
 
 Memory note: loading all ~165K page embeddings requires ~2 GB RAM.
@@ -95,32 +96,94 @@ def _load_corpus(db_path: Path) -> Tuple[List[Tuple[str, int]], Dict[Tuple[str, 
 
 
 # ---------------------------------------------------------------------------
-# File-level train / val / test split
+# Train / val / test split: no query leakage, no document leakage
 # ---------------------------------------------------------------------------
 
-def _file_level_split(
+def _connected_components_split(
     triplets_df: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split triplets 70/15/15 at the source-file level.
+    """Split triplets so that (1) each query is in exactly one split, and (2) no
+    document appears as a positive in more than one split.
 
-    All triplets whose source_file maps to the same split bucket stay together,
-    preventing leakage from same-document queries.
+    Queries that share any positive document (pos_ref) are placed in the same
+    "component"; each component is assigned entirely to train, val, or test.
+    This avoids document leakage (same doc positive in train and val/test) and
+    keeps each query in a single split.
     """
-    unique_files = sorted(triplets_df["source_file"].unique())
+    # (query_idx, pos_ref) pairs: each query–positive pair
+    qp = triplets_df[["query_idx", "pos_ref"]].drop_duplicates()
+    doc_to_queries: Dict[str, List[int]] = {}
+    for _, row in qp.iterrows():
+        doc = str(row["pos_ref"])
+        q = int(row["query_idx"])
+        doc_to_queries.setdefault(doc, []).append(q)
+
+    # Union-find: connect queries that share a positive document
+    all_queries = triplets_df["query_idx"].unique()
+    parent: Dict[int, int] = {q: q for q in all_queries}
+
+    def find(x: int) -> int:
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(x: int, y: int) -> None:
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+
+    for queries in doc_to_queries.values():
+        for i in range(1, len(queries)):
+            union(queries[0], queries[i])
+
+    # Components: root -> set of query indices
+    components: Dict[int, List[int]] = {}
+    for q in all_queries:
+        root = find(q)
+        components.setdefault(root, []).append(q)
+    comp_list = list(components.values())
+
+    # Assign whole components to train/val/test to get ~TRAIN_RATIO/VAL_RATIO/TEST_RATIO by query count
+    total_queries = len(all_queries)
     rng = np.random.RandomState(cfg.RANDOM_SEED)
-    shuffled = np.array(unique_files, dtype=object)
-    rng.shuffle(shuffled)
+    order = np.arange(len(comp_list), dtype=np.intp)
+    rng.shuffle(order)
+    n_train_target = int(total_queries * cfg.TRAIN_RATIO)
+    n_val_target   = int(total_queries * cfg.VAL_RATIO)
+    train_queries: set = set()
+    val_queries: set = set()
+    test_queries: set = set()
+    count_train, count_val, count_test = 0, 0, 0
+    for idx in order:
+        comp = comp_list[idx]
+        n = len(comp)
+        if count_train < n_train_target:
+            train_queries.update(comp)
+            count_train += n
+        elif count_val < n_val_target:
+            val_queries.update(comp)
+            count_val += n
+        else:
+            test_queries.update(comp)
+            count_test += n
 
-    n_train = int(len(shuffled) * cfg.TRAIN_RATIO)
-    n_val   = int(len(shuffled) * cfg.VAL_RATIO)
+    # Assign each query to exactly one split (components are disjoint)
+    query_to_split: Dict[int, str] = {}
+    for q in train_queries:
+        query_to_split[q] = "train"
+    for q in val_queries:
+        query_to_split[q] = "val"
+    for q in test_queries:
+        query_to_split[q] = "test"
 
-    train_files = set(shuffled[:n_train])
-    val_files   = set(shuffled[n_train: n_train + n_val])
-    test_files  = set(shuffled[n_train + n_val:])
+    def split_for_row(row) -> str:
+        return query_to_split[int(row["query_idx"])]
 
-    train_df = triplets_df[triplets_df["source_file"].isin(train_files)].reset_index(drop=True)
-    val_df   = triplets_df[triplets_df["source_file"].isin(val_files)].reset_index(drop=True)
-    test_df  = triplets_df[triplets_df["source_file"].isin(test_files)].reset_index(drop=True)
+    triplets_df = triplets_df.copy()
+    triplets_df["_split"] = triplets_df.apply(split_for_row, axis=1)
+    train_df = triplets_df[triplets_df["_split"] == "train"].drop(columns=["_split"]).reset_index(drop=True)
+    val_df   = triplets_df[triplets_df["_split"] == "val"].drop(columns=["_split"]).reset_index(drop=True)
+    test_df  = triplets_df[triplets_df["_split"] == "test"].drop(columns=["_split"]).reset_index(drop=True)
     return train_df, val_df, test_df
 
 
@@ -549,10 +612,10 @@ def main() -> None:
     print(f"  Triplets         : {len(triplets_df):,}")
 
     # ------------------------------------------------------------------
-    # [2] File-level split
+    # [2] Train/val/test split (no query leakage, no document leakage)
     # ------------------------------------------------------------------
-    print(f"\n[2/5] File-level split  ({cfg.TRAIN_RATIO}/{cfg.VAL_RATIO}/{cfg.TEST_RATIO})")
-    train_df, val_df, test_df = _file_level_split(triplets_df)
+    print(f"\n[2/5] Connected-components split  ({cfg.TRAIN_RATIO}/{cfg.VAL_RATIO}/{cfg.TEST_RATIO})")
+    train_df, val_df, test_df = _connected_components_split(triplets_df)
     print(f"  Train : {len(train_df):,} triplets  ({train_df['query_idx'].nunique():,} queries)")
     print(f"  Val   : {len(val_df):,} triplets  ({val_df['query_idx'].nunique():,} queries)")
     print(f"  Test  : {len(test_df):,} triplets  ({test_df['query_idx'].nunique():,} queries)")

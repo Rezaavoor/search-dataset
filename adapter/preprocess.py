@@ -114,15 +114,11 @@ def _build_triplets(df: pd.DataFrame, corpus_pool: List[Tuple[str, int]], rng: r
         hard_neg_refs = [parse_page_ref(r) for r in _parse_json_col(row.get("hard_negatives", ""))]
         hard_neg_refs = [p for p in hard_neg_refs if p is not None]
 
-        # Use source_file if available; multi-hop queries may have NaN here
-        # because they span multiple files. Fall back to the first positive
-        # page's filename so these queries are distributed across real file
-        # buckets rather than all collapsing into a single "" split bucket.
+        # Source file for split: single-hop uses query's source_file; multi-hop
+        # uses the positive's file *per triplet* so the split is by document,
+        # avoiding leakage (a doc that's positive in train must not be positive in val/test).
         sf = row.get("source_file")
-        if pd.notna(sf) and str(sf).strip():
-            source_file = str(sf).strip()
-        else:
-            source_file = pos_refs[0][0] if pos_refs else ""
+        query_source_file = str(sf).strip() if pd.notna(sf) and str(sf).strip() else None
 
         # Base exclusion set shared across all positives: the pos pages + hard negs
         base_excluded = set(pos_refs) | set(hard_neg_refs)
@@ -132,6 +128,8 @@ def _build_triplets(df: pd.DataFrame, corpus_pool: List[Tuple[str, int]], rng: r
         # the same N_SOFT_NEGS pages repeated for every positive.
         for pos in pos_refs:
             pos_str = fmt_page_ref(*pos)
+            # Per-triplet source_file: single-hop = query's file; multi-hop = this positive's file (no doc leakage).
+            source_file = query_source_file if query_source_file is not None else pos[0]
 
             # Hard-negative triplets
             for hn in hard_neg_refs:
