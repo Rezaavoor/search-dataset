@@ -48,6 +48,9 @@ run_mleb.py                     # Run Massive Legal Embedding Benchmark (MLEB) w
   adapter/model.py              # FullRankAdapter / LowRankAdapter + checkpoint utilities
   adapter/leaderboard.json      # Best result per adapter config (auto-managed by train.py)
 
+# --- Visualization & analysis ---
+  visualizations/               # Embedding-space plots and interactive viewers (see visualizations/README.md)
+
 # --- Data ---
 output/                         # Generated datasets + evaluation results
 processed/                      # Cached artifacts (KG, personas, SQLite store, profiles, checkpoints)
@@ -471,6 +474,22 @@ python adapter/train.py        # train + evaluate; prints baseline vs. adapted c
 All hyperparameters (architecture, learning rate, margin, split ratios, etc.) are centralised in `adapter/config.py`. After each run, `train.py` automatically updates `adapter/leaderboard.json` with the best result per adapter configuration and saves a dedicated checkpoint (`best_full_rank.pt`, `best_low_rank_r256.pt`, etc.) so sweep results are never overwritten.
 
 **Full documentation:** [`adapter/README.md`](adapter/README.md)
+
+---
+
+## Visualizations
+
+The repo also includes embedding-space visualizations built from the SQLite page
+store in `processed/pdf_page_store.sqlite`.
+
+- `visualizations/document_embedding_pca.py` generates a PCA view of document centroids plus a sampled page cloud
+- `visualizations/document_embedding_umap.py` generates a UMAP view of document centroids
+- `visualizations/document_embedding_umap.html` includes interactive controls for `n_neighbors` and `min_dist`
+
+These tools are useful for inspecting corpus spread, spotting clusters/outliers,
+and getting a coarse sense of how documents are distributed in embedding space.
+
+**Full documentation:** [`visualizations/README.md`](visualizations/README.md)
 
 ---
 
