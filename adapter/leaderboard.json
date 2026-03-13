@@ -3,7 +3,7 @@
     "adapter_type": "full_rank",
     "low_rank_dim": null,
     "comparison_metric": "ndcg@10",
-    "best_value": 0.516427,
+    "best_value": 0.563352,
     "config": {
       "LEARNING_RATE": 3e-06,
       "MARGIN": 0.3,
@@ -11,39 +11,39 @@
       "NUM_EPOCHS": 80,
       "WEIGHT_DECAY": 0.0001,
       "GRAD_CLIP_NORM": 1.0,
-      "N_SOFT_NEGS": 5,
+      "N_SOFT_NEGS": 15,
       "RANDOM_SEED": 42
     },
     "test_metrics": {
-      "recall@1": 0.336746,
-      "recall@5": 0.629124,
-      "recall@10": 0.732651,
-      "recall@20": 0.798635,
-      "mrr": 0.470179,
-      "map": 0.458669,
-      "ndcg@10": 0.516427
+      "recall@1": 0.390093,
+      "recall@5": 0.696594,
+      "recall@10": 0.76161,
+      "recall@20": 0.829721,
+      "mrr": 0.51523,
+      "map": 0.509681,
+      "ndcg@10": 0.563352
     },
     "baseline_metrics": {
-      "recall@1": 0.298066,
-      "recall@5": 0.581342,
-      "recall@10": 0.672355,
-      "recall@20": 0.740614,
-      "mrr": 0.427739,
-      "map": 0.417766,
-      "ndcg@10": 0.470099
+      "recall@1": 0.365325,
+      "recall@5": 0.622291,
+      "recall@10": 0.696594,
+      "recall@20": 0.752322,
+      "mrr": 0.471619,
+      "map": 0.466331,
+      "ndcg@10": 0.515401
     },
     "delta": {
-      "recall@1": 0.03868,
-      "recall@5": 0.047782,
-      "recall@10": 0.060296,
-      "recall@20": 0.05802,
-      "mrr": 0.04244,
-      "map": 0.040904,
-      "ndcg@10": 0.046328
+      "recall@1": 0.024768,
+      "recall@5": 0.074303,
+      "recall@10": 0.065015,
+      "recall@20": 0.077399,
+      "mrr": 0.043611,
+      "map": 0.04335,
+      "ndcg@10": 0.04795
     },
     "n_train_queries": 4097,
-    "n_test_queries": 879,
+    "n_test_queries": 323,
     "model_path": "/Users/reza/Downloads/search-dataset-kth/adapter/data/best_full_rank.pt",
-    "updated_at": "2026-03-13T09:36:59Z"
+    "updated_at": "2026-03-13T10:12:18Z"
   }
 }

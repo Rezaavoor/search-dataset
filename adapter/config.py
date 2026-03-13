@@ -25,7 +25,7 @@ EMB_DIM         = 3072
 # ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------
-N_SOFT_NEGS     = 5    # Random soft negatives sampled per query (from full corpus)
+N_SOFT_NEGS     = 10    # Random soft negatives sampled per query (from full corpus)
 RANDOM_SEED     = 42
 EMBED_BATCH_SIZE = 100  # OpenAI API batch size for query embedding
 
