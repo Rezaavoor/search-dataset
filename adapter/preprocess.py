@@ -19,9 +19,10 @@ Output written to adapter/data/:
 Resume-safe: if interrupted during embedding, a partial checkpoint is saved
 after every API batch. Re-running resumes from where it left off.
 
-Usage:
-    python adapter/preprocess.py
-    python adapter/preprocess.py --recompute   # force re-embedding of queries
+Recompute options (combine as needed):
+    --recompute              redo embeddings and triplets (same as both flags)
+    --recompute-embeddings   re-embed queries (reuse existing triplets)
+    --recompute-triplets     regenerate triplets (reuse existing embeddings)
 """
 
 import argparse
@@ -261,7 +262,14 @@ def _embed_queries(queries: List[str], partial_path: Path) -> np.ndarray:
 # Main
 # ---------------------------------------------------------------------------
 
-def main(recompute: bool = False) -> None:
+def main(
+    recompute: bool = False,
+    recompute_embeddings: bool = False,
+    recompute_triplets: bool = False,
+) -> None:
+    redo_emb = recompute or recompute_embeddings
+    redo_triplets = recompute or recompute_triplets
+
     print("=" * 60)
     print("Adapter Preprocessing")
     print("=" * 60)
@@ -294,8 +302,8 @@ def main(recompute: bool = False) -> None:
     # [3] Build triplets
     # ------------------------------------------------------------------
     print(f"\n[3/4] Generating triplets  (seed={cfg.RANDOM_SEED}, soft_negs={cfg.N_SOFT_NEGS})")
-    if triplets_path.exists() and not recompute:
-        print(f"  Skipping: triplets already at {triplets_path.name}  (pass --recompute to redo)")
+    if triplets_path.exists() and not redo_triplets:
+        print(f"  Skipping: triplets already at {triplets_path.name}  (use --recompute-triplets to redo)")
         triplets_df = pd.read_csv(triplets_path)
     else:
         rng         = random.Random(cfg.RANDOM_SEED)
@@ -315,10 +323,13 @@ def main(recompute: bool = False) -> None:
     # [4] Embed queries
     # ------------------------------------------------------------------
     print(f"\n[4/4] Embedding {len(queries):,} queries via OpenAI API")
-    if emb_path.exists() and not recompute:
-        print(f"  Skipping: embeddings already at {emb_path.name}  (pass --recompute to redo)")
+    if emb_path.exists() and not redo_emb:
+        print(f"  Skipping: embeddings already at {emb_path.name}  (use --recompute-embeddings to redo)")
         embeddings = np.load(emb_path)
     else:
+        if redo_emb and partial_path.exists():
+            partial_path.unlink()
+            print("  Cleared partial checkpoint (full re-embed)")
         embeddings = _embed_queries(queries, partial_path)
         np.save(emb_path, embeddings)
         # Clean up partial checkpoint on successful completion
@@ -343,12 +354,27 @@ def main(recompute: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Preprocess dataset into triplets and cache query embeddings."
+        description="Preprocess dataset into triplets and cache query embeddings.",
+        epilog="Recompute flags can be combined. --recompute is shorthand for both --recompute-embeddings and --recompute-triplets.",
     )
     parser.add_argument(
         "--recompute",
         action="store_true",
-        help="Force re-embedding of queries even if query_embeddings.npy already exists.",
+        help="Redo both embeddings and triplets (same as --recompute-embeddings --recompute-triplets).",
+    )
+    parser.add_argument(
+        "--recompute-embeddings",
+        action="store_true",
+        help="Force re-embedding of queries; reuse existing triplets.",
+    )
+    parser.add_argument(
+        "--recompute-triplets",
+        action="store_true",
+        help="Regenerate triplets (new soft/hard negs); reuse existing query embeddings.",
     )
     args = parser.parse_args()
-    main(recompute=args.recompute)
+    main(
+        recompute=args.recompute,
+        recompute_embeddings=args.recompute_embeddings,
+        recompute_triplets=args.recompute_triplets,
+    )
