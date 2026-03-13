@@ -3,7 +3,7 @@
     "adapter_type": "full_rank",
     "low_rank_dim": null,
     "comparison_metric": "ndcg@10",
-    "best_value": 0.51017,
+    "best_value": 0.516427,
     "config": {
       "LEARNING_RATE": 3e-06,
       "MARGIN": 0.3,
@@ -15,35 +15,35 @@
       "RANDOM_SEED": 42
     },
     "test_metrics": {
-      "recall@1": 0.351025,
-      "recall@5": 0.632087,
-      "recall@10": 0.726176,
-      "recall@20": 0.814234,
-      "mrr": 0.479618,
-      "map": 0.455892,
-      "ndcg@10": 0.51017
+      "recall@1": 0.336746,
+      "recall@5": 0.629124,
+      "recall@10": 0.732651,
+      "recall@20": 0.798635,
+      "mrr": 0.470179,
+      "map": 0.458669,
+      "ndcg@10": 0.516427
     },
     "baseline_metrics": {
-      "recall@1": 0.294331,
-      "recall@5": 0.564536,
-      "recall@10": 0.677925,
-      "recall@20": 0.758745,
-      "mrr": 0.419173,
-      "map": 0.402579,
-      "ndcg@10": 0.4583
+      "recall@1": 0.298066,
+      "recall@5": 0.581342,
+      "recall@10": 0.672355,
+      "recall@20": 0.740614,
+      "mrr": 0.427739,
+      "map": 0.417766,
+      "ndcg@10": 0.470099
     },
     "delta": {
-      "recall@1": 0.056695,
-      "recall@5": 0.067551,
-      "recall@10": 0.048251,
-      "recall@20": 0.055489,
-      "mrr": 0.060446,
-      "map": 0.053313,
-      "ndcg@10": 0.051869
+      "recall@1": 0.03868,
+      "recall@5": 0.047782,
+      "recall@10": 0.060296,
+      "recall@20": 0.05802,
+      "mrr": 0.04244,
+      "map": 0.040904,
+      "ndcg@10": 0.046328
     },
-    "n_train_queries": 3722,
-    "n_test_queries": 829,
+    "n_train_queries": 4097,
+    "n_test_queries": 879,
     "model_path": "/Users/reza/Downloads/search-dataset-kth/adapter/data/best_full_rank.pt",
-    "updated_at": "2026-03-12T13:13:39Z"
+    "updated_at": "2026-03-13T09:36:59Z"
   }
 }
