@@ -681,7 +681,12 @@ def embed_corpus(
     batch_size: int = 64,
     max_workers: Optional[int] = None,
     dry_run: bool = False,
+    api_model_name: Optional[str] = None,
 ) -> Dict[str, int]:
+    # api_model_name is the real model ID sent to the API.
+    # model_name is used for SQLite column naming (may include a dim suffix).
+    # When not set, they are the same (non-Voyage providers).
+    api_model_name = api_model_name or model_name
     """Compute embeddings for all pages missing the target model.
 
     Returns stats dict: {total, processed, stored, skipped, errors}.
@@ -709,11 +714,14 @@ def embed_corpus(
         log.info("Skipping %d pages with empty content (can't embed empty text)", len(empty_ids))
 
     total_in_db = conn.execute("SELECT COUNT(*) FROM pdf_page_store").fetchone()[0]
-    already_done = total_in_db - len(rows)
+    already_embedded = conn.execute(
+        f"SELECT COUNT(*) FROM pdf_page_store WHERE {blob_col} IS NOT NULL"
+    ).fetchone()[0]
     conn.close()
 
     log.info("Total pages in store:      %s", _fmt_count(total_in_db))
-    log.info("Already embedded:          %s", _fmt_count(already_done))
+    log.info("Already embedded:          %s", _fmt_count(already_embedded))
+    log.info("Empty content (skipped):   %s", _fmt_count(len(empty_ids)))
     log.info("Pages needing embedding:   %s", _fmt_count(len(rows)))
 
     if not rows:
@@ -794,10 +802,10 @@ def embed_corpus(
         clients.append(c)
         log.info("  HF client: model=%s", resolved_model)
     elif provider == "voyage":
-        c = _create_voyage_client(model_name)
+        c = _create_voyage_client(api_model_name)
         clients.append(c)
         log.info("  Voyage client: model=%s  input_type=document  output_dimension=%d",
-                 model_name, VOYAGE_OUTPUT_DIM)
+                 api_model_name, VOYAGE_OUTPUT_DIM)
     else:
         log.error("Unknown provider: %s", provider)
         sys.exit(1)
@@ -1035,6 +1043,7 @@ def main() -> None:
             batch_size=args.batch_size,
             max_workers=args.workers,
             dry_run=args.dry_run,
+            api_model_name=model_name if args.provider == "voyage" else None,
         )
 
         if _shutdown_event.is_set():
