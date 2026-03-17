@@ -76,6 +76,7 @@ Dependencies include `sentence-transformers`, `transformers`, and `mteb` for ope
 - Configure **either** OpenAI **or** Azure OpenAI (auto-detected from env vars).
 - For multi-endpoint Azure parallelism (used by `profile_corpus.py`, `generate_single_hop.py`, `generate_synthetic_dataset.py`, `embed_corpus.py`), add `AZURE_OPENAI_API_KEY_2` + `AZURE_OPENAI_ENDPOINT_2`, etc. (up to `_9`).
 - For OCR-based PDF extraction (`--ocr`), set `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `AZURE_DOCUMENT_INTELLIGENCE_KEY`.
+- **Voyage AI** (corpus + query embedding): set `VOYAGE_API_KEY`.
 - **Vision quality filter**: requires Google Cloud (Vertex AI) credentials. The filter reads GCP credentials from the `AI_REGIONS_V3` variable in a `.local.env` file. By default it looks for `~/Documents/GitHub/leya/.local.env`. Override with `--leya-env PATH`.
 
 ---
@@ -123,6 +124,16 @@ python embed_corpus.py --embedding-model text-embedding-3-large
 ```
 
 Computes and stores page embeddings for the specified model. Multi-key parallelism and resume-safe (picks up where it left off if interrupted).
+
+#### Voyage AI models
+
+`embed_corpus.py` supports Voyage AI via the `voyage` provider. All Voyage embeddings use `input_type="document"` and 2048 output dimensions, stored in a dedicated SQLite column (e.g., `emb__voyage_4_large_2048`):
+
+```bash
+python embed_corpus.py --provider voyage --model voyage-4-large --batch-size 128
+```
+
+Requires `VOYAGE_API_KEY` in `.env`. The free tier allows up to 200M tokens across all Voyage 4 models.
 
 #### Open-source / HuggingFace models
 
@@ -451,12 +462,34 @@ When `--adapter` is set, the output filename includes an adapter suffix (e.g., `
 | OpenAI | `openai` | `OPENAI_API_KEY` | `text-embedding-3-large` |
 | Azure OpenAI | `azure` | `AZURE_OPENAI_*` | `text-embedding-3-large` |
 | AWS Bedrock | `bedrock` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_BEDROCK_REGION` | `eu.cohere.embed-v4:0` |
+| Voyage AI | `voyage` | `VOYAGE_API_KEY` | `voyage-4-large` |
 
 Bedrock uses a direct API wrapper (`_DirectBedrockCohereEmbedder`) that bypasses `langchain_aws` to avoid parameter compatibility issues with Cohere Embed v4. Pages with empty or whitespace-only content are automatically skipped during embedding.
 
 If a model doesn't have embeddings in SQLite yet, the script auto-embeds all corpus pages (one-time, resume-safe).
 
-> **Note**: open-source models can be embedded with `embed_corpus.py --provider hf` and stored in SQLite. However, `evaluate_search.py` currently only supports cloud providers (`openai`, `azure`, `bedrock`) for query-time embedding. To evaluate an open-source model, pre-embed the corpus with `embed_corpus.py` and use the stored embeddings.
+#### Voyage AI — asymmetric query evaluation
+
+The Voyage 4 family supports testing different query encoders against the same set of pre-computed 2048-dim document embeddings. Use `--query-model` to specify a lighter query encoder while loading corpus embeddings from the heavier `voyage-4-large` column:
+
+```bash
+# Embed corpus once with voyage-4-large (run overnight)
+python embed_corpus.py --provider voyage --model voyage-4-large --batch-size 128
+
+# Evaluate: all three query-side variants
+python evaluate_search.py --dataset output/vision_validated_relaxed.csv \
+  --embedding-model voyage-4-large --provider voyage
+
+python evaluate_search.py --dataset output/vision_validated_relaxed.csv \
+  --embedding-model voyage-4-large --query-model voyage-4 --provider voyage
+
+python evaluate_search.py --dataset output/vision_validated_relaxed.csv \
+  --embedding-model voyage-4-large --query-model voyage-4-lite --provider voyage
+```
+
+Output filenames encode the query model when it differs from the corpus model, e.g. `eval_..._voyage_4_large_2048_query_voyage_4_lite.json`.
+
+> **Note**: open-source models can be embedded with `embed_corpus.py --provider hf` and stored in SQLite. However, `evaluate_search.py` currently only supports cloud providers (`openai`, `azure`, `bedrock`, `voyage`) for query-time embedding. To evaluate an open-source model, pre-embed the corpus with `embed_corpus.py` and use the stored embeddings.
 
 ---
 

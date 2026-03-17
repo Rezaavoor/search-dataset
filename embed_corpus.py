@@ -327,6 +327,51 @@ def _create_bedrock_client(model: str):
     return _DirectBedrockCohereEmbedder(model_id=model, region=region)
 
 
+VOYAGE_OUTPUT_DIM = 2048
+
+
+class _VoyageEmbedder:
+    """Voyage AI embedder for corpus documents.
+
+    Uses ``input_type="document"`` and 2048 output dimensions.
+    The VOYAGE_API_KEY environment variable must be set.
+    """
+
+    def __init__(self, model_id: str):
+        try:
+            import voyageai
+        except ImportError as exc:
+            raise ImportError(
+                "voyageai is required for --provider voyage. "
+                "Install with: pip install voyageai"
+            ) from exc
+
+        api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError(
+                "VOYAGE_API_KEY environment variable is not set. "
+                "Add it to your .env file."
+            )
+        self.model_id = model_id
+        self.client = voyageai.Client(api_key=api_key)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        result = self.client.embed(
+            texts,
+            model=self.model_id,
+            input_type="document",
+            output_dimension=VOYAGE_OUTPUT_DIM,
+        )
+        return result.embeddings
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_documents([text])[0]
+
+
+def _create_voyage_client(model: str) -> _VoyageEmbedder:
+    return _VoyageEmbedder(model_id=model)
+
+
 def _resolve_hf_model_name(model: str) -> str:
     """Resolve short aliases to full HuggingFace model IDs."""
     key = str(model or "").strip()
@@ -697,6 +742,9 @@ def embed_corpus(
         elif os.environ.get("OPENAI_API_KEY"):
             provider = "openai"
             log.info("Auto-detected provider: openai")
+        elif os.environ.get("VOYAGE_API_KEY"):
+            provider = "voyage"
+            log.info("Auto-detected provider: voyage")
         elif os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_BEDROCK_REGION"):
             provider = "bedrock"
             log.info("Auto-detected provider: bedrock")
@@ -745,14 +793,19 @@ def embed_corpus(
         c = _create_hf_client(model_name, batch_size=batch_size)
         clients.append(c)
         log.info("  HF client: model=%s", resolved_model)
+    elif provider == "voyage":
+        c = _create_voyage_client(model_name)
+        clients.append(c)
+        log.info("  Voyage client: model=%s  input_type=document  output_dimension=%d",
+                 model_name, VOYAGE_OUTPUT_DIM)
     else:
         log.error("Unknown provider: %s", provider)
         sys.exit(1)
 
     num_workers = max_workers if max_workers else len(clients)
     num_workers = min(num_workers, len(clients))  # Can't have more workers than clients
-    if provider == "hf" and num_workers > 1:
-        log.warning("HF provider uses one local model instance; capping workers to 1.")
+    if provider in ("hf", "voyage") and num_workers > 1:
+        log.warning("%s provider uses a single client instance; capping workers to 1.", provider)
         num_workers = 1
     log.info("Workers: %d  |  Batch size: %d  |  Total batches: ~%d",
              num_workers, batch_size, (len(rows) + batch_size - 1) // batch_size)
@@ -885,7 +938,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--provider",
         type=str,
-        choices=["auto", "azure", "openai", "bedrock", "hf"],
+        choices=["auto", "azure", "openai", "bedrock", "hf", "voyage"],
         default="auto",
         help="Embedding provider (default: auto-detect from env vars)",
     )
@@ -905,7 +958,10 @@ def parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=64,
-        help="Texts per API call (default: 64). OpenAI max is 2048.",
+        help=(
+            "Texts per API call (default: 64). "
+            "OpenAI max is 2048. Voyage max is 128 (use --batch-size 128 for Voyage)."
+        ),
     )
     p.add_argument(
         "--workers",
@@ -958,6 +1014,10 @@ def main() -> None:
     log.info("Models:   %s", ", ".join(model_list))
 
     for idx, model_name in enumerate(model_list, 1):
+        # Voyage embeddings are always stored with a -2048 suffix to avoid
+        # collisions with any 1024-dim embeddings that may exist.
+        storage_name = f"{model_name}-2048" if args.provider == "voyage" else model_name
+
         if len(model_list) > 1:
             log.info("=" * 80)
             log.info("MODEL %d/%d: %s", idx, len(model_list), model_name)
@@ -965,9 +1025,12 @@ def main() -> None:
             # Reset shutdown event between runs so Ctrl+C works per-model
             _shutdown_event.clear()
 
+        if storage_name != model_name:
+            log.info("Storage column: %s", storage_name)
+
         embed_corpus(
             db_path=db_path,
-            model_name=model_name,
+            model_name=storage_name,
             provider=args.provider,
             batch_size=args.batch_size,
             max_workers=args.workers,

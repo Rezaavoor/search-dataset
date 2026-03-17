@@ -82,10 +82,14 @@ def parse_json_col(value: Any) -> List[str]:
 # ============================================================================
 # Embedding model setup
 # ============================================================================
-def _detect_provider(provider: str) -> str:
+def _detect_provider(provider: str, model: str = "") -> str:
     """Resolve 'auto' provider to a concrete provider name."""
     if provider != "auto":
         return provider
+    if os.environ.get("VOYAGE_API_KEY") and (
+        "voyage" in model.lower()
+    ):
+        return "voyage"
     if os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"):
         return "azure"
     if os.environ.get("OPENAI_API_KEY"):
@@ -94,8 +98,67 @@ def _detect_provider(provider: str) -> str:
         return "bedrock"
     raise ValueError(
         "No API credentials found. Set OPENAI_API_KEY, Azure vars, "
-        "or AWS_ACCESS_KEY_ID + AWS_BEDROCK_REGION."
+        "AWS_ACCESS_KEY_ID + AWS_BEDROCK_REGION, or VOYAGE_API_KEY."
     )
+
+
+VOYAGE_OUTPUT_DIM = 2048
+
+
+def _voyage_client():
+    """Create a Voyage AI client from VOYAGE_API_KEY."""
+    try:
+        import voyageai
+    except ImportError as exc:
+        raise ImportError(
+            "voyageai is required for --provider voyage. "
+            "Install with: pip install voyageai"
+        ) from exc
+    api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("VOYAGE_API_KEY is not set.")
+    return voyageai.Client(api_key=api_key)
+
+
+class _VoyageDocEmbedder:
+    """Voyage AI embedder for corpus documents (input_type='document', 2048 dims)."""
+
+    def __init__(self, model_id: str):
+        self.model_id = model_id
+        self.client = _voyage_client()
+
+    def embed_documents(self, texts: list) -> list:
+        result = self.client.embed(
+            texts,
+            model=self.model_id,
+            input_type="document",
+            output_dimension=VOYAGE_OUTPUT_DIM,
+        )
+        return result.embeddings
+
+    def embed_query(self, text: str) -> list:
+        return self.embed_documents([text])[0]
+
+
+class _VoyageQueryEmbedder:
+    """Voyage AI embedder for queries (input_type='query', 2048 dims)."""
+
+    def __init__(self, model_id: str):
+        self.model_id = model_id
+        self.client = _voyage_client()
+
+    def embed_documents(self, texts: list) -> list:
+        """Embed a batch of query texts (maps embed_documents → input_type='query')."""
+        result = self.client.embed(
+            texts,
+            model=self.model_id,
+            input_type="query",
+            output_dimension=VOYAGE_OUTPUT_DIM,
+        )
+        return result.embeddings
+
+    def embed_query(self, text: str) -> list:
+        return self.embed_documents([text])[0]
 
 
 def _is_cohere_model(model: str) -> bool:
@@ -109,14 +172,20 @@ def setup_embedding_model(model: str, provider: str = "auto"):
 
     For Bedrock Cohere models this uses ``input_type="search_document"``,
     which is the correct mode for indexing corpus pages.
+    For Voyage models this uses ``input_type="document"`` and 2048 dimensions.
 
     Providers:
       - openai: Uses OPENAI_API_KEY
       - azure: Uses AZURE_OPENAI_* vars
       - bedrock: Uses AWS credentials (AWS_ACCESS_KEY_ID/SECRET or default profile)
+      - voyage: Uses VOYAGE_API_KEY
       - auto: Detects from env vars
     """
-    provider = _detect_provider(provider)
+    provider = _detect_provider(provider, model)
+
+    if provider == "voyage":
+        print(f"  Provider: Voyage AI (model: {model}, input_type: document, dim: {VOYAGE_OUTPUT_DIM})")
+        return _VoyageDocEmbedder(model_id=model)
 
     if provider == "azure":
         from langchain_openai import AzureOpenAIEmbeddings
@@ -154,10 +223,15 @@ def setup_query_embedding_model(model: str, provider: str = "auto"):
 
     For Bedrock Cohere models this configures ``input_type="search_query"``
     so that queries receive the correct asymmetric special tokens.
-    For non-Cohere models this returns the same model as
+    For Voyage models this uses ``input_type="query"`` and 2048 dimensions.
+    For non-Cohere / non-Voyage models this returns the same model as
     ``setup_embedding_model`` (symmetric models don't distinguish).
     """
-    provider = _detect_provider(provider)
+    provider = _detect_provider(provider, model)
+
+    if provider == "voyage":
+        print(f"  Query embedder: Voyage AI (model: {model}, input_type: query, dim: {VOYAGE_OUTPUT_DIM})")
+        return _VoyageQueryEmbedder(model_id=model)
 
     if provider == "bedrock" and _is_cohere_model(model):
         import boto3
@@ -426,9 +500,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--provider", type=str,
-        choices=["auto", "openai", "azure", "bedrock"],
+        choices=["auto", "openai", "azure", "bedrock", "voyage"],
         default="auto",
         help="Embedding provider (default: auto-detect from env vars)",
+    )
+    parser.add_argument(
+        "--query-model", type=str, default=None,
+        help=(
+            "Model to use for query embedding (default: same as --embedding-model). "
+            "Useful for Voyage asymmetric experiments: embed corpus with voyage-4-large "
+            "but evaluate queries with voyage-4 or voyage-4-lite."
+        ),
     )
     parser.add_argument(
         "--output", type=str, default=None,
@@ -447,7 +529,16 @@ def main() -> int:
     args = parser.parse_args()
 
     model_name = args.embedding_model
+    # query_model defaults to the same model as corpus, but can differ for
+    # Voyage asymmetric experiments (e.g., voyage-4-large docs + voyage-4 queries)
+    query_model_name = args.query_model if args.query_model else model_name
     top_k_values = sorted(set(args.top_k))
+
+    # Voyage embeddings are stored with a -2048 suffix in SQLite
+    is_voyage = args.provider == "voyage" or (
+        args.provider == "auto" and "voyage" in model_name.lower()
+    )
+    resolved_corpus_model = f"{model_name}-2048" if is_voyage else model_name
 
     # --- Load adapter (optional) ---
     adapter = None
@@ -471,7 +562,9 @@ def main() -> int:
     print("=" * 60)
     print("Embedding Search Evaluation")
     print("=" * 60)
-    print(f"  Model: {model_name}")
+    print(f"  Corpus model: {resolved_corpus_model}")
+    if query_model_name != model_name:
+        print(f"  Query model:  {query_model_name}")
     if adapter is not None:
         print(f"  Adapter: {args.adapter}")
     print(f"  Top-K: {top_k_values}")
@@ -500,10 +593,10 @@ def main() -> int:
     print(f"  SQLite store: {db_path}")
 
     # --- Load or compute corpus embeddings ---
-    print(f"\n[2/5] Loading corpus embeddings for: {model_name}")
+    print(f"\n[2/5] Loading corpus embeddings for: {resolved_corpus_model}")
 
     # Check if model column exists and has data
-    blob_col = _emb_col(model_name)
+    blob_col = _emb_col(resolved_corpus_model)
     try:
         row = conn.execute(
             f"SELECT COUNT(*) FROM pdf_page_store WHERE {blob_col} IS NOT NULL"
@@ -521,7 +614,7 @@ def main() -> int:
         print(f"  {existing_count}/{total_pages} pages have embeddings, {missing} missing")
         print(f"  Computing embeddings for missing pages...")
         emb_model = setup_embedding_model(model_name, args.provider)
-        stored = compute_and_store_corpus_embeddings(conn, model_name, emb_model)
+        stored = compute_and_store_corpus_embeddings(conn, resolved_corpus_model, emb_model)
         print(f"  Stored {stored} new embeddings")
     else:
         print(f"  All {existing_count} pages have embeddings (cached)")
@@ -530,7 +623,7 @@ def main() -> int:
     # Load all embeddings into memory — can take several minutes for large corpora
     print(f"  Loading {existing_count:,} page embeddings from SQLite (this may take a few minutes)...")
     t_load = time.monotonic()
-    all_embeddings = load_page_embeddings(conn, model_name)
+    all_embeddings = load_page_embeddings(conn, resolved_corpus_model)
     print(f"  Loaded {len(all_embeddings):,} page embeddings in {time.monotonic() - t_load:.1f}s")
 
     if not all_embeddings:
@@ -556,8 +649,10 @@ def main() -> int:
     queries = df["user_input"].tolist()
 
     # Use a query-specific embedding model so that asymmetric models
-    # (e.g., Cohere) receive the correct input_type="search_query".
-    query_emb_model = setup_query_embedding_model(model_name, args.provider)
+    # (e.g., Cohere, Voyage) receive the correct input_type.
+    # For Voyage experiments, query_model_name may differ from model_name
+    # (e.g., voyage-4 or voyage-4-lite queries against voyage-4-large documents).
+    query_emb_model = setup_query_embedding_model(query_model_name, args.provider)
 
     EMBED_BATCH = 200
     query_embeddings: List[Optional[List[float]]] = []
@@ -775,7 +870,8 @@ def main() -> int:
 
     # Build output
     output_data = {
-        "model": model_name,
+        "model": resolved_corpus_model,
+        "query_model": query_model_name,
         "corpus_pages": len(all_embeddings),
         "num_queries": n_valid,
         "top_k_values": top_k_values,
@@ -791,7 +887,12 @@ def main() -> int:
     else:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         dataset_stem = dataset_path.stem
-        output_path = OUTPUT_DIR / f"eval_{dataset_stem}_{sanitize_model_name(model_name)}{adapter_label}.json"
+        query_suffix = (
+            f"_query_{sanitize_model_name(query_model_name)}"
+            if query_model_name != model_name
+            else ""
+        )
+        output_path = OUTPUT_DIR / f"eval_{dataset_stem}_{sanitize_model_name(resolved_corpus_model)}{query_suffix}{adapter_label}.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
