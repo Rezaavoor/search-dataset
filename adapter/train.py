@@ -33,6 +33,7 @@ sys.path.insert(0, str(_ADAPTER_DIR))
 
 import config as cfg
 from model import build_adapter, load_adapter, save_adapter
+from split_dataset import _connected_components_split
 from utils import parse_page_ref
 
 
@@ -56,6 +57,11 @@ def _get_device() -> torch.device:
 
 def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
     return F.normalize(x, p=2, dim=-1)
+
+
+# _connected_components_split is imported from split_dataset.py — that module
+# is the single canonical source so train.py and the standalone splitter are
+# always guaranteed to produce identical splits.
 
 
 # ---------------------------------------------------------------------------
@@ -93,98 +99,6 @@ def _load_corpus(db_path: Path) -> Tuple[List[Tuple[str, int]], Dict[Tuple[str, 
     key_to_idx = {k: i for i, k in enumerate(corpus_keys)}
     print(f"  Loaded {len(corpus_keys):,} page embeddings  shape={corpus_matrix.shape}")
     return corpus_keys, key_to_idx, corpus_matrix
-
-
-# ---------------------------------------------------------------------------
-# Train / val / test split: no query leakage, no document leakage
-# ---------------------------------------------------------------------------
-
-def _connected_components_split(
-    triplets_df: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split triplets so that (1) each query is in exactly one split, and (2) no
-    document appears as a positive in more than one split.
-
-    Queries that share any positive document (pos_ref) are placed in the same
-    "component"; each component is assigned entirely to train, val, or test.
-    This avoids document leakage (same doc positive in train and val/test) and
-    keeps each query in a single split.
-    """
-    # (query_idx, pos_ref) pairs: each query–positive pair
-    qp = triplets_df[["query_idx", "pos_ref"]].drop_duplicates()
-    doc_to_queries: Dict[str, List[int]] = {}
-    for _, row in qp.iterrows():
-        doc = str(row["pos_ref"])
-        q = int(row["query_idx"])
-        doc_to_queries.setdefault(doc, []).append(q)
-
-    # Union-find: connect queries that share a positive document
-    all_queries = triplets_df["query_idx"].unique()
-    parent: Dict[int, int] = {q: q for q in all_queries}
-
-    def find(x: int) -> int:
-        if parent[x] != x:
-            parent[x] = find(parent[x])
-        return parent[x]
-
-    def union(x: int, y: int) -> None:
-        px, py = find(x), find(y)
-        if px != py:
-            parent[px] = py
-
-    for queries in doc_to_queries.values():
-        for i in range(1, len(queries)):
-            union(queries[0], queries[i])
-
-    # Components: root -> set of query indices
-    components: Dict[int, List[int]] = {}
-    for q in all_queries:
-        root = find(q)
-        components.setdefault(root, []).append(q)
-    comp_list = list(components.values())
-
-    # Assign whole components to train/val/test to get ~TRAIN_RATIO/VAL_RATIO/TEST_RATIO by query count
-    total_queries = len(all_queries)
-    rng = np.random.RandomState(cfg.RANDOM_SEED)
-    order = np.arange(len(comp_list), dtype=np.intp)
-    rng.shuffle(order)
-    n_train_target = int(total_queries * cfg.TRAIN_RATIO)
-    n_val_target   = int(total_queries * cfg.VAL_RATIO)
-    train_queries: set = set()
-    val_queries: set = set()
-    test_queries: set = set()
-    count_train, count_val, count_test = 0, 0, 0
-    for idx in order:
-        comp = comp_list[idx]
-        n = len(comp)
-        if count_train < n_train_target:
-            train_queries.update(comp)
-            count_train += n
-        elif count_val < n_val_target:
-            val_queries.update(comp)
-            count_val += n
-        else:
-            test_queries.update(comp)
-            count_test += n
-
-    # Assign each query to exactly one split (components are disjoint)
-    query_to_split: Dict[int, str] = {}
-    for q in train_queries:
-        query_to_split[q] = "train"
-    for q in val_queries:
-        query_to_split[q] = "val"
-    for q in test_queries:
-        query_to_split[q] = "test"
-
-    def split_for_row(row) -> str:
-        return query_to_split[int(row["query_idx"])]
-
-    triplets_df = triplets_df.copy()
-    triplets_df["_split"] = triplets_df.apply(split_for_row, axis=1)
-    train_df = triplets_df[triplets_df["_split"] == "train"].drop(columns=["_split"]).reset_index(drop=True)
-    val_df   = triplets_df[triplets_df["_split"] == "val"].drop(columns=["_split"]).reset_index(drop=True)
-    test_df  = triplets_df[triplets_df["_split"] == "test"].drop(columns=["_split"]).reset_index(drop=True)
-    return train_df, val_df, test_df
 
 
 # ---------------------------------------------------------------------------
