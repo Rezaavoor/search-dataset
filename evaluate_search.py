@@ -312,6 +312,8 @@ def compute_and_store_corpus_embeddings(
         f"""
         SELECT id, doc_content FROM pdf_page_store
         WHERE {blob_col} IS NULL
+          AND doc_content IS NOT NULL
+          AND TRIM(doc_content) != ''
         ORDER BY rel_path, page_number
         """
     ).fetchall()
@@ -592,32 +594,42 @@ def main() -> int:
     init_pdf_page_store(conn)
     print(f"  SQLite store: {db_path}")
 
+    # Count pages with actual content — this is the canonical corpus size used
+    # for comparison across all models, regardless of whether a model embedded
+    # empty pages (e.g. OpenAI accepts empty strings, Voyage does not).
+    corpus_pages_with_content = int(conn.execute(
+        "SELECT COUNT(*) FROM pdf_page_store "
+        "WHERE doc_content IS NOT NULL AND TRIM(doc_content) != ''"
+    ).fetchone()[0])
+
     # --- Load or compute corpus embeddings ---
     print(f"\n[2/5] Loading corpus embeddings for: {resolved_corpus_model}")
 
-    # Check if model column exists and has data
+    # Check if model column exists and has data.
+    # Only pages with non-empty content can be embedded — empty pages are excluded
+    # from both the "total" and "missing" counts so all providers behave consistently.
     blob_col = _emb_col(resolved_corpus_model)
     try:
-        row = conn.execute(
+        existing_count = int(conn.execute(
             f"SELECT COUNT(*) FROM pdf_page_store WHERE {blob_col} IS NOT NULL"
-        ).fetchone()
-        existing_count = int(row[0]) if row else 0
+        ).fetchone()[0])
     except Exception:
         existing_count = 0
 
-    total_pages = int(
-        conn.execute("SELECT COUNT(*) FROM pdf_page_store").fetchone()[0]
-    )
+    embeddable_pages = int(conn.execute(
+        "SELECT COUNT(*) FROM pdf_page_store "
+        "WHERE doc_content IS NOT NULL AND TRIM(doc_content) != ''"
+    ).fetchone()[0])
 
-    if existing_count < total_pages:
-        missing = total_pages - existing_count
-        print(f"  {existing_count}/{total_pages} pages have embeddings, {missing} missing")
+    if existing_count < embeddable_pages:
+        missing = embeddable_pages - existing_count
+        print(f"  {existing_count}/{embeddable_pages} pages have embeddings, {missing} missing")
         print(f"  Computing embeddings for missing pages...")
         emb_model = setup_embedding_model(model_name, args.provider)
         stored = compute_and_store_corpus_embeddings(conn, resolved_corpus_model, emb_model)
         print(f"  Stored {stored} new embeddings")
     else:
-        print(f"  All {existing_count} pages have embeddings (cached)")
+        print(f"  All {existing_count} embeddable pages have embeddings (cached)")
         emb_model = None  # Not needed if all cached
 
     # Load all embeddings into memory — can take several minutes for large corpora
@@ -843,7 +855,7 @@ def main() -> int:
     print(f"\n{'=' * 60}")
     print(f"Results: {model_name}")
     print(f"{'=' * 60}")
-    print(f"  Corpus pages: {len(all_embeddings)}")
+    print(f"  Corpus pages: {corpus_pages_with_content:,}")
     print(f"  Queries evaluated: {n_valid}")
     print()
     for key, val in agg_metrics.items():
@@ -872,7 +884,7 @@ def main() -> int:
     output_data = {
         "model": resolved_corpus_model,
         "query_model": query_model_name,
-        "corpus_pages": len(all_embeddings),
+        "corpus_pages": corpus_pages_with_content,
         "num_queries": n_valid,
         "top_k_values": top_k_values,
         "metrics": agg_metrics,
