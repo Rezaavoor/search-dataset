@@ -21,6 +21,7 @@ generate_single_hop.py          # Standalone parallel single-hop generator (no K
 # --- Evaluation & validation ---
 vision_validate_dataset.py      # Vision-based post-hoc validation + standalone quality filter (Gemini via Vertex AI)
 evaluate_search.py              # Evaluate embedding model retrieval quality (Recall@K, MRR, MRR@K, nDCG@K, MAP)
+statistical_test.py             # Paired permutation test + bootstrap CI on eval JSON results (no API calls)
 validate_dataset.py             # Text-only LLM-as-a-judge validation (legacy reporting tool)
 run_mleb.py                     # Run Massive Legal Embedding Benchmark (MLEB) with MTEB
 
@@ -490,6 +491,36 @@ python evaluate_search.py --dataset output/vision_validated_relaxed.csv \
 Output filenames encode the query model when it differs from the corpus model, e.g. `eval_..._voyage_4_large_2048_query_voyage_4_lite.json`.
 
 > **Note**: open-source models can be embedded with `embed_corpus.py --provider hf` and stored in SQLite. However, `evaluate_search.py` currently only supports cloud providers (`openai`, `azure`, `bedrock`, `voyage`) for query-time embedding. To evaluate an open-source model, pre-embed the corpus with `embed_corpus.py` and use the stored embeddings.
+
+### Statistical significance testing
+
+`statistical_test.py` compares two (or more) eval JSON files to determine whether the observed retrieval differences are statistically significant. It runs entirely offline on the per-query scores already stored in the eval JSONs — no API calls, no re-computation.
+
+It performs two tests on per-query Recall@5 (configurable with `--metric`):
+1. **Paired permutation test** — are the two systems significantly different? (p-value)
+2. **Bootstrap confidence interval** — how large is the difference? (95% CI)
+
+```bash
+# Compare baseline vs adapter
+python statistical_test.py \
+    output/eval_test_text_embedding_3_large.json \
+    output/eval_test_text_embedding_3_large_adapted_full_rank_r256.json
+
+# Compare on a different metric
+python statistical_test.py --metric ndcg@10 \
+    output/eval_test_text_embedding_3_large.json \
+    output/eval_test_voyage_4_large_2048.json
+
+# Compare all pairs across multiple configurations
+python statistical_test.py --all-pairs \
+    output/eval_test_text_embedding_3_large.json \
+    output/eval_test_text_embedding_3_large_adapted_full_rank_r256.json \
+    output/eval_test_voyage_4_large_2048.json \
+    output/eval_test_voyage_4_large_2048_query_voyage_4_lite.json \
+    output/eval_test_voyage_4_large_2048_query_voyage_4.json
+```
+
+Parameters default to the thesis methodology (10,000 permutations, 10,000 bootstrap resamples, α=0.05, seed=42). Override with `--permutations`, `--bootstrap`, `--alpha`, `--seed`.
 
 ---
 
