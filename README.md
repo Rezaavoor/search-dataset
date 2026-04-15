@@ -23,7 +23,7 @@ vision_validate_dataset.py      # Vision-based post-hoc validation + standalone 
 evaluate_search.py              # Evaluate embedding model retrieval quality (Recall@K, MRR, MRR@K, nDCG@K, MAP)
 statistical_test.py             # Paired permutation test + bootstrap CI on eval JSON results (no API calls)
 validate_dataset.py             # Text-only LLM-as-a-judge validation (legacy reporting tool)
-run_mleb.py                     # Run Massive Legal Embedding Benchmark (MLEB) with MTEB
+run_mteb.py                     # External benchmark: evaluate all 5 models on MTEB ARCChallenge + BarExamQA (nDCG@10)
 
 # --- Modules ---
   modules/
@@ -54,6 +54,7 @@ run_mleb.py                     # Run Massive Legal Embedding Benchmark (MLEB) w
 
 # --- Data ---
 output/                         # Generated datasets + evaluation results
+  output/final_results/         # Consolidated final results for the report (see output/final_results/README.md)
 processed/                      # Cached artifacts (KG, personas, SQLite store, profiles, checkpoints)
 ```
 
@@ -541,6 +542,36 @@ All hyperparameters (architecture, learning rate, margin, split ratios, etc.) ar
 
 ---
 
+## Final results
+
+All final evaluation results are consolidated in [`output/final_results/`](output/final_results/README.md). The 5 models are evaluated on 3 benchmarks:
+
+1. **Custom legal dataset** (in-domain) — held-out test split, ~170K-page corpus, 879 queries
+2. **ARCChallenge** (external, general) — MTEB science QA benchmark, ~9,350 docs
+3. **BarExamQA** (external, legal) — MTEB US bar exam benchmark, ~116 docs
+
+### nDCG@10 across all benchmarks
+
+| Model | Custom Legal | ARCChallenge | BarExamQA |
+|---|---|---|---|
+| **openai+adapter** | **0.6789** | 0.2501 | 0.5484 |
+| voyage-4-large | 0.6263 | **0.4383** | **0.6672** |
+| voyage-4 | 0.6033 | 0.3308 | 0.6136 |
+| voyage-4-lite | 0.5985 | 0.2760 | 0.5893 |
+| openai (baseline) | 0.4891 | 0.2522 | 0.5459 |
+
+The adapter provides a +18.98pp nDCG@10 improvement on the in-domain legal corpus while remaining neutral on external benchmarks (-0.21pp on ARCChallenge, +0.25pp on BarExamQA). Voyage-4-large is the strongest general-purpose model across all benchmarks.
+
+External benchmarks are run via `run_mteb.py`:
+
+```bash
+python run_mteb.py                           # all 5 models, both tasks
+python run_mteb.py --models openai openai+adapter  # specific models
+python run_mteb.py --tasks BarExamQA         # single task
+```
+
+---
+
 ## Visualizations
 
 The repo also includes embedding-space visualizations built from the SQLite page
@@ -630,14 +661,14 @@ Can be run independently on any generated CSV to produce filtered outputs withou
 
 The legacy text-only `validate_dataset.py` is retained as a reference tool for evaluating hard negative quality (not covered by the vision filter).
 
-### Layer 5: Retrieval evaluation sanity check (`evaluate_search.py`, `run_mleb.py`)
+### Layer 5: Retrieval evaluation sanity check (`evaluate_search.py`, `run_mteb.py`)
 
 `evaluate_search.py` acts as a **functional sanity check** on dataset quality by measuring how well an embedding model retrieves the ground truth pages. It computes Recall@K, MRR, MAP, nDCG@K, and hard negative analysis. Built-in diagnostics warn about:
 - Small query sets (n < 50)
 - Queries with >50 positive pages (possible boilerplate contamination)
 - Queries with >100 positive pages (likely header/footer inflation)
 
-As an additional sanity check, retrieval results for `text-embedding-3-large` on this dataset were compared against publicly available scores for the same model on the **MTEB** (Massive Text Embedding Benchmark) and **MLEB** (Massive Legal Embedding Benchmark, https://isaacus.com/mleb). The project includes `run_mleb.py`, which evaluates embedding models on 10 expert-annotated legal retrieval datasets using the official MTEB evaluation framework. The nDCG@10 scores produced by `text-embedding-3-large` on these external benchmarks were broadly consistent with the retrieval quality observed on the generated dataset, confirming that the dataset's difficulty and ground truth labels are realistic and not artificially easy or inflated.
+As an additional sanity check, retrieval results for `text-embedding-3-large` on this dataset were compared against publicly available scores for the same model on the **MTEB** (Massive Text Embedding Benchmark). The project includes `run_mteb.py`, which benchmarks all 5 project models on two public MTEB retrieval tasks: **ARCChallenge** (general-domain science QA, ~9,350 docs) and **BarExamQA** (legal-domain US bar exam, ~116 docs). These external benchmarks serve two purposes: (1) confirming that the dataset's difficulty and ground truth labels are realistic and not artificially easy, and (2) verifying that the trained query adapter does not degrade general retrieval performance while maintaining its in-domain advantage.
 
 ### Layer 6: Retrieval-based curation
 
@@ -665,7 +696,7 @@ The dataset was further validated by comparing pypdf vs OCR text extraction, run
 | HN tiered LLM judge | Hard neg mining | LLM relevance/answerability | Tiered accept/reject |
 | HN per-file cap | Hard neg mining | Max 2 per file | Diversity enforcement |
 | Post-hoc vision validation | Standalone script | Gemini vision model | Filtered CSVs + report |
-| Retrieval evaluation | Standalone script | IR metrics + MTEB comparison | Quality warnings |
+| Retrieval evaluation | Standalone script | IR metrics + MTEB external benchmark (ARCChallenge, BarExamQA) | Quality warnings |
 | Retrieval-based curation | Post-evaluation | Rank > 1,000 removal | **Drops rows** (boilerplate + corrupt) |
 | A/B comparison | Analysis | Cross-corpus evaluation | Methodology validation |
 
