@@ -544,7 +544,7 @@ All hyperparameters (architecture, learning rate, margin, split ratios, etc.) ar
 
 ## Final results
 
-All final evaluation results are consolidated in [`output/final_results/`](output/final_results/README.md). The 5 models are evaluated on 3 benchmarks:
+All final evaluation results are consolidated in [`output/final_results/`](output/final_results/README.md), including an interactive visualization ([`embedding_model_comparison.html`](output/final_results/embedding_model_comparison.html)). The 5 models are evaluated on 3 benchmarks:
 
 1. **Custom legal dataset** (in-domain) — held-out test split, ~170K-page corpus, 879 queries
 2. **ARCChallenge** (external, general) — MTEB science QA benchmark, ~9,350 docs

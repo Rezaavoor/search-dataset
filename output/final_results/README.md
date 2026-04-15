@@ -98,3 +98,4 @@ Public MTEB benchmark — US bar exam legal provision retrieval, ~116 corpus docum
 | `eval_test_voyage_4_large_2048_query_voyage_4.json` | Voyage-4 (asymmetric) — custom legal test split |
 | `eval_test_voyage_4_large_2048_query_voyage_4_lite.json` | Voyage-4-lite (asymmetric) — custom legal test split |
 | `mteb_results.json` | All 5 models on ARCChallenge + BarExamQA (full MTEB metrics) |
+| `embedding_model_comparison.html` | Interactive visualization — charts and tables for all 3 benchmarks (open in browser) |

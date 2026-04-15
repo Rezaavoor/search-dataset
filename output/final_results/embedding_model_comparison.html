@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Embedding Model Comparison</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #21262d;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #7d8590;
+    --c1: #58a6ff;
+    --c2: #3fb950;
+    --c3: #ffa657;
+    --c4: #f78166;
+    --c5: #d2a8ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Sans', sans-serif;
+    padding: 36px 40px;
+  }
+  .header { margin-bottom: 32px; }
+  .label {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 8px;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  h1 { font-size: 28px; font-weight: 700; line-height: 1.2; }
+  .subtitle { margin-top: 6px; font-size: 14px; color: var(--muted); }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 28px;
+  }
+  .legend-item {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 14px;
+    font-size: 12.5px; font-weight: 500;
+  }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+  .kpi-row {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    gap: 12px; margin-bottom: 28px;
+  }
+  .kpi-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px; position: relative; overflow: hidden;
+  }
+  .kpi-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0;
+    height: 3px; border-radius: 10px 10px 0 0;
+  }
+  .kpi-card.c1::before { background: var(--c1); }
+  .kpi-card.c2::before { background: var(--c2); }
+  .kpi-card.c3::before { background: var(--c3); }
+  .kpi-card.c4::before { background: var(--c4); }
+  .kpi-card.c5::before { background: var(--c5); }
+  .kpi-name { font-size: 11px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 10px; }
+  .kpi-val {
+    font-size: 30px; font-weight: 700;
+    font-family: 'IBM Plex Mono', monospace; line-height: 1;
+  }
+  .kpi-sublabel { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .kpi-delta { font-size: 12px; font-weight: 600; margin-top: 10px;
+    font-family: 'IBM Plex Mono', monospace; }
+  .pos { color: var(--c2); }
+  .neu { color: var(--muted); }
+
+  .section-title {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 14px;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  .charts-grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 20px; margin-bottom: 24px;
+  }
+  .chart-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 24px;
+  }
+  .chart-card.wide { grid-column: 1 / -1; }
+  .chart-title {
+    font-size: 12px; font-weight: 600; color: var(--text);
+    margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.07em;
+  }
+  .chart-desc { font-size: 12px; color: var(--muted); margin-bottom: 20px; }
+
+  .table-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 24px; overflow-x: auto;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: right; padding: 8px 14px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.07em; color: var(--muted);
+    border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  th:first-child { text-align: left; }
+  td {
+    text-align: right; padding: 10px 14px;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+    font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+    vertical-align: middle;
+  }
+  td:first-child {
+    text-align: left; font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 500; font-size: 13px;
+  }
+  tr:last-child td { border-bottom: none; }
+  .best { font-weight: 700; color: var(--c2); }
+  .model-dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; margin-right: 8px; vertical-align: middle;
+  }
+  .delta-pos { color: #3fb950; font-size: 11px; }
+  .delta-neu { color: var(--muted); font-size: 11px; }
+  .insight-box {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-left: 3px solid var(--c2); border-radius: 8px;
+    padding: 14px 18px; margin-bottom: 28px; font-size: 13px;
+    line-height: 1.6; color: var(--muted);
+  }
+  .insight-box strong { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="label">KTH Master's Thesis · Embedding Evaluation</div>
+  <h1>Embedding Model Comparison</h1>
+  <div class="subtitle">3 benchmarks: Custom legal (879 queries, ~170K pages) · ARCChallenge (1,172 queries, ~9,350 docs) · BarExamQA (117 queries, ~116 docs)</div>
+</div>
+
+<div class="section-title">Models evaluated</div>
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#58a6ff"></div>text-embedding-3-large (baseline)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#3fb950"></div>text-embedding-3-large + Adapter (full-rank)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ffa657"></div>voyage-4-large / voyage-4-large (symmetric)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f78166"></div>voyage-4-large docs + voyage-4 queries</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#d2a8ff"></div>voyage-4-large docs + voyage-4-lite queries</div>
+</div>
+
+<div class="section-title">Custom legal dataset (in-domain) · nDCG@10</div>
+<div class="kpi-row">
+  <div class="kpi-card c1">
+    <div class="kpi-name">TE3L Baseline</div>
+    <div class="kpi-val" style="color:#58a6ff">48.9%</div>
+    <div class="kpi-sublabel">nDCG@10</div>
+    <div class="kpi-delta neu">— reference</div>
+  </div>
+  <div class="kpi-card c2">
+    <div class="kpi-name">TE3L + Adapter</div>
+    <div class="kpi-val" style="color:#3fb950">67.9%</div>
+    <div class="kpi-sublabel">nDCG@10</div>
+    <div class="kpi-delta pos">▲ +38.8%</div>
+  </div>
+  <div class="kpi-card c3">
+    <div class="kpi-name">Voyage-4-Large</div>
+    <div class="kpi-val" style="color:#ffa657">62.6%</div>
+    <div class="kpi-sublabel">nDCG@10</div>
+    <div class="kpi-delta pos">▲ +28.1%</div>
+  </div>
+  <div class="kpi-card c4">
+    <div class="kpi-name">V4L + V4 query</div>
+    <div class="kpi-val" style="color:#f78166">60.3%</div>
+    <div class="kpi-sublabel">nDCG@10</div>
+    <div class="kpi-delta pos">▲ +23.4%</div>
+  </div>
+  <div class="kpi-card c5">
+    <div class="kpi-name">V4L + V4-Lite</div>
+    <div class="kpi-val" style="color:#d2a8ff">59.8%</div>
+    <div class="kpi-sublabel">nDCG@10</div>
+    <div class="kpi-delta pos">▲ +22.4%</div>
+  </div>
+</div>
+
+<div class="insight-box">
+  <strong>Key findings:</strong> The query adapter (+38.8% nDCG@10) outperforms all off-the-shelf models on the test split, confirming it generalises beyond training data.
+  Voyage-4-large symmetric is the strongest standalone model (+28.1%), beating the baseline by a wide margin.
+  The asymmetric Voyage configurations (voyage-4 / voyage-4-lite as query encoder) remain competitive —
+  <strong>voyage-4-lite sacrifices only 0.3 nDCG@10 points vs voyage-4</strong>, making it an efficient production trade-off.
+</div>
+
+<div class="section-title">Cross-Benchmark nDCG@10 Overview</div>
+<div class="charts-grid" style="margin-bottom:28px">
+  <div class="chart-card wide">
+    <div class="chart-title">nDCG@10 Across All Benchmarks</div>
+    <div class="chart-desc">Grouped by benchmark — Custom Legal (in-domain), ARCChallenge (general), BarExamQA (legal)</div>
+    <canvas id="crossBenchChart" height="80"></canvas>
+  </div>
+</div>
+
+<div class="section-title">Cross-benchmark nDCG@10 comparison</div>
+<div class="table-card" style="margin-bottom:28px">
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Custom Legal</th><th>ARCChallenge</th><th>BarExamQA</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><span class="model-dot" style="background:#3fb950"></span>TE3L + Adapter</td><td class="best">67.9%</td><td>25.0%</td><td>54.8%</td></tr>
+      <tr><td><span class="model-dot" style="background:#ffa657"></span>V4L symmetric</td><td>62.6%</td><td class="best">43.8%</td><td class="best">66.7%</td></tr>
+      <tr><td><span class="model-dot" style="background:#f78166"></span>V4L + V4 query</td><td>60.3%</td><td>33.1%</td><td>61.4%</td></tr>
+      <tr><td><span class="model-dot" style="background:#d2a8ff"></span>V4L + V4-Lite query</td><td>59.8%</td><td>27.6%</td><td>58.9%</td></tr>
+      <tr><td><span class="model-dot" style="background:#58a6ff"></span>TE3L Baseline</td><td>48.9%</td><td>25.2%</td><td>54.6%</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="insight-box">
+  <strong>Adapter transfer analysis:</strong> The adapter provides +18.98pp nDCG@10 on the in-domain legal corpus but is neutral on external benchmarks (-0.21pp on ARCChallenge, +0.25pp on BarExamQA).
+  This confirms the adapter is domain-specific: it improves retrieval on the corpus it was trained for without degrading general performance.
+  <strong>Voyage-4-large is the strongest general-purpose model</strong>, dominating both external benchmarks (43.8% on ARCChallenge, 66.7% on BarExamQA).
+</div>
+
+<div class="section-title">ARCChallenge · General Domain (Science QA) · ~9,350 docs · 1,172 queries</div>
+<div class="charts-grid" style="margin-bottom:28px">
+  <div class="chart-card wide">
+    <div class="chart-title">Recall @ K — ARCChallenge</div>
+    <div class="chart-desc">Fraction of queries where the correct document appears within the top K results</div>
+    <canvas id="arcRecallChart" height="75"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">Key Metrics — ARCChallenge</div>
+    <div class="chart-desc">Recall@1, MRR, MAP and nDCG@10 grouped by model</div>
+    <canvas id="arcKeyMetrics" height="220"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">Radar — ARCChallenge</div>
+    <div class="chart-desc">All six retrieval dimensions</div>
+    <canvas id="arcRadar" height="220"></canvas>
+  </div>
+</div>
+<div class="section-title">ARCChallenge · Full Metrics Table</div>
+<div class="table-card" style="margin-bottom:28px">
+  <table>
+    <thead>
+      <tr><th>Model</th><th>R@1</th><th>R@5</th><th>R@10</th><th>R@20</th><th>MRR</th><th>MAP</th><th>nDCG@10</th></tr>
+    </thead>
+    <tbody id="arcTableBody"></tbody>
+  </table>
+</div>
+
+<div class="section-title">BarExamQA · Legal Domain (US Bar Exam) · ~116 docs · 117 queries</div>
+<div class="charts-grid" style="margin-bottom:28px">
+  <div class="chart-card wide">
+    <div class="chart-title">Recall @ K — BarExamQA</div>
+    <div class="chart-desc">Fraction of queries where the correct provision appears within the top K results</div>
+    <canvas id="barRecallChart" height="75"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">Key Metrics — BarExamQA</div>
+    <div class="chart-desc">Recall@1, MRR, MAP and nDCG@10 grouped by model</div>
+    <canvas id="barKeyMetrics" height="220"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">Radar — BarExamQA</div>
+    <div class="chart-desc">All six retrieval dimensions</div>
+    <canvas id="barRadar" height="220"></canvas>
+  </div>
+</div>
+<div class="section-title">BarExamQA · Full Metrics Table</div>
+<div class="table-card" style="margin-bottom:28px">
+  <table>
+    <thead>
+      <tr><th>Model</th><th>R@1</th><th>R@5</th><th>R@10</th><th>R@20</th><th>MRR</th><th>MAP</th><th>nDCG@10</th></tr>
+    </thead>
+    <tbody id="barTableBody"></tbody>
+  </table>
+</div>
+
+<div class="section-title">Custom Legal Dataset · Detailed Metrics</div>
+<div class="charts-grid">
+  <div class="chart-card wide">
+    <div class="chart-title">Recall @ K</div>
+    <div class="chart-desc">Fraction of queries where the correct page appears within the top K results. Higher is better.</div>
+    <canvas id="recallChart" height="75"></canvas>
+  </div>
+
+  <div class="chart-card">
+    <div class="chart-title">Key Metrics by Model</div>
+    <div class="chart-desc">Recall@1, MRR, MAP and nDCG@10 grouped by model</div>
+    <canvas id="keyMetrics" height="220"></canvas>
+  </div>
+
+  <div class="chart-card">
+    <div class="chart-title">Holistic Radar Comparison</div>
+    <div class="chart-desc">All six retrieval dimensions normalised to [0.2, 1.0]</div>
+    <canvas id="radarChart" height="220"></canvas>
+  </div>
+</div>
+
+<div class="section-title">Custom Legal Dataset · Full Metrics Table</div>
+<div class="table-card">
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>R@1</th><th>R@5</th><th>R@10</th><th>R@20</th>
+        <th>MRR</th><th>MAP</th>
+        <th>nDCG@5</th><th>nDCG@10</th><th>nDCG@20</th>
+      </tr>
+    </thead>
+    <tbody id="tableBody"></tbody>
+  </table>
+</div>
+
+<script>
+Chart.defaults.color = '#7d8590';
+Chart.defaults.borderColor = '#30363d';
+Chart.defaults.font.family = "'IBM Plex Mono', monospace";
+
+const MODELS = [
+  { label: 'TE3L Baseline',        short: 'TE3L',       color: '#58a6ff' },
+  { label: 'TE3L + Adapter',       short: 'Adapter',    color: '#3fb950' },
+  { label: 'V4L symmetric',        short: 'V4L',        color: '#ffa657' },
+  { label: 'V4L + V4 query',       short: 'V4L+V4',     color: '#f78166' },
+  { label: 'V4L + V4-Lite query',  short: 'V4L+Lite',   color: '#d2a8ff' },
+];
+
+const DATA = [
+  { r1:0.3049, r5:0.6030, r10:0.7088, r20:0.7759, mrr:0.4361, map:0.4296, ndcg5:0.4544, ndcg10:0.4891, ndcg20:0.5071 },
+  { r1:0.5017, r5:0.7918, r10:0.8703, r20:0.9170, mrr:0.6300, map:0.6236, ndcg5:0.6529, ndcg10:0.6789, ndcg20:0.6913 },
+  { r1:0.4642, r5:0.7281, r10:0.8123, r20:0.8578, mrr:0.5838, map:0.5729, ndcg5:0.5980, ndcg10:0.6263, ndcg20:0.6387 },
+  { r1:0.4323, r5:0.7258, r10:0.7907, r20:0.8441, mrr:0.5601, map:0.5507, ndcg5:0.5809, ndcg10:0.6033, ndcg20:0.6179 },
+  { r1:0.4323, r5:0.7144, r10:0.7816, r20:0.8328, mrr:0.5571, map:0.5471, ndcg5:0.5756, ndcg10:0.5985, ndcg20:0.6124 },
+];
+
+const baseline = DATA[0];
+
+// ── Recall@K bar chart ────────────────────────────────────────────────────────
+new Chart(document.getElementById('recallChart'), {
+  type: 'bar',
+  data: {
+    labels: ['Recall@1', 'Recall@5', 'Recall@10', 'Recall@20'],
+    datasets: MODELS.map((m, i) => ({
+      label: m.label,
+      data: [DATA[i].r1, DATA[i].r5, DATA[i].r10, DATA[i].r20],
+      backgroundColor: m.color + 'bb',
+      borderColor: m.color,
+      borderWidth: 1.5,
+      borderRadius: 4,
+    }))
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: {
+        position: 'bottom',
+        labels: { font: { size: 11, family: "'IBM Plex Sans'" }, boxWidth: 12, padding: 14 }
+      },
+      tooltip: {
+        callbacks: { label: ctx => ` ${ctx.dataset.label}: ${(ctx.raw*100).toFixed(1)}%` }
+      }
+    },
+    scales: {
+      x: { grid: { color: '#21262d' }, ticks: { font: { size: 12, family: "'IBM Plex Sans'" } } },
+      y: {
+        min: 0, max: 1,
+        grid: { color: '#21262d' },
+        ticks: { callback: v => (v*100).toFixed(0)+'%', font: { size: 11 } }
+      }
+    }
+  }
+});
+
+// ── Key metrics grouped bar ───────────────────────────────────────────────────
+new Chart(document.getElementById('keyMetrics'), {
+  type: 'bar',
+  data: {
+    labels: MODELS.map(m => m.short),
+    datasets: [
+      { label: 'Recall@1', data: DATA.map(d => d.r1),     backgroundColor: '#58a6ff55', borderColor: '#58a6ff', borderWidth: 1.5, borderRadius: 3 },
+      { label: 'MRR',      data: DATA.map(d => d.mrr),    backgroundColor: '#3fb95055', borderColor: '#3fb950', borderWidth: 1.5, borderRadius: 3 },
+      { label: 'MAP',      data: DATA.map(d => d.map),    backgroundColor: '#ffa65755', borderColor: '#ffa657', borderWidth: 1.5, borderRadius: 3 },
+      { label: 'nDCG@10',  data: DATA.map(d => d.ndcg10), backgroundColor: '#d2a8ff55', borderColor: '#d2a8ff', borderWidth: 1.5, borderRadius: 3 },
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: {
+        position: 'bottom',
+        labels: { font: { size: 11, family: "'IBM Plex Sans'" }, boxWidth: 12, padding: 10 }
+      },
+      tooltip: {
+        callbacks: { label: ctx => ` ${ctx.dataset.label}: ${(ctx.raw*100).toFixed(1)}%` }
+      }
+    },
+    scales: {
+      x: { grid: { display: false }, ticks: { font: { size: 11, family: "'IBM Plex Mono'" } } },
+      y: {
+        min: 0, max: 1, grid: { color: '#21262d' },
+        ticks: { callback: v => (v*100).toFixed(0)+'%', font: { size: 11 } }
+      }
+    }
+  }
+});
+
+// ── Radar chart ───────────────────────────────────────────────────────────────
+new Chart(document.getElementById('radarChart'), {
+  type: 'radar',
+  data: {
+    labels: ['Recall@1', 'Recall@5', 'Recall@10', 'MRR', 'MAP', 'nDCG@10'],
+    datasets: MODELS.map((m, i) => ({
+      label: m.label,
+      data: [DATA[i].r1, DATA[i].r5, DATA[i].r10, DATA[i].mrr, DATA[i].map, DATA[i].ndcg10],
+      borderColor: m.color,
+      backgroundColor: m.color + '18',
+      borderWidth: 2,
+      pointBackgroundColor: m.color,
+      pointRadius: 3,
+    }))
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: {
+        position: 'bottom',
+        labels: { font: { size: 10, family: "'IBM Plex Sans'" }, boxWidth: 10, padding: 8 }
+      }
+    },
+    scales: {
+      r: {
+        min: 0.2, max: 1.0,
+        grid: { color: '#30363d' },
+        angleLines: { color: '#30363d' },
+        pointLabels: { font: { size: 11, family: "'IBM Plex Sans'" }, color: '#7d8590' },
+        ticks: { display: false }
+      }
+    }
+  }
+});
+
+// ── External benchmark data ───────────────────────────────────────────────────
+const ARC_DATA = [
+  { r1:0.1203, r5:0.3166, r10:0.4053, r20:0.4966, mrr:0.2176, map:0.2176, ndcg10:0.2522 },
+  { r1:0.1203, r5:0.3131, r10:0.4010, r20:0.5000, mrr:0.2164, map:0.2164, ndcg10:0.2501 },
+  { r1:0.2645, r5:0.5341, r10:0.6263, r20:0.6920, mrr:0.3886, map:0.3886, ndcg10:0.4383 },
+  { r1:0.1630, r5:0.4198, r10:0.5230, r20:0.6152, mrr:0.2825, map:0.2825, ndcg10:0.3308 },
+  { r1:0.1263, r5:0.3584, r10:0.4565, r20:0.5435, mrr:0.2318, map:0.2318, ndcg10:0.2760 },
+];
+const BAR_DATA = [
+  { r1:0.3675, r5:0.6667, r10:0.7436, r20:0.8889, mrr:0.4963, map:0.4963, ndcg10:0.5459 },
+  { r1:0.3761, r5:0.6410, r10:0.7521, r20:0.8462, mrr:0.4966, map:0.4966, ndcg10:0.5484 },
+  { r1:0.5043, r5:0.7607, r10:0.8462, r20:0.9060, mrr:0.6185, map:0.6185, ndcg10:0.6672 },
+  { r1:0.4103, r5:0.7180, r10:0.8291, r20:0.9231, mrr:0.5547, map:0.5547, ndcg10:0.6136 },
+  { r1:0.3675, r5:0.7094, r10:0.8120, r20:0.8803, mrr:0.5268, map:0.5268, ndcg10:0.5893 },
+];
+
+// ── Cross-benchmark grouped bar ──────────────────────────────────────────────
+new Chart(document.getElementById('crossBenchChart'), {
+  type: 'bar',
+  data: {
+    labels: ['Custom Legal', 'ARCChallenge', 'BarExamQA'],
+    datasets: MODELS.map((m, i) => ({
+      label: m.label,
+      data: [DATA[i].ndcg10, ARC_DATA[i].ndcg10, BAR_DATA[i].ndcg10],
+      backgroundColor: m.color + 'bb',
+      borderColor: m.color,
+      borderWidth: 1.5,
+      borderRadius: 4,
+    }))
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: {
+        position: 'bottom',
+        labels: { font: { size: 11, family: "'IBM Plex Sans'" }, boxWidth: 12, padding: 14 }
+      },
+      tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${(ctx.raw*100).toFixed(1)}%` } }
+    },
+    scales: {
+      x: { grid: { color: '#21262d' }, ticks: { font: { size: 12, family: "'IBM Plex Sans'" } } },
+      y: { min: 0, max: 0.8, grid: { color: '#21262d' }, ticks: { callback: v => (v*100).toFixed(0)+'%', font: { size: 11 } } }
+    }
+  }
+});
+
+// ── Reusable chart builders for external benchmarks ──────────────────────────
+function buildRecallChart(canvasId, extData, yMax) {
+  new Chart(document.getElementById(canvasId), {
+    type: 'bar',
+    data: {
+      labels: ['Recall@1', 'Recall@5', 'Recall@10', 'Recall@20'],
+      datasets: MODELS.map((m, i) => ({
+        label: m.label,
+        data: [extData[i].r1, extData[i].r5, extData[i].r10, extData[i].r20],
+        backgroundColor: m.color + 'bb', borderColor: m.color,
+        borderWidth: 1.5, borderRadius: 4,
+      }))
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 11, family: "'IBM Plex Sans'" }, boxWidth: 12, padding: 14 } },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${(ctx.raw*100).toFixed(1)}%` } }
+      },
+      scales: {
+        x: { grid: { color: '#21262d' }, ticks: { font: { size: 12, family: "'IBM Plex Sans'" } } },
+        y: { min: 0, max: yMax, grid: { color: '#21262d' }, ticks: { callback: v => (v*100).toFixed(0)+'%', font: { size: 11 } } }
+      }
+    }
+  });
+}
+
+function buildKeyMetrics(canvasId, extData) {
+  new Chart(document.getElementById(canvasId), {
+    type: 'bar',
+    data: {
+      labels: MODELS.map(m => m.short),
+      datasets: [
+        { label: 'Recall@1', data: extData.map(d => d.r1),     backgroundColor: '#58a6ff55', borderColor: '#58a6ff', borderWidth: 1.5, borderRadius: 3 },
+        { label: 'MRR',      data: extData.map(d => d.mrr),    backgroundColor: '#3fb95055', borderColor: '#3fb950', borderWidth: 1.5, borderRadius: 3 },
+        { label: 'MAP',      data: extData.map(d => d.map),    backgroundColor: '#ffa65755', borderColor: '#ffa657', borderWidth: 1.5, borderRadius: 3 },
+        { label: 'nDCG@10',  data: extData.map(d => d.ndcg10), backgroundColor: '#d2a8ff55', borderColor: '#d2a8ff', borderWidth: 1.5, borderRadius: 3 },
+      ]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 11, family: "'IBM Plex Sans'" }, boxWidth: 12, padding: 10 } },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${(ctx.raw*100).toFixed(1)}%` } }
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { size: 11, family: "'IBM Plex Mono'" } } },
+        y: { min: 0, max: 0.8, grid: { color: '#21262d' }, ticks: { callback: v => (v*100).toFixed(0)+'%', font: { size: 11 } } }
+      }
+    }
+  });
+}
+
+function buildRadar(canvasId, extData, rMin) {
+  new Chart(document.getElementById(canvasId), {
+    type: 'radar',
+    data: {
+      labels: ['Recall@1', 'Recall@5', 'Recall@10', 'MRR', 'MAP', 'nDCG@10'],
+      datasets: MODELS.map((m, i) => ({
+        label: m.label,
+        data: [extData[i].r1, extData[i].r5, extData[i].r10, extData[i].mrr, extData[i].map, extData[i].ndcg10],
+        borderColor: m.color, backgroundColor: m.color + '18',
+        borderWidth: 2, pointBackgroundColor: m.color, pointRadius: 3,
+      }))
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { position: 'bottom', labels: { font: { size: 10, family: "'IBM Plex Sans'" }, boxWidth: 10, padding: 8 } } },
+      scales: {
+        r: { min: rMin, max: 1.0, grid: { color: '#30363d' }, angleLines: { color: '#30363d' },
+             pointLabels: { font: { size: 11, family: "'IBM Plex Sans'" }, color: '#7d8590' }, ticks: { display: false } }
+      }
+    }
+  });
+}
+
+function buildExtTable(tbodyId, extData) {
+  const extCols = ['r1','r5','r10','r20','mrr','map','ndcg10'];
+  const extBest = {};
+  extCols.forEach(c => extBest[c] = Math.max(...extData.map(d => d[c])));
+  const extBaseline = extData[0];
+  const tb = document.getElementById(tbodyId);
+  MODELS.forEach((m, i) => {
+    const d = extData[i];
+    const isBase = i === 0;
+    const cells = extCols.map(c => {
+      const isBest = Math.abs(d[c] - extBest[c]) < 0.00001;
+      const val = `<span class="${isBest ? 'best' : ''}">${fmt(d[c])}</span>`;
+      const del = isBase ? '' : delta(d[c], extBaseline[c]);
+      return `<td>${val}${del}</td>`;
+    }).join('');
+    tb.innerHTML += `<tr><td><span class="model-dot" style="background:${m.color}"></span>${m.label}</td>${cells}</tr>`;
+  });
+}
+
+// Build ARCChallenge charts
+buildRecallChart('arcRecallChart', ARC_DATA, 0.8);
+buildKeyMetrics('arcKeyMetrics', ARC_DATA);
+buildRadar('arcRadar', ARC_DATA, 0.0);
+
+// Build BarExamQA charts
+buildRecallChart('barRecallChart', BAR_DATA, 1.0);
+buildKeyMetrics('barKeyMetrics', BAR_DATA);
+buildRadar('barRadar', BAR_DATA, 0.2);
+
+// ── Table helpers ─────────────────────────────────────────────────────────────
+const cols = ['r1','r5','r10','r20','mrr','map','ndcg5','ndcg10','ndcg20'];
+const best = {};
+cols.forEach(c => best[c] = Math.max(...DATA.map(d => d[c])));
+
+const fmt = v => (v*100).toFixed(1)+'%';
+const delta = (v, base) => {
+  const d = ((v - base) / base * 100);
+  return d >= 0.05
+    ? `<span class="delta-pos"> ▲${d.toFixed(1)}%</span>`
+    : `<span class="delta-neu"> —</span>`;
+};
+
+const tbody = document.getElementById('tableBody');
+MODELS.forEach((m, i) => {
+  const d = DATA[i];
+  const isBase = i === 0;
+  const cells = cols.map(c => {
+    const isBest = Math.abs(d[c] - best[c]) < 0.00001;
+    const val = `<span class="${isBest ? 'best' : ''}">${fmt(d[c])}</span>`;
+    const del = isBase ? '' : delta(d[c], baseline[c]);
+    return `<td>${val}${del}</td>`;
+  }).join('');
+  tbody.innerHTML += `<tr>
+    <td><span class="model-dot" style="background:${m.color}"></span>${m.label}</td>
+    ${cells}
+  </tr>`;
+});
+
+// Build external benchmark tables (uses fmt and delta defined above)
+buildExtTable('arcTableBody', ARC_DATA);
+buildExtTable('barTableBody', BAR_DATA);
+</script>
+</body>
+</html>
